@@ -7,10 +7,20 @@ import os
 from functools import partial
 from typing import Dict, NamedTuple, Sequence
 
+import jax
+
+# TensorFlow Probability still probes this legacy location when imported by
+# Distrax. JAX 0.10 removed it from jax.interpreters.xla but keeps the mapping
+# in jax.core. Providing the alias before importing Distrax avoids requiring a
+# manual edit inside site-packages.
+try:
+    jax.interpreters.xla.pytype_aval_mappings
+except AttributeError:
+    jax.interpreters.xla.pytype_aval_mappings = jax.core.pytype_aval_mappings
+
 import distrax
 import flax.linen as nn
 import hydra
-import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -19,6 +29,7 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
+from tqdm.auto import tqdm
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import JaxMARLWrapper, SMAXLogWrapper
 
@@ -192,7 +203,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config):
+def make_train(config, progress_bar=None):
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
@@ -285,8 +296,12 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
-        ac_init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], 128)
-        cr_init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], 128)
+        ac_init_hstate = ScannedRNN.initialize_carry(
+            config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"]
+        )
+        cr_init_hstate = ScannedRNN.initialize_carry(
+            config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"]
+        )
 
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
@@ -591,25 +606,32 @@ def make_train(config):
             rng = update_state[-1]
 
             def callback(metric):
-                wandb.log(
-                    {
-                        # the metrics have an agent dimension, but this is identical
-                        # for all agents so index into the 0th item of that dimension.
-                        "returns": metric["returned_episode_returns"][:, :, 0][
-                            metric["returned_episode"][:, :, 0]
-                        ].mean(),
-                        "win_rate": metric["returned_won_episode"][:, :, 0][
-                            metric["returned_episode"][:, :, 0]
-                        ].mean(),
-                        "env_step": metric["update_steps"]
-                        * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
-                        **metric["loss"],
-                    }
-                )
+                # The metrics have an agent dimension, but they are identical
+                # for all agents, so index into the 0th agent.
+                log_data = {
+                    "returns": metric["returned_episode_returns"][:, :, 0][
+                        metric["returned_episode"][:, :, 0]
+                    ].mean(),
+                    "win_rate": metric["returned_won_episode"][:, :, 0][
+                        metric["returned_episode"][:, :, 0]
+                    ].mean(),
+                    "env_step": (metric["update_steps"] + 1)
+                    * config["NUM_ENVS"]
+                    * config["NUM_STEPS"],
+                    **metric["loss"],
+                }
+                if progress_bar is not None:
+                    completed = int(np.asarray(metric["update_steps"]).item()) + 1
+                    progress_bar.update(max(0, completed - progress_bar.n))
+                    postfix = {"steps": f"{int(log_data['env_step']):,}"}
+                    win_rate = float(np.asarray(log_data["win_rate"]).item())
+                    if np.isfinite(win_rate):
+                        postfix["win"] = f"{win_rate:.3f}"
+                    progress_bar.set_postfix(postfix)
+                wandb.log(log_data)
 
             metric["update_steps"] = update_steps
-            jax.experimental.io_callback(callback, None, metric)
+            jax.debug.callback(callback, metric, ordered=True)
             update_steps = update_steps + 1
             runner_state = (train_states, env_state, last_obs, last_done, hstates, rng)
             return (runner_state, update_steps), metric
@@ -648,9 +670,22 @@ def main(config):
         mode=config["WANDB_MODE"],
     )
     rng = jax.random.PRNGKey(config["SEED"])
-    with jax.disable_jit(False):
-        train_jit = jax.jit(make_train(config))
-        train_jit(rng)
+    num_updates = int(
+        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+    )
+    progress_bar = tqdm(
+        total=num_updates,
+        desc=f"MAPPO {config['MAP_NAME']} seed={config['SEED']}",
+        unit="update",
+        dynamic_ncols=True,
+    )
+    try:
+        with jax.disable_jit(False):
+            train_jit = jax.jit(make_train(config, progress_bar))
+            result = train_jit(rng)
+            jax.block_until_ready(result)
+    finally:
+        progress_bar.close()
 
 
 if __name__ == "__main__":

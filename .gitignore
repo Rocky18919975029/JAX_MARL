@@ -12,6 +12,7 @@ docker/*
 results/
 tmp/
 *-checkpoint.py
+*.bak-progress
 wandb/
 outputs/
 models/
