@@ -17,6 +17,8 @@
 "OBS_WITH_AGENT_ID": True
 "ACTOR_PARAMETER_SHARING": True
 "MATCHED_COMPARISON": False
+"ALIGN_MODE": "none" # none | c_to_a | a_to_c | reciprocal | joint
+"ALIGNMENT_COEF": 0.1
 "ENV_NAME": "HeuristicEnemySMAX"
 "MAP_NAME": "2s3z"
 "SEED": 0

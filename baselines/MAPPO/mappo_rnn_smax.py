@@ -131,13 +131,13 @@ class ActorRNN(nn.Module):
         embedding = nn.relu(embedding)
 
         rnn_in = (embedding, dones)
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        hidden, actor_latent = ScannedRNN()(hidden, rnn_in)
 
         actor_mean = nn.Dense(
             self.config["GRU_HIDDEN_DIM"],
             kernel_init=orthogonal(2),
             bias_init=constant(0.0),
-        )(embedding)
+        )(actor_latent)
         actor_mean = nn.relu(actor_mean)
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
@@ -147,7 +147,7 @@ class ActorRNN(nn.Module):
 
         pi = distrax.Categorical(logits=action_logits)
 
-        return hidden, pi
+        return hidden, pi, actor_latent
 
 
 class CriticRNN(nn.Module):
@@ -164,19 +164,19 @@ class CriticRNN(nn.Module):
         embedding = nn.relu(embedding)
 
         rnn_in = (embedding, dones)
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        hidden, critic_latent = ScannedRNN()(hidden, rnn_in)
 
         critic = nn.Dense(
             self.config["GRU_HIDDEN_DIM"],
             kernel_init=orthogonal(2),
             bias_init=constant(0.0),
-        )(embedding)
+        )(critic_latent)
         critic = nn.relu(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
         )
 
-        return hidden, jnp.squeeze(critic, axis=-1)
+        return hidden, jnp.squeeze(critic, axis=-1), critic_latent
 
 
 class Transition(NamedTuple):
@@ -188,6 +188,9 @@ class Transition(NamedTuple):
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     world_state: jnp.ndarray
+    actor_latent_old: jnp.ndarray
+    critic_latent_old: jnp.ndarray
+    alive_mask: jnp.ndarray
     info: jnp.ndarray
     avail_actions: jnp.ndarray
 
@@ -223,6 +226,19 @@ def tree_l2_norm(tree):
     )
 
 
+def latent_distance(source, target, mask):
+    """Masked MSE after parameter-free, per-sample layer normalization."""
+
+    def normalize(x):
+        mean = x.mean(axis=-1, keepdims=True)
+        variance = jnp.square(x - mean).mean(axis=-1, keepdims=True)
+        return (x - mean) * jax.lax.rsqrt(variance + 1e-5)
+
+    distance = jnp.square(normalize(source) - normalize(target)).mean(axis=-1)
+    mask = mask.astype(distance.dtype)
+    return (distance * mask).sum() / jnp.maximum(mask.sum(), 1.0)
+
+
 def make_train(config, progress_bar=None):
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
@@ -233,6 +249,16 @@ def make_train(config, progress_bar=None):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+    valid_align_modes = {"none", "c_to_a", "a_to_c", "reciprocal", "joint"}
+    if config["ALIGN_MODE"] not in valid_align_modes:
+        raise ValueError(
+            f"ALIGN_MODE must be one of {sorted(valid_align_modes)}, got "
+            f"{config['ALIGN_MODE']!r}."
+        )
+    if config["ALIGN_MODE"] != "none" and not config["MATCHED_COMPARISON"]:
+        raise ValueError(
+            "Representation alignment requires MATCHED_COMPARISON=true."
+        )
     if (
         (not config["ACTOR_PARAMETER_SHARING"] or config["MATCHED_COMPARISON"])
         and config["NUM_ENVS"] % config["NUM_MINIBATCHES"] != 0
@@ -378,7 +404,7 @@ def make_train(config, progress_bar=None):
                     config["ACTOR_PARAMETER_SHARING"]
                     and not config["MATCHED_COMPARISON"]
                 ):
-                    ac_hstate, pi = actor_network.apply(
+                    ac_hstate, pi, actor_latent = actor_network.apply(
                         train_states[0].params, hstates[0], ac_in
                     )
                     action = pi.sample(seed=_rng)
@@ -405,14 +431,16 @@ def make_train(config, progress_bar=None):
                     actor_rngs = jax.random.split(_rng, env.num_agents)
 
                     def apply_and_sample(params, hidden, inputs, sample_rng):
-                        hidden, pi = actor_network.apply(params, hidden, inputs)
+                        hidden, pi, latent = actor_network.apply(
+                            params, hidden, inputs
+                        )
                         action = pi.sample(seed=sample_rng)
-                        return hidden, action, pi.log_prob(action)
+                        return hidden, action, pi.log_prob(action), latent
 
                     parameter_axis = (
                         None if config["ACTOR_PARAMETER_SHARING"] else 0
                     )
-                    ac_hstate, action, log_prob = jax.vmap(
+                    ac_hstate, action, log_prob, actor_latent = jax.vmap(
                         apply_and_sample,
                         in_axes=(parameter_axis, 0, 0, 0),
                     )(
@@ -423,6 +451,9 @@ def make_train(config, progress_bar=None):
                     )
                     action = action.reshape((1, config["NUM_ACTORS"]))
                     log_prob = log_prob.reshape((1, config["NUM_ACTORS"]))
+                    actor_latent = actor_latent.reshape(
+                        (1, config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+                    )
                     ac_hstate = ac_hstate.reshape(
                         (config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
                     )
@@ -441,7 +472,7 @@ def make_train(config, progress_bar=None):
                     world_state[None, :],
                     last_done[np.newaxis, :],
                 )
-                cr_hstate, value = critic_network.apply(
+                cr_hstate, value, critic_latent = critic_network.apply(
                     train_states[1].params, hstates[1], cr_in
                 )
 
@@ -462,6 +493,9 @@ def make_train(config, progress_bar=None):
                     log_prob.squeeze(),
                     obs_batch,
                     world_state,
+                    jax.lax.stop_gradient(actor_latent.squeeze(axis=0)),
+                    jax.lax.stop_gradient(critic_latent.squeeze(axis=0)),
+                    jnp.sum(avail_actions, axis=-1) > 1,
                     info,
                     avail_actions,
                 )
@@ -490,7 +524,7 @@ def make_train(config, progress_bar=None):
                 last_world_state[None, :],
                 last_done[np.newaxis, :],
             )
-            _, last_val = critic_network.apply(
+            _, last_val, _ = critic_network.apply(
                 train_states[1].params, hstates[1], cr_in
             )
             last_val = last_val.squeeze()
@@ -531,7 +565,7 @@ def make_train(config, progress_bar=None):
 
                     def _actor_loss_fn(actor_params, init_hstate, traj_batch, gae):
                         # RERUN NETWORK
-                        _, pi = actor_network.apply(
+                        _, pi, actor_latent = actor_network.apply(
                             actor_params,
                             init_hstate.squeeze(),
                             (traj_batch.obs, traj_batch.done, traj_batch.avail_actions),
@@ -568,13 +602,14 @@ def make_train(config, progress_bar=None):
                             ratio,
                             approx_kl,
                             clip_frac,
+                            actor_latent,
                         )
 
                     def _critic_loss_fn(
                         critic_params, init_hstate, traj_batch, targets
                     ):
                         # RERUN NETWORK
-                        _, value = critic_network.apply(
+                        _, value, critic_latent = critic_network.apply(
                             critic_params,
                             init_hstate.squeeze(),
                             (traj_batch.world_state, traj_batch.done),
@@ -590,7 +625,7 @@ def make_train(config, progress_bar=None):
                             0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         )
                         critic_loss = config["VF_COEF"] * value_loss
-                        return critic_loss, (value_loss)
+                        return critic_loss, (value_loss, critic_latent)
 
                     def split_agents(x):
                         x = x.reshape(
@@ -611,49 +646,165 @@ def make_train(config, progress_bar=None):
                     else:
                         actor_advantages = advantages
 
-                    if (
-                        config["ACTOR_PARAMETER_SHARING"]
-                        and not config["MATCHED_COMPARISON"]
-                    ):
+                    if config["MATCHED_COMPARISON"]:
+                        actor_batch = jax.tree.map(split_agents, traj_batch)
+                        actor_hstates = split_agents(ac_init_hstate)
+                        actor_advantages = split_agents(actor_advantages)
+                        parameter_axis = (
+                            None if config["ACTOR_PARAMETER_SHARING"] else 0
+                        )
+
+                        def matched_total_loss(actor_params, critic_params):
+                            actor_losses, actor_aux = jax.vmap(
+                                _actor_loss_fn,
+                                in_axes=(parameter_axis, 0, 0, 0),
+                            )(
+                                actor_params,
+                                actor_hstates,
+                                actor_batch,
+                                actor_advantages,
+                            )
+                            critic_rl_loss, critic_aux = _critic_loss_fn(
+                                critic_params,
+                                cr_init_hstate,
+                                traj_batch,
+                                targets,
+                            )
+
+                            actor_latent = actor_aux[5].swapaxes(0, 1).reshape(
+                                traj_batch.actor_latent_old.shape
+                            )
+                            critic_latent = critic_aux[1]
+                            mask = traj_batch.alive_mask
+                            c_to_a_loss = latent_distance(
+                                actor_latent,
+                                jax.lax.stop_gradient(
+                                    traj_batch.critic_latent_old
+                                ),
+                                mask,
+                            )
+                            a_to_c_loss = latent_distance(
+                                critic_latent,
+                                jax.lax.stop_gradient(
+                                    traj_batch.actor_latent_old
+                                ),
+                                mask,
+                            )
+                            joint_loss = latent_distance(
+                                actor_latent, critic_latent, mask
+                            )
+                            zero = jnp.zeros((), dtype=actor_latent.dtype)
+                            actor_alignment = zero
+                            critic_alignment = zero
+                            joint_alignment = zero
+                            if config["ALIGN_MODE"] == "c_to_a":
+                                actor_alignment = c_to_a_loss
+                            elif config["ALIGN_MODE"] == "a_to_c":
+                                critic_alignment = a_to_c_loss
+                            elif config["ALIGN_MODE"] == "reciprocal":
+                                actor_alignment = c_to_a_loss
+                                critic_alignment = a_to_c_loss
+                            elif config["ALIGN_MODE"] == "joint":
+                                joint_alignment = joint_loss
+
+                            alignment_objective = (
+                                actor_alignment
+                                + critic_alignment
+                                + joint_alignment
+                            )
+                            total_loss = (
+                                actor_losses.mean()
+                                + critic_rl_loss
+                                + config["ALIGNMENT_COEF"]
+                                * alignment_objective
+                            )
+                            return total_loss, (
+                                actor_losses,
+                                actor_aux,
+                                critic_rl_loss,
+                                critic_aux,
+                                c_to_a_loss,
+                                a_to_c_loss,
+                                joint_loss,
+                                actor_alignment,
+                                critic_alignment,
+                                joint_alignment,
+                            )
+
+                        (
+                            (combined_total_loss, matched_aux),
+                            (actor_grads, critic_grads),
+                        ) = jax.value_and_grad(
+                            matched_total_loss,
+                            argnums=(0, 1),
+                            has_aux=True,
+                        )(
+                            actor_train_state.params,
+                            critic_train_state.params,
+                        )
+                        if not config["ACTOR_PARAMETER_SHARING"]:
+                            actor_grads = jax.tree.map(
+                                lambda x: x * env.num_agents, actor_grads
+                            )
+                        actor_loss = (matched_aux[0], matched_aux[1])
+                        critic_loss = (matched_aux[2], matched_aux[3])
+                        c_to_a_loss = matched_aux[4]
+                        a_to_c_loss = matched_aux[5]
+                        current_joint_loss = matched_aux[6]
+                        actor_alignment_loss = matched_aux[7]
+                        critic_alignment_loss = matched_aux[8]
+                        joint_alignment_loss = matched_aux[9]
+                    elif config["ACTOR_PARAMETER_SHARING"]:
                         actor_loss, actor_grads = actor_grad_fn(
                             actor_train_state.params,
                             ac_init_hstate,
                             traj_batch,
                             actor_advantages,
                         )
+                        critic_loss, critic_grads = jax.value_and_grad(
+                            _critic_loss_fn, has_aux=True
+                        )(
+                            critic_train_state.params,
+                            cr_init_hstate,
+                            traj_batch,
+                            targets,
+                        )
+                        combined_total_loss = actor_loss[0] + critic_loss[0]
+                        zero = jnp.zeros((), dtype=advantages.dtype)
+                        c_to_a_loss = zero
+                        a_to_c_loss = zero
+                        current_joint_loss = zero
+                        actor_alignment_loss = zero
+                        critic_alignment_loss = zero
+                        joint_alignment_loss = zero
                     else:
                         actor_batch = jax.tree.map(split_agents, traj_batch)
                         actor_hstates = split_agents(ac_init_hstate)
                         actor_advantages = split_agents(actor_advantages)
-                        if config["ACTOR_PARAMETER_SHARING"]:
-                            def shared_actor_loss_fn(actor_params):
-                                actor_losses, actor_aux = jax.vmap(
-                                    _actor_loss_fn,
-                                    in_axes=(None, 0, 0, 0),
-                                )(
-                                    actor_params,
-                                    actor_hstates,
-                                    actor_batch,
-                                    actor_advantages,
-                                )
-                                return actor_losses.mean(), jax.tree.map(
-                                    lambda x: x.mean(axis=0), actor_aux
-                                )
-
-                            actor_loss, actor_grads = jax.value_and_grad(
-                                shared_actor_loss_fn, has_aux=True
-                            )(actor_train_state.params)
-                        else:
-                            actor_loss, actor_grads = jax.vmap(actor_grad_fn)(
-                                actor_train_state.params,
-                                actor_hstates,
-                                actor_batch,
-                                actor_advantages,
-                            )
-                    critic_grad_fn = jax.value_and_grad(_critic_loss_fn, has_aux=True)
-                    critic_loss, critic_grads = critic_grad_fn(
-                        critic_train_state.params, cr_init_hstate, traj_batch, targets
-                    )
+                        actor_loss, actor_grads = jax.vmap(actor_grad_fn)(
+                            actor_train_state.params,
+                            actor_hstates,
+                            actor_batch,
+                            actor_advantages,
+                        )
+                        critic_loss, critic_grads = jax.value_and_grad(
+                            _critic_loss_fn, has_aux=True
+                        )(
+                            critic_train_state.params,
+                            cr_init_hstate,
+                            traj_batch,
+                            targets,
+                        )
+                        combined_total_loss = (
+                            actor_loss[0].mean() + critic_loss[0]
+                        )
+                        zero = jnp.zeros((), dtype=advantages.dtype)
+                        c_to_a_loss = zero
+                        a_to_c_loss = zero
+                        current_joint_loss = zero
+                        actor_alignment_loss = zero
+                        critic_alignment_loss = zero
+                        joint_alignment_loss = zero
 
                     if config["ACTOR_PARAMETER_SHARING"]:
                         actor_grad_norms = jnp.asarray(
@@ -661,8 +812,10 @@ def make_train(config, progress_bar=None):
                         )
                     else:
                         actor_grad_norms = jax.vmap(tree_l2_norm)(actor_grads)
+                    critic_grad_norm = tree_l2_norm(critic_grads)
 
                     old_actor_params = actor_train_state.params
+                    old_critic_params = critic_train_state.params
                     actor_train_state = actor_train_state.apply_gradients(
                         grads=actor_grads
                     )
@@ -673,6 +826,11 @@ def make_train(config, progress_bar=None):
                         lambda new, old: new - old,
                         actor_train_state.params,
                         old_actor_params,
+                    )
+                    critic_param_updates = jax.tree.map(
+                        lambda new, old: new - old,
+                        critic_train_state.params,
+                        old_critic_params,
                     )
                     if config["ACTOR_PARAMETER_SHARING"]:
                         actor_update_norms = jnp.asarray(
@@ -687,15 +845,20 @@ def make_train(config, progress_bar=None):
                     )
 
                     mean_actor_loss = actor_loss[0].mean()
-                    total_loss = mean_actor_loss + critic_loss[0]
                     loss_info = {
-                        "total_loss": total_loss,
+                        "total_loss": combined_total_loss,
                         "actor_loss": mean_actor_loss,
-                        "value_loss": critic_loss[0],
+                        "value_loss": critic_loss[1][0],
                         "entropy": actor_loss[1][1].mean(),
                         "ratio": actor_loss[1][2],
                         "approx_kl": actor_loss[1][3].mean(),
                         "clip_frac": actor_loss[1][4].mean(),
+                        "alignment_c_to_a_distance": c_to_a_loss,
+                        "alignment_a_to_c_distance": a_to_c_loss,
+                        "alignment_current_joint_distance": current_joint_loss,
+                        "alignment_actor_objective": actor_alignment_loss,
+                        "alignment_critic_objective": critic_alignment_loss,
+                        "alignment_joint_objective": joint_alignment_loss,
                         "actor_grad_norm_mean": actor_grad_norms.mean(),
                         "actor_grad_norm_max": actor_grad_norms.max(),
                         "actor_grad_norm_after_clip_mean": (
@@ -709,6 +872,16 @@ def make_train(config, progress_bar=None):
                         ),
                         "actor_update_norm_mean": actor_update_norms.mean(),
                         "actor_update_norm_max": actor_update_norms.max(),
+                        "critic_grad_norm": critic_grad_norm,
+                        "critic_grad_norm_after_clip": jnp.minimum(
+                            critic_grad_norm, config["MAX_GRAD_NORM"]
+                        ),
+                        "critic_grad_clipped": (
+                            critic_grad_norm > config["MAX_GRAD_NORM"]
+                        ),
+                        "critic_update_norm": tree_l2_norm(
+                            critic_param_updates
+                        ),
                     }
 
                     if config["MATCHED_COMPARISON"]:
@@ -922,7 +1095,10 @@ def main(config):
         tags=[t for t in os.environ.get("WANDB_TAGS", "").split(",") if t],
         group=os.environ.get("WANDB_RUN_GROUP") or None,
         name=os.environ.get("WANDB_NAME")
-        or f"MAPPO-{actor_mode}-{config['MAP_NAME']}-seed{config['SEED']}",
+        or (
+            f"MAPPO-{actor_mode}-{config['ALIGN_MODE']}-"
+            f"{config['MAP_NAME']}-seed{config['SEED']}"
+        ),
         config=config,
         mode=config["WANDB_MODE"],
     )
@@ -933,7 +1109,8 @@ def main(config):
     progress_bar = tqdm(
         total=num_updates,
         desc=(
-            f"MAPPO {actor_mode} {config['MAP_NAME']} seed={config['SEED']}"
+            f"MAPPO {actor_mode} {config['ALIGN_MODE']} "
+            f"{config['MAP_NAME']} seed={config['SEED']}"
         ),
         unit="update",
         dynamic_ncols=True,

@@ -49,6 +49,26 @@ one optimizer per actor. Gradient norms, clipping rates, parameter-update norms,
 and global/per-agent advantage statistics are logged to W&B to quantify the
 remaining optimization differences.
 
+## Actor-critic representation alignment
+
+Alignment experiments require `MATCHED_COMPARISON=true`. Select one mode with:
+
+```bash
+ALIGN_MODE=none        # matched baseline
+ALIGN_MODE=c_to_a      # frozen critic rollout latent teaches actor
+ALIGN_MODE=a_to_c      # frozen actor rollout latent teaches critic
+ALIGN_MODE=reciprocal  # both frozen-target directions
+ALIGN_MODE=joint       # current actor and critic latents jointly align
+ALIGNMENT_COEF=0.1
+```
+
+Both representations are the 128-dimensional post-GRU, pre-head latent. The
+distance is per-sample layer-normalized MSE, averaged only over currently alive
+agents. Frozen targets are saved during rollout and remain fixed across all PPO
+minibatches and epochs in that update. Joint mode obtains actor and critic
+gradients from one combined forward loss, so neither side observes parameters
+already updated by the other side.
+
 ## Tested environment
 
 - Ubuntu 22.04
