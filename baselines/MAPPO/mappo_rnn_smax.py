@@ -217,6 +217,12 @@ def vmapped_optimizer(tx):
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+def tree_l2_norm(tree):
+    return jnp.sqrt(
+        sum(jnp.sum(jnp.square(x)) for x in jax.tree.leaves(tree))
+    )
+
+
 def make_train(config, progress_bar=None):
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
@@ -228,12 +234,12 @@ def make_train(config, progress_bar=None):
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
     if (
-        not config["ACTOR_PARAMETER_SHARING"]
+        (not config["ACTOR_PARAMETER_SHARING"] or config["MATCHED_COMPARISON"])
         and config["NUM_ENVS"] % config["NUM_MINIBATCHES"] != 0
     ):
         raise ValueError(
-            "NUM_ENVS must be divisible by NUM_MINIBATCHES when actor parameters "
-            "are not shared."
+            "NUM_ENVS must be divisible by NUM_MINIBATCHES for independent actors "
+            "or the matched comparison protocol."
         )
     config["CLIP_EPS"] = (
         config["CLIP_EPS"] / env.num_agents
@@ -267,15 +273,23 @@ def make_train(config, progress_bar=None):
         ac_init_hstate = ScannedRNN.initialize_carry(
             config["NUM_ENVS"], config["GRU_HIDDEN_DIM"]
         )
-        if config["ACTOR_PARAMETER_SHARING"]:
-            actor_network_params = actor_network.init(
-                _rng_actor, ac_init_hstate, ac_init_x
-            )
-        else:
+        if (
+            not config["ACTOR_PARAMETER_SHARING"]
+            and not config["MATCHED_COMPARISON"]
+        ):
             actor_rngs = jax.random.split(_rng_actor, env.num_agents)
             actor_network_params = jax.vmap(
                 actor_network.init, in_axes=(0, None, None)
             )(actor_rngs, ac_init_hstate, ac_init_x)
+        else:
+            actor_network_params = actor_network.init(
+                _rng_actor, ac_init_hstate, ac_init_x
+            )
+            if not config["ACTOR_PARAMETER_SHARING"]:
+                actor_network_params = jax.tree.map(
+                    lambda x: jnp.repeat(x[None, ...], env.num_agents, axis=0),
+                    actor_network_params,
+                )
         cr_init_x = (
             jnp.zeros(
                 (
@@ -360,7 +374,10 @@ def make_train(config, progress_bar=None):
                     last_done[np.newaxis, :],
                     avail_actions,
                 )
-                if config["ACTOR_PARAMETER_SHARING"]:
+                if (
+                    config["ACTOR_PARAMETER_SHARING"]
+                    and not config["MATCHED_COMPARISON"]
+                ):
                     ac_hstate, pi = actor_network.apply(
                         train_states[0].params, hstates[0], ac_in
                     )
@@ -392,7 +409,13 @@ def make_train(config, progress_bar=None):
                         action = pi.sample(seed=sample_rng)
                         return hidden, action, pi.log_prob(action)
 
-                    ac_hstate, action, log_prob = jax.vmap(apply_and_sample)(
+                    parameter_axis = (
+                        None if config["ACTOR_PARAMETER_SHARING"] else 0
+                    )
+                    ac_hstate, action, log_prob = jax.vmap(
+                        apply_and_sample,
+                        in_axes=(parameter_axis, 0, 0, 0),
+                    )(
                         train_states[0].params,
                         actor_hstate,
                         actor_in,
@@ -518,7 +541,8 @@ def make_train(config, progress_bar=None):
                         # CALCULATE ACTOR LOSS
                         logratio = log_prob - traj_batch.log_prob
                         ratio = jnp.exp(logratio)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        if not config["MATCHED_COMPARISON"]:
+                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -568,45 +592,98 @@ def make_train(config, progress_bar=None):
                         critic_loss = config["VF_COEF"] * value_loss
                         return critic_loss, (value_loss)
 
+                    def split_agents(x):
+                        x = x.reshape(
+                            (
+                                x.shape[0],
+                                env.num_agents,
+                                -1,
+                                *x.shape[2:],
+                            )
+                        )
+                        return jnp.swapaxes(x, 0, 1)
+
                     actor_grad_fn = jax.value_and_grad(_actor_loss_fn, has_aux=True)
-                    if config["ACTOR_PARAMETER_SHARING"]:
+                    if config["MATCHED_COMPARISON"]:
+                        actor_advantages = (
+                            advantages - advantages.mean()
+                        ) / (advantages.std() + 1e-8)
+                    else:
+                        actor_advantages = advantages
+
+                    if (
+                        config["ACTOR_PARAMETER_SHARING"]
+                        and not config["MATCHED_COMPARISON"]
+                    ):
                         actor_loss, actor_grads = actor_grad_fn(
                             actor_train_state.params,
                             ac_init_hstate,
                             traj_batch,
-                            advantages,
-                        )
-                    else:
-                        def split_agents(x):
-                            x = x.reshape(
-                                (
-                                    x.shape[0],
-                                    env.num_agents,
-                                    -1,
-                                    *x.shape[2:],
-                                )
-                            )
-                            return jnp.swapaxes(x, 0, 1)
-
-                        actor_batch = jax.tree.map(split_agents, traj_batch)
-                        actor_hstates = split_agents(ac_init_hstate)
-                        actor_advantages = split_agents(advantages)
-                        actor_loss, actor_grads = jax.vmap(actor_grad_fn)(
-                            actor_train_state.params,
-                            actor_hstates,
-                            actor_batch,
                             actor_advantages,
                         )
+                    else:
+                        actor_batch = jax.tree.map(split_agents, traj_batch)
+                        actor_hstates = split_agents(ac_init_hstate)
+                        actor_advantages = split_agents(actor_advantages)
+                        if config["ACTOR_PARAMETER_SHARING"]:
+                            def shared_actor_loss_fn(actor_params):
+                                actor_losses, actor_aux = jax.vmap(
+                                    _actor_loss_fn,
+                                    in_axes=(None, 0, 0, 0),
+                                )(
+                                    actor_params,
+                                    actor_hstates,
+                                    actor_batch,
+                                    actor_advantages,
+                                )
+                                return actor_losses.mean(), jax.tree.map(
+                                    lambda x: x.mean(axis=0), actor_aux
+                                )
+
+                            actor_loss, actor_grads = jax.value_and_grad(
+                                shared_actor_loss_fn, has_aux=True
+                            )(actor_train_state.params)
+                        else:
+                            actor_loss, actor_grads = jax.vmap(actor_grad_fn)(
+                                actor_train_state.params,
+                                actor_hstates,
+                                actor_batch,
+                                actor_advantages,
+                            )
                     critic_grad_fn = jax.value_and_grad(_critic_loss_fn, has_aux=True)
                     critic_loss, critic_grads = critic_grad_fn(
                         critic_train_state.params, cr_init_hstate, traj_batch, targets
                     )
 
+                    if config["ACTOR_PARAMETER_SHARING"]:
+                        actor_grad_norms = jnp.asarray(
+                            [tree_l2_norm(actor_grads)]
+                        )
+                    else:
+                        actor_grad_norms = jax.vmap(tree_l2_norm)(actor_grads)
+
+                    old_actor_params = actor_train_state.params
                     actor_train_state = actor_train_state.apply_gradients(
                         grads=actor_grads
                     )
                     critic_train_state = critic_train_state.apply_gradients(
                         grads=critic_grads
+                    )
+                    actor_param_updates = jax.tree.map(
+                        lambda new, old: new - old,
+                        actor_train_state.params,
+                        old_actor_params,
+                    )
+                    if config["ACTOR_PARAMETER_SHARING"]:
+                        actor_update_norms = jnp.asarray(
+                            [tree_l2_norm(actor_param_updates)]
+                        )
+                    else:
+                        actor_update_norms = jax.vmap(tree_l2_norm)(
+                            actor_param_updates
+                        )
+                    actor_grad_norms_after_clip = jnp.minimum(
+                        actor_grad_norms, config["MAX_GRAD_NORM"]
                     )
 
                     mean_actor_loss = actor_loss[0].mean()
@@ -619,7 +696,33 @@ def make_train(config, progress_bar=None):
                         "ratio": actor_loss[1][2],
                         "approx_kl": actor_loss[1][3].mean(),
                         "clip_frac": actor_loss[1][4].mean(),
+                        "actor_grad_norm_mean": actor_grad_norms.mean(),
+                        "actor_grad_norm_max": actor_grad_norms.max(),
+                        "actor_grad_norm_after_clip_mean": (
+                            actor_grad_norms_after_clip.mean()
+                        ),
+                        "actor_grad_norm_after_clip_max": (
+                            actor_grad_norms_after_clip.max()
+                        ),
+                        "actor_grad_clipped_fraction": jnp.mean(
+                            actor_grad_norms > config["MAX_GRAD_NORM"]
+                        ),
+                        "actor_update_norm_mean": actor_update_norms.mean(),
+                        "actor_update_norm_max": actor_update_norms.max(),
                     }
+
+                    if config["MATCHED_COMPARISON"]:
+                        raw_advantages_by_agent = split_agents(advantages)
+                        loss_info["advantage_global_mean"] = advantages.mean()
+                        loss_info["advantage_global_std"] = advantages.std()
+                        for agent_idx in range(env.num_agents):
+                            agent_advantages = raw_advantages_by_agent[agent_idx]
+                            loss_info[f"advantage_mean_agent_{agent_idx}"] = (
+                                agent_advantages.mean()
+                            )
+                            loss_info[f"advantage_std_agent_{agent_idx}"] = (
+                                agent_advantages.std()
+                            )
 
                     return (actor_train_state, critic_train_state), loss_info
 
@@ -645,7 +748,10 @@ def make_train(config, progress_bar=None):
                     advantages.squeeze(),
                     targets.squeeze(),
                 )
-                if config["ACTOR_PARAMETER_SHARING"]:
+                if (
+                    config["ACTOR_PARAMETER_SHARING"]
+                    and not config["MATCHED_COMPARISON"]
+                ):
                     permutation = jax.random.permutation(
                         _rng, config["NUM_ACTORS"]
                     )
@@ -665,15 +771,15 @@ def make_train(config, progress_bar=None):
                         shuffled_batch,
                     )
                 else:
-                    # Keep every agent represented in every minibatch. Each
-                    # independent actor is then updated only from its own
-                    # environment trajectories.
+                    # Keep every agent represented in every minibatch. Matched
+                    # shared and independent runs therefore give the critic the
+                    # same samples in the same update order.
                     permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
                     envs_per_minibatch = (
                         config["NUM_ENVS"] // config["NUM_MINIBATCHES"]
                     )
 
-                    def make_independent_minibatches(x):
+                    def make_stratified_minibatches(x):
                         x = x.reshape(
                             (
                                 x.shape[0],
@@ -703,7 +809,7 @@ def make_train(config, progress_bar=None):
                         )
 
                     minibatches = jax.tree.map(
-                        make_independent_minibatches, batch
+                        make_stratified_minibatches, batch
                     )
 
                 # train_states = (actor_train_state, critic_train_state)
@@ -799,10 +905,15 @@ def make_train(config, progress_bar=None):
 def main(config):
 
     config = OmegaConf.to_container(config)
-    actor_mode = (
+    sharing_mode = (
         "shared-actor"
         if config["ACTOR_PARAMETER_SHARING"]
         else "independent-actors"
+    )
+    actor_mode = (
+        f"matched-{sharing_mode}"
+        if config["MATCHED_COMPARISON"]
+        else sharing_mode
     )
 
     wandb.init(

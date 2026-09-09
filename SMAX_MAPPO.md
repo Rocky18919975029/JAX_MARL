@@ -26,6 +26,29 @@ In independent-actor mode, each actor has its own parameters, Adam state,
 gradient clipping, and advantage normalization. Minibatches retain a separate,
 equal set of environment trajectories for every actor.
 
+## Matched actor-sharing comparison
+
+For a controlled shared-versus-independent actor experiment, enable:
+
+```bash
+MATCHED_COMPARISON=true
+```
+
+Run this once with `ACTOR_PARAMETER_SHARING=true` and once with
+`ACTOR_PARAMETER_SHARING=false` for every seed. With the same seed, both runs
+use:
+
+- identical initial actor parameters (the independent run copies the same
+  initial parameters to every actor);
+- identical per-agent action-sampling keys and agent-wise actor execution;
+- identical environment-stratified minibatches and critic update order;
+- identical global, cross-agent advantage normalization in every minibatch.
+
+The shared run still uses one actor optimizer, while the independent run uses
+one optimizer per actor. Gradient norms, clipping rates, parameter-update norms,
+and global/per-agent advantage statistics are logged to W&B to quantify the
+remaining optimization differences.
+
 ## Tested environment
 
 - Ubuntu 22.04
