@@ -203,6 +203,20 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
+def vmapped_optimizer(tx):
+    """Apply one optimizer independently to every leading parameter slice."""
+
+    def init_fn(params):
+        return jax.vmap(tx.init)(params)
+
+    def update_fn(updates, state, params=None):
+        if params is None:
+            return jax.vmap(lambda g, s: tx.update(g, s))(updates, state)
+        return jax.vmap(tx.update)(updates, state, params)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def make_train(config, progress_bar=None):
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
@@ -213,6 +227,14 @@ def make_train(config, progress_bar=None):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+    if (
+        not config["ACTOR_PARAMETER_SHARING"]
+        and config["NUM_ENVS"] % config["NUM_MINIBATCHES"] != 0
+    ):
+        raise ValueError(
+            "NUM_ENVS must be divisible by NUM_MINIBATCHES when actor parameters "
+            "are not shared."
+        )
     config["CLIP_EPS"] = (
         config["CLIP_EPS"] / env.num_agents
         if config["SCALE_CLIP_EPS"]
@@ -245,7 +267,15 @@ def make_train(config, progress_bar=None):
         ac_init_hstate = ScannedRNN.initialize_carry(
             config["NUM_ENVS"], config["GRU_HIDDEN_DIM"]
         )
-        actor_network_params = actor_network.init(_rng_actor, ac_init_hstate, ac_init_x)
+        if config["ACTOR_PARAMETER_SHARING"]:
+            actor_network_params = actor_network.init(
+                _rng_actor, ac_init_hstate, ac_init_x
+            )
+        else:
+            actor_rngs = jax.random.split(_rng_actor, env.num_agents)
+            actor_network_params = jax.vmap(
+                actor_network.init, in_axes=(0, None, None)
+            )(actor_rngs, ac_init_hstate, ac_init_x)
         cr_init_x = (
             jnp.zeros(
                 (
@@ -264,7 +294,7 @@ def make_train(config, progress_bar=None):
         )
 
         if config["ANNEAL_LR"]:
-            actor_tx = optax.chain(
+            base_actor_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(learning_rate=linear_schedule, eps=1e-5),
             )
@@ -273,7 +303,7 @@ def make_train(config, progress_bar=None):
                 optax.adam(learning_rate=linear_schedule, eps=1e-5),
             )
         else:
-            actor_tx = optax.chain(
+            base_actor_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["LR"], eps=1e-5),
             )
@@ -281,6 +311,11 @@ def make_train(config, progress_bar=None):
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["LR"], eps=1e-5),
             )
+        actor_tx = (
+            base_actor_tx
+            if config["ACTOR_PARAMETER_SHARING"]
+            else vmapped_optimizer(base_actor_tx)
+        )
         actor_train_state = TrainState.create(
             apply_fn=actor_network.apply,
             params=actor_network_params,
@@ -325,12 +360,49 @@ def make_train(config, progress_bar=None):
                     last_done[np.newaxis, :],
                     avail_actions,
                 )
-                # print('env step ac in', ac_in)
-                ac_hstate, pi = actor_network.apply(
-                    train_states[0].params, hstates[0], ac_in
-                )
-                action = pi.sample(seed=_rng)
-                log_prob = pi.log_prob(action)
+                if config["ACTOR_PARAMETER_SHARING"]:
+                    ac_hstate, pi = actor_network.apply(
+                        train_states[0].params, hstates[0], ac_in
+                    )
+                    action = pi.sample(seed=_rng)
+                    log_prob = pi.log_prob(action)
+                else:
+                    actor_hstate = hstates[0].reshape(
+                        (
+                            env.num_agents,
+                            config["NUM_ENVS"],
+                            config["GRU_HIDDEN_DIM"],
+                        )
+                    )
+                    actor_in = (
+                        obs_batch.reshape(
+                            (env.num_agents, config["NUM_ENVS"], -1)
+                        )[:, None, ...],
+                        last_done.reshape(
+                            (env.num_agents, config["NUM_ENVS"])
+                        )[:, None, ...],
+                        avail_actions.reshape(
+                            (env.num_agents, config["NUM_ENVS"], -1)
+                        ),
+                    )
+                    actor_rngs = jax.random.split(_rng, env.num_agents)
+
+                    def apply_and_sample(params, hidden, inputs, sample_rng):
+                        hidden, pi = actor_network.apply(params, hidden, inputs)
+                        action = pi.sample(seed=sample_rng)
+                        return hidden, action, pi.log_prob(action)
+
+                    ac_hstate, action, log_prob = jax.vmap(apply_and_sample)(
+                        train_states[0].params,
+                        actor_hstate,
+                        actor_in,
+                        actor_rngs,
+                    )
+                    action = action.reshape((1, config["NUM_ACTORS"]))
+                    log_prob = log_prob.reshape((1, config["NUM_ACTORS"]))
+                    ac_hstate = ac_hstate.reshape(
+                        (config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+                    )
                 env_act = unbatchify(
                     action, env.agents, config["NUM_ENVS"], env.num_agents
                 )
@@ -497,9 +569,34 @@ def make_train(config, progress_bar=None):
                         return critic_loss, (value_loss)
 
                     actor_grad_fn = jax.value_and_grad(_actor_loss_fn, has_aux=True)
-                    actor_loss, actor_grads = actor_grad_fn(
-                        actor_train_state.params, ac_init_hstate, traj_batch, advantages
-                    )
+                    if config["ACTOR_PARAMETER_SHARING"]:
+                        actor_loss, actor_grads = actor_grad_fn(
+                            actor_train_state.params,
+                            ac_init_hstate,
+                            traj_batch,
+                            advantages,
+                        )
+                    else:
+                        def split_agents(x):
+                            x = x.reshape(
+                                (
+                                    x.shape[0],
+                                    env.num_agents,
+                                    -1,
+                                    *x.shape[2:],
+                                )
+                            )
+                            return jnp.swapaxes(x, 0, 1)
+
+                        actor_batch = jax.tree.map(split_agents, traj_batch)
+                        actor_hstates = split_agents(ac_init_hstate)
+                        actor_advantages = split_agents(advantages)
+                        actor_loss, actor_grads = jax.vmap(actor_grad_fn)(
+                            actor_train_state.params,
+                            actor_hstates,
+                            actor_batch,
+                            actor_advantages,
+                        )
                     critic_grad_fn = jax.value_and_grad(_critic_loss_fn, has_aux=True)
                     critic_loss, critic_grads = critic_grad_fn(
                         critic_train_state.params, cr_init_hstate, traj_batch, targets
@@ -512,15 +609,16 @@ def make_train(config, progress_bar=None):
                         grads=critic_grads
                     )
 
-                    total_loss = actor_loss[0] + critic_loss[0]
+                    mean_actor_loss = actor_loss[0].mean()
+                    total_loss = mean_actor_loss + critic_loss[0]
                     loss_info = {
                         "total_loss": total_loss,
-                        "actor_loss": actor_loss[0],
+                        "actor_loss": mean_actor_loss,
                         "value_loss": critic_loss[0],
-                        "entropy": actor_loss[1][1],
+                        "entropy": actor_loss[1][1].mean(),
                         "ratio": actor_loss[1][2],
-                        "approx_kl": actor_loss[1][3],
-                        "clip_frac": actor_loss[1][4],
+                        "approx_kl": actor_loss[1][3].mean(),
+                        "clip_frac": actor_loss[1][4].mean(),
                     }
 
                     return (actor_train_state, critic_train_state), loss_info
@@ -547,24 +645,66 @@ def make_train(config, progress_bar=None):
                     advantages.squeeze(),
                     targets.squeeze(),
                 )
-                permutation = jax.random.permutation(_rng, config["NUM_ACTORS"])
-
-                shuffled_batch = jax.tree.map(
-                    lambda x: jnp.take(x, permutation, axis=1), batch
-                )
-
-                minibatches = jax.tree.map(
-                    lambda x: jnp.swapaxes(
-                        jnp.reshape(
-                            x,
-                            [x.shape[0], config["NUM_MINIBATCHES"], -1]
-                            + list(x.shape[2:]),
+                if config["ACTOR_PARAMETER_SHARING"]:
+                    permutation = jax.random.permutation(
+                        _rng, config["NUM_ACTORS"]
+                    )
+                    shuffled_batch = jax.tree.map(
+                        lambda x: jnp.take(x, permutation, axis=1), batch
+                    )
+                    minibatches = jax.tree.map(
+                        lambda x: jnp.swapaxes(
+                            jnp.reshape(
+                                x,
+                                [x.shape[0], config["NUM_MINIBATCHES"], -1]
+                                + list(x.shape[2:]),
+                            ),
+                            1,
+                            0,
                         ),
-                        1,
-                        0,
-                    ),
-                    shuffled_batch,
-                )
+                        shuffled_batch,
+                    )
+                else:
+                    # Keep every agent represented in every minibatch. Each
+                    # independent actor is then updated only from its own
+                    # environment trajectories.
+                    permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
+                    envs_per_minibatch = (
+                        config["NUM_ENVS"] // config["NUM_MINIBATCHES"]
+                    )
+
+                    def make_independent_minibatches(x):
+                        x = x.reshape(
+                            (
+                                x.shape[0],
+                                env.num_agents,
+                                config["NUM_ENVS"],
+                                *x.shape[2:],
+                            )
+                        )
+                        x = jnp.take(x, permutation, axis=2)
+                        x = x.reshape(
+                            (
+                                x.shape[0],
+                                env.num_agents,
+                                config["NUM_MINIBATCHES"],
+                                envs_per_minibatch,
+                                *x.shape[3:],
+                            )
+                        )
+                        x = jnp.moveaxis(x, 2, 0)
+                        return x.reshape(
+                            (
+                                config["NUM_MINIBATCHES"],
+                                x.shape[1],
+                                env.num_agents * envs_per_minibatch,
+                                *x.shape[4:],
+                            )
+                        )
+
+                    minibatches = jax.tree.map(
+                        make_independent_minibatches, batch
+                    )
 
                 # train_states = (actor_train_state, critic_train_state)
                 train_states, loss_info = jax.lax.scan(
@@ -659,6 +799,11 @@ def make_train(config, progress_bar=None):
 def main(config):
 
     config = OmegaConf.to_container(config)
+    actor_mode = (
+        "shared-actor"
+        if config["ACTOR_PARAMETER_SHARING"]
+        else "independent-actors"
+    )
 
     wandb.init(
         entity=config["ENTITY"],
@@ -666,7 +811,7 @@ def main(config):
         tags=[t for t in os.environ.get("WANDB_TAGS", "").split(",") if t],
         group=os.environ.get("WANDB_RUN_GROUP") or None,
         name=os.environ.get("WANDB_NAME")
-        or f"MAPPO-{config['MAP_NAME']}-seed{config['SEED']}",
+        or f"MAPPO-{actor_mode}-{config['MAP_NAME']}-seed{config['SEED']}",
         config=config,
         mode=config["WANDB_MODE"],
     )
@@ -676,7 +821,9 @@ def main(config):
     )
     progress_bar = tqdm(
         total=num_updates,
-        desc=f"MAPPO {config['MAP_NAME']} seed={config['SEED']}",
+        desc=(
+            f"MAPPO {actor_mode} {config['MAP_NAME']} seed={config['SEED']}"
+        ),
         unit="update",
         dynamic_ncols=True,
     )

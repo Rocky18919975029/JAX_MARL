@@ -15,6 +15,7 @@
 "MAX_GRAD_NORM": 0.25
 "ACTIVATION": "relu"
 "OBS_WITH_AGENT_ID": True
+"ACTOR_PARAMETER_SHARING": True
 "ENV_NAME": "HeuristicEnemySMAX"
 "MAP_NAME": "2s3z"
 "SEED": 0

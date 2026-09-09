@@ -5,6 +5,26 @@ This fork includes the changes used for the tested SMAX MAPPO setup:
 - a terminal progress bar with environment steps, win rate, and ETA;
 - compatibility for Distrax/TFP with JAX 0.10.2 without editing `site-packages`;
 - configurable recurrent-state width instead of a hard-coded width of 128.
+- selectable shared or independent actor parameters with a centralized critic.
+
+## Actor parameter sharing
+
+The official parameter-sharing behavior remains the default:
+
+```bash
+ACTOR_PARAMETER_SHARING=true
+```
+
+To give every allied agent its own complete actor encoder, GRU, and action head
+while retaining the shared centralized critic, use:
+
+```bash
+ACTOR_PARAMETER_SHARING=false
+```
+
+In independent-actor mode, each actor has its own parameters, Adam state,
+gradient clipping, and advantage normalization. Minibatches retain a separate,
+equal set of environment trajectories for every actor.
 
 ## Tested environment
 
