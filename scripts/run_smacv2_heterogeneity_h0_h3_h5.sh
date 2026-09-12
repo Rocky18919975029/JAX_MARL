@@ -10,6 +10,10 @@ MAX_RUNS_PER_GPU="${MAX_RUNS_PER_GPU:-5}"
 cd "$REPO_DIR" || exit 1
 mkdir -p "$RUN_DIR"
 
+# This environment uses JAX's pip-provided CUDA libraries. Avoid selecting the
+# user's older CUDA 12.2 libraries from shell startup files.
+unset LD_LIBRARY_PATH
+
 maps=(
     smacv2_10_units_hetero_h0
     smacv2_10_units_hetero_h3
