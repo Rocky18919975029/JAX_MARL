@@ -17,7 +17,10 @@ SMAX is a purely JAX SMAC-like environment. It, like SMAC, focuses on decentrali
 | smacv2_5_units | 5 randomly chosen    | 5 randomly chosen      |
 | smacv2_10_units | 10 randomly chosen  | 10 randomly chosen     |
 | smacv2_10_units_hetero_h0 | one random type, profile `[10]` | mirrored ally profile |
+| smacv2_10_units_hetero_h1 | two random types, profile `[9, 1]` | mirrored ally profile |
+| smacv2_10_units_hetero_h2 | two random types, profile `[7, 3]` | mirrored ally profile |
 | smacv2_10_units_hetero_h3 | three random types, profile `[6, 2, 2]` | mirrored ally profile |
+| smacv2_10_units_hetero_h4 | four random types, profile `[4, 3, 2, 1]` | mirrored ally profile |
 | smacv2_10_units_hetero_h5 | six types, profile `[2, 2, 2, 2, 1, 1]` | mirrored ally profile |
 | smacv2_20_units | 20 randomly chosen  | 20 randomly chosen     |
 

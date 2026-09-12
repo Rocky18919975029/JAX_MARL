@@ -4,9 +4,10 @@ set -uo pipefail
 REPO_DIR="${REPO_DIR:-$HOME/JaxMARL}"
 PROJECT="${PROJECT:-jaxmarl-smax-heterogeneity}"
 ALIGNMENT_COEF="${ALIGNMENT_COEF:-0.1}"
-RUN_DIR="${RUN_DIR:-$REPO_DIR/logs/heterogeneity-h0-h3-h5-$(date +%Y%m%d_%H%M%S)}"
+RUN_DIR="${RUN_DIR:-$REPO_DIR/logs/heterogeneity-$(date +%Y%m%d_%H%M%S)}"
 MAX_RUNS_PER_GPU="${MAX_RUNS_PER_GPU:-5}"
 ACTOR_VARIANT="${ACTOR_VARIANT:-both}"
+HETERO_LEVELS="${HETERO_LEVELS:-h0 h3 h5}"
 
 cd "$REPO_DIR" || exit 1
 mkdir -p "$RUN_DIR"
@@ -15,11 +16,25 @@ mkdir -p "$RUN_DIR"
 # user's older CUDA 12.2 libraries from shell startup files.
 unset LD_LIBRARY_PATH
 
-maps=(
-    smacv2_10_units_hetero_h0
-    smacv2_10_units_hetero_h3
-    smacv2_10_units_hetero_h5
-)
+read -r -a requested_levels <<< "$HETERO_LEVELS"
+maps=()
+for level in "${requested_levels[@]}"; do
+    case "$level" in
+        h0|h1|h2|h3|h4|h5)
+            maps+=("smacv2_10_units_hetero_${level}")
+            ;;
+        *)
+            echo "Unknown heterogeneity level: $level" >&2
+            echo "HETERO_LEVELS may contain: h0 h1 h2 h3 h4 h5" >&2
+            exit 2
+            ;;
+    esac
+done
+if (( ${#maps[@]} == 0 )); then
+    echo "HETERO_LEVELS must select at least one level" >&2
+    exit 2
+fi
+
 case "$ACTOR_VARIANT" in
     both)
         sharing_values=(true false)
@@ -120,6 +135,7 @@ echo "Run directory: $RUN_DIR"
 echo "W&B project: $PROJECT"
 echo "Alignment coefficient: $ALIGNMENT_COEF"
 echo "Actor variant: $ACTOR_VARIANT"
+echo "Heterogeneity levels: $HETERO_LEVELS"
 echo "Launching $task_index runs ($MAX_RUNS_PER_GPU concurrent runs per GPU)"
 
 manager_pids=()

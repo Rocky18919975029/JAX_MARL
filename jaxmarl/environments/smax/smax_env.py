@@ -119,8 +119,17 @@ MAP_NAME_TO_SCENARIO = {
     "smacv2_10_units_hetero_h0": Scenario(
         jnp.zeros((20,), dtype=jnp.uint8), 10, 10, True, True, (10,)
     ),
+    "smacv2_10_units_hetero_h1": Scenario(
+        jnp.zeros((20,), dtype=jnp.uint8), 10, 10, True, True, (9, 1)
+    ),
+    "smacv2_10_units_hetero_h2": Scenario(
+        jnp.zeros((20,), dtype=jnp.uint8), 10, 10, True, True, (7, 3)
+    ),
     "smacv2_10_units_hetero_h3": Scenario(
         jnp.zeros((20,), dtype=jnp.uint8), 10, 10, True, True, (6, 2, 2)
+    ),
+    "smacv2_10_units_hetero_h4": Scenario(
+        jnp.zeros((20,), dtype=jnp.uint8), 10, 10, True, True, (4, 3, 2, 1)
     ),
     "smacv2_10_units_hetero_h5": Scenario(
         jnp.zeros((20,), dtype=jnp.uint8), 10, 10, True, True, (2, 2, 2, 2, 1, 1)
