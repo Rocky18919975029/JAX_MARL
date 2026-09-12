@@ -22,6 +22,7 @@ from jaxmarl.environments.multi_agent_env import (
     State as BaseState,
 )
 from jaxmarl.environments.smax.distributions import (
+    ControlledUnitTypeDistribution,
     SurroundAndReflectPositionDistribution,
     UniformUnitTypeDistribution,
 )
@@ -55,6 +56,7 @@ class Scenario:
     num_enemies: int
     smacv2_position_generation: bool
     smacv2_unit_type_generation: bool
+    unit_type_profile: Tuple[int, ...] = ()
 
 
 MAP_NAME_TO_SCENARIO = {
@@ -112,6 +114,17 @@ MAP_NAME_TO_SCENARIO = {
     ),
     "smacv2_5_units": Scenario(jnp.zeros((10,), dtype=jnp.uint8), 5, 5, True, True),
     "smacv2_10_units": Scenario(jnp.zeros((20,), dtype=jnp.uint8), 10, 10, True, True),
+    # Controlled within-team heterogeneity. Type identities are permuted each
+    # episode, so every physical unit type has the same long-run marginal.
+    "smacv2_10_units_hetero_h0": Scenario(
+        jnp.zeros((20,), dtype=jnp.uint8), 10, 10, True, True, (10,)
+    ),
+    "smacv2_10_units_hetero_h3": Scenario(
+        jnp.zeros((20,), dtype=jnp.uint8), 10, 10, True, True, (6, 2, 2)
+    ),
+    "smacv2_10_units_hetero_h5": Scenario(
+        jnp.zeros((20,), dtype=jnp.uint8), 10, 10, True, True, (2, 2, 2, 2, 1, 1)
+    ),
     "smacv2_20_units": Scenario(jnp.zeros((40,), dtype=jnp.uint8), 20, 20, True, True),
 }
 
@@ -198,12 +211,20 @@ class SMAX(MultiAgentEnv):
         self.position_generator = SurroundAndReflectPositionDistribution(
             self.num_allies, self.num_enemies, self.map_width, self.map_height
         )
-        self.unit_type_generator = UniformUnitTypeDistribution(
+        unit_type_profile = () if scenario is None else scenario.unit_type_profile
+        unit_type_distribution = (
+            ControlledUnitTypeDistribution
+            if unit_type_profile
+            else UniformUnitTypeDistribution
+        )
+        unit_type_generator_args = (unit_type_profile,) if unit_type_profile else ()
+        self.unit_type_generator = unit_type_distribution(
             self.num_allies,
             self.num_enemies,
             self.map_width,
             self.map_height,
             len(self.unit_type_names),
+            *unit_type_generator_args,
         )
         self.agents = [f"ally_{i}" for i in range(self.num_allies)] + [
             f"enemy_{i}" for i in range(self.num_enemies)

@@ -161,3 +161,57 @@ class UniformUnitTypeDistribution(Distribution):
             enemy_unit_types = ally_unit_types[: self.n_enemies]
 
         return jnp.concatenate([ally_unit_types, enemy_unit_types], dtype=jnp.uint8)
+
+
+class ControlledUnitTypeDistribution(Distribution):
+    """Sample unit types with a fixed per-episode ally-team composition.
+
+    The profile controls only the multiplicities. Its occupied type labels are
+    randomly selected from all available unit types every episode, and the
+    resulting units are shuffled across agent indices. Equal-sized enemy teams
+    receive the same shuffled type vector as the ally team.
+    """
+
+    def __init__(
+        self,
+        n_allies,
+        n_enemies,
+        map_width,
+        map_height,
+        n_unit_types,
+        profile,
+    ):
+        super().__init__(n_allies, n_enemies, map_width, map_height)
+        self.n_unit_types = n_unit_types
+        self.profile = tuple(int(count) for count in profile)
+
+        if not self.profile or any(count <= 0 for count in self.profile):
+            raise ValueError(
+                "Controlled unit-type profile must contain positive counts"
+            )
+        if sum(self.profile) != self.n_allies:
+            raise ValueError("Controlled unit-type profile must sum to n_allies")
+        if len(self.profile) > self.n_unit_types:
+            raise ValueError("Controlled unit-type profile uses too many unit types")
+        if self.n_enemies != self.n_allies:
+            raise ValueError("Controlled unit-type scenarios require equal team sizes")
+
+        profile_slots = [
+            profile_index
+            for profile_index, count in enumerate(self.profile)
+            for _ in range(count)
+        ]
+        self.profile_slots = jnp.asarray(profile_slots, dtype=jnp.int32)
+
+    def generate(self, key: PRNGKeyArray):
+        type_key, agent_key = jax.random.split(key)
+        type_labels = jax.random.permutation(
+            type_key, jnp.arange(self.n_unit_types, dtype=jnp.uint8)
+        )
+        ally_unit_types = type_labels[self.profile_slots]
+        ally_unit_types = jax.random.permutation(agent_key, ally_unit_types)
+
+        # Mirror the ally type vector so team composition cannot confound the
+        # controlled within-team heterogeneity level.
+        enemy_unit_types = ally_unit_types
+        return jnp.concatenate([ally_unit_types, enemy_unit_types], dtype=jnp.uint8)
