@@ -6,6 +6,7 @@ PROJECT="${PROJECT:-jaxmarl-smax-heterogeneity}"
 ALIGNMENT_COEF="${ALIGNMENT_COEF:-0.1}"
 RUN_DIR="${RUN_DIR:-$REPO_DIR/logs/heterogeneity-h0-h3-h5-$(date +%Y%m%d_%H%M%S)}"
 MAX_RUNS_PER_GPU="${MAX_RUNS_PER_GPU:-5}"
+ACTOR_VARIANT="${ACTOR_VARIANT:-both}"
 
 cd "$REPO_DIR" || exit 1
 mkdir -p "$RUN_DIR"
@@ -19,7 +20,21 @@ maps=(
     smacv2_10_units_hetero_h3
     smacv2_10_units_hetero_h5
 )
-sharing_values=(true false)
+case "$ACTOR_VARIANT" in
+    both)
+        sharing_values=(true false)
+        ;;
+    shared)
+        sharing_values=(true)
+        ;;
+    independent)
+        sharing_values=(false)
+        ;;
+    *)
+        echo "ACTOR_VARIANT must be one of: both, shared, independent" >&2
+        exit 2
+        ;;
+esac
 align_modes=(none c_to_a a_to_c reciprocal joint)
 seeds=(1 2 3 4)
 
@@ -104,6 +119,7 @@ echo "Repository: $REPO_DIR"
 echo "Run directory: $RUN_DIR"
 echo "W&B project: $PROJECT"
 echo "Alignment coefficient: $ALIGNMENT_COEF"
+echo "Actor variant: $ACTOR_VARIANT"
 echo "Launching $task_index runs ($MAX_RUNS_PER_GPU concurrent runs per GPU)"
 
 manager_pids=()
