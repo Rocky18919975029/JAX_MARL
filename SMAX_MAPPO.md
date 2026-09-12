@@ -69,6 +69,48 @@ minibatches and epochs in that update. Joint mode obtains actor and critic
 gradients from one combined forward loss, so neither side observes parameters
 already updated by the other side.
 
+## Checkpoints and post-training evaluation
+
+Checkpointing is disabled by default for individual baseline commands. Enable
+it with:
+
+```bash
+SAVE_CHECKPOINTS=true \
+CHECKPOINT_INTERVAL_TIMESTEPS=1000000 \
+CHECKPOINT_DIR="$HOME/JaxMARL/checkpoints/MAPPO/smax" \
+python baselines/MAPPO/mappo_rnn_smax.py ...
+```
+
+The controlled-heterogeneity launcher enables checkpointing by default. Each
+run gets its own directory containing checkpoints near every requested
+environment-step interval and a separate `final` checkpoint. Every checkpoint
+contains:
+
+- `model.safetensors`: complete actor and critic parameter trees;
+- `config.json`: the full training and architecture configuration;
+- `metadata.json`: step, seed, map, actor-sharing, and alignment metadata.
+
+Set `WANDB_UPLOAD_CHECKPOINTS=true` to additionally version every checkpoint as
+a W&B model artifact. Local saving remains enabled independently of artifact
+upload.
+
+Evaluate either a run directory, its `final` directory, an intermediate step
+directory, or a direct `model.safetensors` path:
+
+```bash
+python baselines/MAPPO/eval_mappo_rnn_smax.py \
+  --checkpoint /path/to/run/final \
+  --episodes 256 \
+  --num-envs 64 \
+  --seed 10000 \
+  --policy deterministic
+```
+
+Use `--policy stochastic` to sample from the learned policy. Evaluation writes
+per-episode results plus means, standard deviations, standard errors, and 95%
+confidence intervals to JSON. Add `--wandb-mode online` to log the aggregate
+evaluation metrics to a separate W&B evaluation project.
+
 ## Tested environment
 
 - Ubuntu 22.04

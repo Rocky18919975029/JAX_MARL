@@ -28,6 +28,13 @@
   "attack_mode": "closest"
 "ANNEAL_LR": True
 
+# Checkpointing. Intermediate checkpoints are saved after the first update
+# crossing each interval; the final parameters are always saved separately.
+"SAVE_CHECKPOINTS": False
+"CHECKPOINT_INTERVAL_TIMESTEPS": 1000000
+"CHECKPOINT_DIR": "checkpoints/MAPPO/smax"
+"WANDB_UPLOAD_CHECKPOINTS": False
+
 # WandB Params
 "WANDB_MODE": "disabled"
 "ENTITY": ""

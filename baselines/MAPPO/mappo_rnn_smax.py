@@ -3,8 +3,11 @@ Based on PureJaxRL Implementation of IPPO, with changes to give a centralised cr
 """
 
 import functools
+import json
 import os
+import re
 from functools import partial
+from pathlib import Path
 from typing import Dict, NamedTuple, Sequence
 
 import jax
@@ -26,12 +29,110 @@ import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
+from jax.experimental import io_callback
 from omegaconf import OmegaConf
 
 import wandb
 from tqdm.auto import tqdm
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
-from jaxmarl.wrappers.baselines import JaxMARLWrapper, SMAXLogWrapper
+from jaxmarl.wrappers.baselines import JaxMARLWrapper, SMAXLogWrapper, save_params
+
+
+def _safe_path_component(value):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip("-_") or "run"
+
+
+def _json_default(value):
+    if hasattr(value, "item"):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def make_checkpoint_callback(config, run):
+    """Create a host callback that writes evaluation-ready checkpoints."""
+
+    checkpoint_root = Path(config["CHECKPOINT_DIR"]).expanduser().resolve()
+    project_name = _safe_path_component(config.get("PROJECT") or "local")
+    run_name = _safe_path_component(run.name)
+    run_id = _safe_path_component(run.id)
+    run_dir = checkpoint_root / project_name / f"{run_name}-{run_id}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_json_atomic(path, payload):
+        temporary_path = path.with_name(f".{path.name}.tmp")
+        with temporary_path.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2, sort_keys=True, default=_json_default)
+            file.write("\n")
+        os.replace(temporary_path, path)
+
+    def checkpoint_callback(actor_params, critic_params, env_step, is_final):
+        env_step = int(np.asarray(env_step).item())
+        is_final = bool(np.asarray(is_final).item())
+        checkpoint_name = "final" if is_final else f"step_{env_step:012d}"
+        checkpoint_dir = run_dir / checkpoint_name
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        model_path = checkpoint_dir / "model.safetensors"
+        temporary_model_path = checkpoint_dir / ".model.tmp.safetensors"
+        save_params(
+            {"actor": actor_params, "critic": critic_params},
+            temporary_model_path,
+        )
+        os.replace(temporary_model_path, model_path)
+
+        checkpoint_config = dict(config)
+        checkpoint_config["CHECKPOINT_ENV_STEP"] = env_step
+        checkpoint_config["CHECKPOINT_IS_FINAL"] = is_final
+        write_json_atomic(checkpoint_dir / "config.json", checkpoint_config)
+        write_json_atomic(
+            checkpoint_dir / "metadata.json",
+            {
+                "format_version": 1,
+                "env_step": env_step,
+                "is_final": is_final,
+                "map_name": config["MAP_NAME"],
+                "seed": config["SEED"],
+                "actor_parameter_sharing": config["ACTOR_PARAMETER_SHARING"],
+                "matched_comparison": config["MATCHED_COMPARISON"],
+                "align_mode": config["ALIGN_MODE"],
+                "alignment_coef": config["ALIGNMENT_COEF"],
+                "wandb_project": run.project,
+                "wandb_run_id": run.id,
+                "wandb_run_name": run.name,
+            },
+        )
+        write_json_atomic(
+            run_dir / "latest.json",
+            {
+                "checkpoint": checkpoint_name,
+                "env_step": env_step,
+                "is_final": is_final,
+            },
+        )
+        print(f"Checkpoint saved: {checkpoint_dir}", flush=True)
+
+        if config["WANDB_UPLOAD_CHECKPOINTS"]:
+            artifact = wandb.Artifact(
+                f"{run_name}-{run_id}-checkpoint",
+                type="model",
+                metadata={
+                    "env_step": env_step,
+                    "is_final": is_final,
+                    "map_name": config["MAP_NAME"],
+                    "seed": config["SEED"],
+                },
+            )
+            artifact.add_dir(str(checkpoint_dir))
+            aliases = ["latest", f"step-{env_step}"]
+            if is_final:
+                aliases.append("final")
+            run.log_artifact(artifact, aliases=aliases)
+
+        return np.int32(0)
+
+    return checkpoint_callback, run_dir
 
 
 class SMAXWorldStateWrapper(JaxMARLWrapper):
@@ -239,7 +340,7 @@ def latent_distance(source, target, mask):
     return (distance * mask).sum() / jnp.maximum(mask.sum(), 1.0)
 
 
-def make_train(config, progress_bar=None):
+def make_train(config, progress_bar=None, checkpoint_callback=None):
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
@@ -1051,6 +1152,38 @@ def make_train(config, progress_bar=None):
 
             metric["update_steps"] = update_steps
             jax.debug.callback(callback, metric, ordered=True)
+
+            if checkpoint_callback is not None:
+                rollout_env_steps = config["NUM_ENVS"] * config["NUM_STEPS"]
+                completed_updates = update_steps + 1
+                completed_env_steps = completed_updates * rollout_env_steps
+                previous_env_steps = update_steps * rollout_env_steps
+                checkpoint_interval = config["CHECKPOINT_INTERVAL_TIMESTEPS"]
+                crossed_interval = (
+                    completed_env_steps // checkpoint_interval
+                    > previous_env_steps // checkpoint_interval
+                )
+                is_final = completed_updates == config["NUM_UPDATES"]
+                should_save = jnp.logical_or(crossed_interval, is_final)
+
+                def save_checkpoint(_):
+                    return io_callback(
+                        checkpoint_callback,
+                        jax.ShapeDtypeStruct((), jnp.int32),
+                        train_states[0].params,
+                        train_states[1].params,
+                        completed_env_steps,
+                        is_final,
+                        ordered=True,
+                    )
+
+                jax.lax.cond(
+                    should_save,
+                    save_checkpoint,
+                    lambda _: jnp.int32(0),
+                    operand=None,
+                )
+
             update_steps = update_steps + 1
             runner_state = (train_states, env_state, last_obs, last_done, hstates, rng)
             return (runner_state, update_steps), metric
@@ -1089,7 +1222,7 @@ def main(config):
         else sharing_mode
     )
 
-    wandb.init(
+    run = wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=[t for t in os.environ.get("WANDB_TAGS", "").split(",") if t],
@@ -1102,6 +1235,16 @@ def main(config):
         config=config,
         mode=config["WANDB_MODE"],
     )
+    checkpoint_callback = None
+    checkpoint_run_dir = None
+    if config["SAVE_CHECKPOINTS"]:
+        checkpoint_interval = int(config["CHECKPOINT_INTERVAL_TIMESTEPS"])
+        if checkpoint_interval <= 0:
+            raise ValueError("CHECKPOINT_INTERVAL_TIMESTEPS must be positive")
+        config["CHECKPOINT_INTERVAL_TIMESTEPS"] = checkpoint_interval
+        checkpoint_callback, checkpoint_run_dir = make_checkpoint_callback(config, run)
+        print(f"Checkpoints: {checkpoint_run_dir}", flush=True)
+
     rng = jax.random.PRNGKey(config["SEED"])
     num_updates = int(
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -1117,11 +1260,14 @@ def main(config):
     )
     try:
         with jax.disable_jit(False):
-            train_jit = jax.jit(make_train(config, progress_bar))
+            train_jit = jax.jit(
+                make_train(config, progress_bar, checkpoint_callback)
+            )
             result = train_jit(rng)
             jax.block_until_ready(result)
     finally:
         progress_bar.close()
+        wandb.finish()
 
 
 if __name__ == "__main__":

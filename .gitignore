@@ -16,4 +16,5 @@ tmp/
 wandb/
 outputs/
 models/
+checkpoints/
 build/

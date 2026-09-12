@@ -8,6 +8,10 @@ RUN_DIR="${RUN_DIR:-$REPO_DIR/logs/heterogeneity-$(date +%Y%m%d_%H%M%S)}"
 MAX_RUNS_PER_GPU="${MAX_RUNS_PER_GPU:-5}"
 ACTOR_VARIANT="${ACTOR_VARIANT:-both}"
 HETERO_LEVELS="${HETERO_LEVELS:-h0 h3 h5}"
+SAVE_CHECKPOINTS="${SAVE_CHECKPOINTS:-true}"
+CHECKPOINT_INTERVAL_TIMESTEPS="${CHECKPOINT_INTERVAL_TIMESTEPS:-1000000}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-$REPO_DIR/checkpoints/MAPPO/smax}"
+WANDB_UPLOAD_CHECKPOINTS="${WANDB_UPLOAD_CHECKPOINTS:-false}"
 
 cd "$REPO_DIR" || exit 1
 mkdir -p "$RUN_DIR"
@@ -103,6 +107,10 @@ run_one() {
         MATCHED_COMPARISON=true \
         ALIGN_MODE="$align_mode" \
         ALIGNMENT_COEF="$ALIGNMENT_COEF" \
+        SAVE_CHECKPOINTS="$SAVE_CHECKPOINTS" \
+        CHECKPOINT_INTERVAL_TIMESTEPS="$CHECKPOINT_INTERVAL_TIMESTEPS" \
+        CHECKPOINT_DIR="$CHECKPOINT_ROOT" \
+        WANDB_UPLOAD_CHECKPOINTS="$WANDB_UPLOAD_CHECKPOINTS" \
         WANDB_MODE=online \
         PROJECT="$PROJECT" \
         > "$log_file" 2>&1
@@ -136,6 +144,10 @@ echo "W&B project: $PROJECT"
 echo "Alignment coefficient: $ALIGNMENT_COEF"
 echo "Actor variant: $ACTOR_VARIANT"
 echo "Heterogeneity levels: $HETERO_LEVELS"
+echo "Save checkpoints: $SAVE_CHECKPOINTS"
+echo "Checkpoint interval: $CHECKPOINT_INTERVAL_TIMESTEPS env steps"
+echo "Checkpoint root: $CHECKPOINT_ROOT"
+echo "Upload checkpoints to W&B: $WANDB_UPLOAD_CHECKPOINTS"
 echo "Launching $task_index runs ($MAX_RUNS_PER_GPU concurrent runs per GPU)"
 
 manager_pids=()
