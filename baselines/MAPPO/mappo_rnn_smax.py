@@ -6,6 +6,7 @@ import functools
 import json
 import os
 import re
+import subprocess
 from functools import partial
 from pathlib import Path
 from typing import Dict, NamedTuple, Sequence
@@ -67,10 +68,26 @@ def make_checkpoint_callback(config, run):
             file.write("\n")
         os.replace(temporary_path, path)
 
-    def checkpoint_callback(actor_params, critic_params, env_step, is_final):
+    def checkpoint_callback(
+        actor_params,
+        critic_params,
+        env_step,
+        nominal_env_step,
+        is_final,
+        is_initial,
+    ):
         env_step = int(np.asarray(env_step).item())
+        nominal_env_step = int(np.asarray(nominal_env_step).item())
         is_final = bool(np.asarray(is_final).item())
-        checkpoint_name = "final" if is_final else f"step_{env_step:012d}"
+        is_initial = bool(np.asarray(is_initial).item())
+        if is_final:
+            nominal_env_step = int(config["TOTAL_TIMESTEPS"])
+        if is_initial:
+            checkpoint_name = "initial"
+        elif is_final:
+            checkpoint_name = "final"
+        else:
+            checkpoint_name = f"step_{nominal_env_step:012d}"
         checkpoint_dir = run_dir / checkpoint_name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -84,20 +101,28 @@ def make_checkpoint_callback(config, run):
 
         checkpoint_config = dict(config)
         checkpoint_config["CHECKPOINT_ENV_STEP"] = env_step
+        checkpoint_config["CHECKPOINT_NOMINAL_ENV_STEP"] = nominal_env_step
         checkpoint_config["CHECKPOINT_IS_FINAL"] = is_final
+        checkpoint_config["CHECKPOINT_IS_INITIAL"] = is_initial
         write_json_atomic(checkpoint_dir / "config.json", checkpoint_config)
         write_json_atomic(
             checkpoint_dir / "metadata.json",
             {
                 "format_version": 1,
                 "env_step": env_step,
+                "nominal_env_step": nominal_env_step,
                 "is_final": is_final,
+                "is_initial": is_initial,
                 "map_name": config["MAP_NAME"],
                 "seed": config["SEED"],
                 "actor_parameter_sharing": config["ACTOR_PARAMETER_SHARING"],
                 "matched_comparison": config["MATCHED_COMPARISON"],
                 "align_mode": config["ALIGN_MODE"],
                 "alignment_coef": config["ALIGNMENT_COEF"],
+                "align_target_shuffle": config["ALIGN_TARGET_SHUFFLE"],
+                "condition": config.get("EXPERIMENT_CONDITION", ""),
+                "protocol_version": config.get("PROTOCOL_VERSION", ""),
+                "git_commit": config.get("GIT_COMMIT", ""),
                 "wandb_project": run.project,
                 "wandb_run_id": run.id,
                 "wandb_run_name": run.name,
@@ -108,7 +133,9 @@ def make_checkpoint_callback(config, run):
             {
                 "checkpoint": checkpoint_name,
                 "env_step": env_step,
+                "nominal_env_step": nominal_env_step,
                 "is_final": is_final,
+                "is_initial": is_initial,
             },
         )
         print(f"Checkpoint saved: {checkpoint_dir}", flush=True)
@@ -119,13 +146,17 @@ def make_checkpoint_callback(config, run):
                 type="model",
                 metadata={
                     "env_step": env_step,
+                    "nominal_env_step": nominal_env_step,
                     "is_final": is_final,
+                    "is_initial": is_initial,
                     "map_name": config["MAP_NAME"],
                     "seed": config["SEED"],
                 },
             )
             artifact.add_dir(str(checkpoint_dir))
             aliases = ["latest", f"step-{env_step}"]
+            if is_initial:
+                aliases.append("initial")
             if is_final:
                 aliases.append("final")
             run.log_artifact(artifact, aliases=aliases)
@@ -292,6 +323,7 @@ class Transition(NamedTuple):
     actor_latent_old: jnp.ndarray
     critic_latent_old: jnp.ndarray
     alive_mask: jnp.ndarray
+    alignment_mask: jnp.ndarray
     info: jnp.ndarray
     avail_actions: jnp.ndarray
 
@@ -340,6 +372,131 @@ def latent_distance(source, target, mask):
     return (distance * mask).sum() / jnp.maximum(mask.sum(), 1.0)
 
 
+def shuffle_targets_within_agent(
+    target_latent,
+    alive_mask,
+    training_seed,
+    update_index,
+    num_agents,
+    num_envs,
+    seed_offset=700000,
+):
+    """Derange alive targets over environment x time within each agent.
+
+    A random non-zero cyclic shift is a bijection over every agent's valid
+    pool, so it exactly preserves that pool's marginal distribution and has
+    no fixed points whenever at least two valid samples exist.  The key is an
+    audit-friendly RNG substream independent from rollout/action sampling.
+    """
+
+    num_steps = target_latent.shape[0]
+    latent_dim = target_latent.shape[-1]
+    pool_size = num_steps * num_envs
+
+    target_by_agent = target_latent.reshape(
+        (num_steps, num_agents, num_envs, latent_dim)
+    )
+    target_by_agent = jnp.transpose(target_by_agent, (1, 0, 2, 3)).reshape(
+        (num_agents, pool_size, latent_dim)
+    )
+    alive_by_agent = alive_mask.reshape((num_steps, num_agents, num_envs))
+    alive_by_agent = jnp.transpose(alive_by_agent, (1, 0, 2)).reshape(
+        (num_agents, pool_size)
+    )
+
+    valid_counts = alive_by_agent.sum(axis=1, dtype=jnp.int32)
+    eligible = jnp.logical_and(alive_by_agent, valid_counts[:, None] > 1)
+    positions = jnp.arange(pool_size, dtype=jnp.int32)
+    positions_by_agent = jnp.broadcast_to(positions, alive_by_agent.shape)
+
+    # Sorting [valid positions, invalid positions] gives a static-size lookup
+    # from rank-within-valid-pool to the original environment/time index.
+    valid_order = jnp.argsort(
+        jnp.where(alive_by_agent, positions_by_agent, pool_size + positions_by_agent),
+        axis=1,
+    )
+    valid_rank = jnp.cumsum(alive_by_agent, axis=1, dtype=jnp.int32) - 1
+
+    shuffle_key = jax.random.PRNGKey(training_seed)
+    shuffle_key = jax.random.fold_in(shuffle_key, seed_offset)
+    shuffle_key = jax.random.fold_in(shuffle_key, update_index)
+    uniforms = jax.random.uniform(shuffle_key, (num_agents,))
+    shift_range = jnp.maximum(valid_counts - 1, 1)
+    shifts = 1 + jnp.floor(uniforms * shift_range).astype(jnp.int32)
+    shifts = jnp.where(valid_counts > 1, shifts, 0)
+
+    safe_counts = jnp.maximum(valid_counts, 1)
+    target_rank = jnp.mod(valid_rank + shifts[:, None], safe_counts[:, None])
+    target_indices = jnp.take_along_axis(valid_order, target_rank, axis=1)
+    target_indices = jnp.where(eligible, target_indices, positions_by_agent)
+    shuffled_by_agent = jnp.take_along_axis(
+        target_by_agent, target_indices[..., None], axis=1
+    )
+
+    shuffled = shuffled_by_agent.reshape(
+        (num_agents, num_steps, num_envs, latent_dim)
+    )
+    shuffled = jnp.transpose(shuffled, (1, 0, 2, 3)).reshape(target_latent.shape)
+    alignment_mask = jnp.transpose(
+        eligible.reshape((num_agents, num_steps, num_envs)), (1, 0, 2)
+    ).reshape(alive_mask.shape)
+
+    eligible_count = alignment_mask.sum(dtype=jnp.int32)
+    fixed_count = jnp.logical_and(
+        eligible, target_indices == positions_by_agent
+    ).sum(dtype=jnp.int32)
+    fixed_point_proportion = fixed_count.astype(jnp.float32) / jnp.maximum(
+        eligible_count, 1
+    )
+    agent_ids = jnp.arange(num_agents, dtype=jnp.int32)[:, None]
+    checksum_terms = jnp.where(
+        eligible,
+        (agent_ids + 1) * 1009
+        + (positions_by_agent + 1) * 9176
+        + (target_indices + 1) * 6361,
+        0,
+    )
+    checksum = checksum_terms.sum(dtype=jnp.int32)
+    audit = {
+        "shuffle_enabled": jnp.asarray(1, dtype=jnp.int32),
+        "shuffle_valid_target_count": eligible_count,
+        "shuffle_fixed_point_proportion": fixed_point_proportion,
+        "shuffle_permutation_checksum": checksum,
+    }
+    return shuffled, alignment_mask, audit
+
+
+def maybe_shuffle_targets_within_agent(
+    target_latent,
+    alive_mask,
+    enabled,
+    training_seed,
+    update_index,
+    num_agents,
+    num_envs,
+    seed_offset=700000,
+):
+    """Apply the H1 control shuffle, preserving the exact input when disabled."""
+
+    if not enabled:
+        audit = {
+            "shuffle_enabled": jnp.asarray(0, dtype=jnp.int32),
+            "shuffle_valid_target_count": jnp.asarray(0, dtype=jnp.int32),
+            "shuffle_fixed_point_proportion": jnp.asarray(0.0),
+            "shuffle_permutation_checksum": jnp.asarray(0, dtype=jnp.int32),
+        }
+        return target_latent, alive_mask, audit
+    return shuffle_targets_within_agent(
+        target_latent,
+        alive_mask,
+        training_seed,
+        update_index,
+        num_agents,
+        num_envs,
+        seed_offset,
+    )
+
+
 def make_train(config, progress_bar=None, checkpoint_callback=None):
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
@@ -360,6 +517,17 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
         raise ValueError(
             "Representation alignment requires MATCHED_COMPARISON=true."
         )
+    if config["ALIGN_TARGET_SHUFFLE"]:
+        if config["ALIGN_MODE"] not in {"a_to_c", "c_to_a"}:
+            raise ValueError(
+                "ALIGN_TARGET_SHUFFLE=true is only valid for ALIGN_MODE=a_to_c "
+                "or ALIGN_MODE=c_to_a."
+            )
+        if config["ALIGN_TARGET_SHUFFLE_SCOPE"] != "same_agent_env_time":
+            raise ValueError(
+                "The confirmatory protocol only supports "
+                "ALIGN_TARGET_SHUFFLE_SCOPE=same_agent_env_time."
+            )
     if (
         (not config["ACTOR_PARAMETER_SHARING"] or config["MATCHED_COMPARISON"])
         and config["NUM_ENVS"] % config["NUM_MINIBATCHES"] != 0
@@ -467,6 +635,19 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
             params=critic_network_params,
             tx=critic_tx,
         )
+
+        if checkpoint_callback is not None:
+            io_callback(
+                checkpoint_callback,
+                jax.ShapeDtypeStruct((), jnp.int32),
+                actor_train_state.params,
+                critic_train_state.params,
+                jnp.asarray(0, dtype=jnp.int32),
+                jnp.asarray(0, dtype=jnp.int32),
+                jnp.asarray(False),
+                jnp.asarray(True),
+                ordered=True,
+            )
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -585,6 +766,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                 )(rng_step, env_state, env_act)
                 info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
+                alive_mask = jnp.sum(avail_actions, axis=-1) > 1
                 transition = Transition(
                     jnp.tile(done["__all__"], env.num_agents),
                     last_done,
@@ -596,7 +778,8 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                     world_state,
                     jax.lax.stop_gradient(actor_latent.squeeze(axis=0)),
                     jax.lax.stop_gradient(critic_latent.squeeze(axis=0)),
-                    jnp.sum(avail_actions, axis=-1) > 1,
+                    alive_mask,
+                    alive_mask,
                     info,
                     avail_actions,
                 )
@@ -614,6 +797,52 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
+
+            _, _, shuffle_audit = maybe_shuffle_targets_within_agent(
+                traj_batch.actor_latent_old,
+                traj_batch.alive_mask,
+                False,
+                config["SEED"],
+                update_steps,
+                env.num_agents,
+                config["NUM_ENVS"],
+                config["ALIGN_SHUFFLE_SEED_OFFSET"],
+            )
+            if config["ALIGN_TARGET_SHUFFLE"]:
+                if config["ALIGN_MODE"] == "a_to_c":
+                    shuffled_target, alignment_mask, shuffle_audit = (
+                        maybe_shuffle_targets_within_agent(
+                            traj_batch.actor_latent_old,
+                            traj_batch.alive_mask,
+                            True,
+                            config["SEED"],
+                            update_steps,
+                            env.num_agents,
+                            config["NUM_ENVS"],
+                            config["ALIGN_SHUFFLE_SEED_OFFSET"],
+                        )
+                    )
+                    traj_batch = traj_batch._replace(
+                        actor_latent_old=shuffled_target,
+                        alignment_mask=alignment_mask,
+                    )
+                else:
+                    shuffled_target, alignment_mask, shuffle_audit = (
+                        maybe_shuffle_targets_within_agent(
+                            traj_batch.critic_latent_old,
+                            traj_batch.alive_mask,
+                            True,
+                            config["SEED"],
+                            update_steps,
+                            env.num_agents,
+                            config["NUM_ENVS"],
+                            config["ALIGN_SHUFFLE_SEED_OFFSET"],
+                        )
+                    )
+                    traj_batch = traj_batch._replace(
+                        critic_latent_old=shuffled_target,
+                        alignment_mask=alignment_mask,
+                    )
 
             # CALCULATE ADVANTAGE
             train_states, env_state, last_obs, last_done, hstates, rng = runner_state
@@ -776,7 +1005,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                                 traj_batch.actor_latent_old.shape
                             )
                             critic_latent = critic_aux[1]
-                            mask = traj_batch.alive_mask
+                            mask = traj_batch.alignment_mask
                             c_to_a_loss = latent_distance(
                                 actor_latent,
                                 jax.lax.stop_gradient(
@@ -843,10 +1072,56 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                             actor_train_state.params,
                             critic_train_state.params,
                         )
+
+                        if (
+                            config["ALIGN_MODE"] == "none"
+                            or config["ALIGNMENT_COEF"] == 0
+                        ):
+                            actor_cross_grads = jax.tree.map(
+                                jnp.zeros_like, actor_grads
+                            )
+                            critic_cross_grads = jax.tree.map(
+                                jnp.zeros_like, critic_grads
+                            )
+                        else:
+
+                            def matched_cross_objective(
+                                actor_params, critic_params
+                            ):
+                                _, auxiliary = matched_total_loss(
+                                    actor_params, critic_params
+                                )
+                                return config["ALIGNMENT_COEF"] * (
+                                    auxiliary[7]
+                                    + auxiliary[8]
+                                    + auxiliary[9]
+                                )
+
+                            actor_cross_grads, critic_cross_grads = jax.grad(
+                                matched_cross_objective,
+                                argnums=(0, 1),
+                            )(
+                                actor_train_state.params,
+                                critic_train_state.params,
+                            )
                         if not config["ACTOR_PARAMETER_SHARING"]:
                             actor_grads = jax.tree.map(
                                 lambda x: x * env.num_agents, actor_grads
                             )
+                            actor_cross_grads = jax.tree.map(
+                                lambda x: x * env.num_agents,
+                                actor_cross_grads,
+                            )
+                        actor_rl_grads = jax.tree.map(
+                            lambda total, cross: total - cross,
+                            actor_grads,
+                            actor_cross_grads,
+                        )
+                        critic_rl_grads = jax.tree.map(
+                            lambda total, cross: total - cross,
+                            critic_grads,
+                            critic_cross_grads,
+                        )
                         actor_loss = (matched_aux[0], matched_aux[1])
                         critic_loss = (matched_aux[2], matched_aux[3])
                         c_to_a_loss = matched_aux[4]
@@ -878,6 +1153,14 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         actor_alignment_loss = zero
                         critic_alignment_loss = zero
                         joint_alignment_loss = zero
+                        actor_cross_grads = jax.tree.map(
+                            jnp.zeros_like, actor_grads
+                        )
+                        critic_cross_grads = jax.tree.map(
+                            jnp.zeros_like, critic_grads
+                        )
+                        actor_rl_grads = actor_grads
+                        critic_rl_grads = critic_grads
                     else:
                         actor_batch = jax.tree.map(split_agents, traj_batch)
                         actor_hstates = split_agents(ac_init_hstate)
@@ -906,14 +1189,26 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         actor_alignment_loss = zero
                         critic_alignment_loss = zero
                         joint_alignment_loss = zero
-
-                    if config["ACTOR_PARAMETER_SHARING"]:
-                        actor_grad_norms = jnp.asarray(
-                            [tree_l2_norm(actor_grads)]
+                        actor_cross_grads = jax.tree.map(
+                            jnp.zeros_like, actor_grads
                         )
-                    else:
-                        actor_grad_norms = jax.vmap(tree_l2_norm)(actor_grads)
+                        critic_cross_grads = jax.tree.map(
+                            jnp.zeros_like, critic_grads
+                        )
+                        actor_rl_grads = actor_grads
+                        critic_rl_grads = critic_grads
+
+                    def actor_tree_norms(tree):
+                        if config["ACTOR_PARAMETER_SHARING"]:
+                            return jnp.asarray([tree_l2_norm(tree)])
+                        return jax.vmap(tree_l2_norm)(tree)
+
+                    actor_grad_norms = actor_tree_norms(actor_grads)
+                    actor_rl_grad_norms = actor_tree_norms(actor_rl_grads)
+                    actor_cross_grad_norms = actor_tree_norms(actor_cross_grads)
                     critic_grad_norm = tree_l2_norm(critic_grads)
+                    critic_rl_grad_norm = tree_l2_norm(critic_rl_grads)
+                    critic_cross_grad_norm = tree_l2_norm(critic_cross_grads)
 
                     old_actor_params = actor_train_state.params
                     old_critic_params = critic_train_state.params
@@ -957,9 +1252,33 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         "alignment_c_to_a_distance": c_to_a_loss,
                         "alignment_a_to_c_distance": a_to_c_loss,
                         "alignment_current_joint_distance": current_joint_loss,
+                        "c_to_a_loss": c_to_a_loss,
+                        "a_to_c_loss": a_to_c_loss,
+                        "joint_loss": current_joint_loss,
                         "alignment_actor_objective": actor_alignment_loss,
                         "alignment_critic_objective": critic_alignment_loss,
                         "alignment_joint_objective": joint_alignment_loss,
+                        "alignment_objective_weighted": config["ALIGNMENT_COEF"]
+                        * (
+                            actor_alignment_loss
+                            + critic_alignment_loss
+                            + joint_alignment_loss
+                        ),
+                        "alignment_objective": (
+                            actor_alignment_loss
+                            + critic_alignment_loss
+                            + joint_alignment_loss
+                        ),
+                        "actor_rl_grad_norm_mean": actor_rl_grad_norms.mean(),
+                        "actor_rl_grad_norm_max": actor_rl_grad_norms.max(),
+                        "actor_cross_grad_norm_mean": (
+                            actor_cross_grad_norms.mean()
+                        ),
+                        "actor_cross_grad_norm_max": actor_cross_grad_norms.max(),
+                        "actor_cross_to_rl_grad_ratio_mean": (
+                            actor_cross_grad_norms
+                            / jnp.maximum(actor_rl_grad_norms, 1e-12)
+                        ).mean(),
                         "actor_grad_norm_mean": actor_grad_norms.mean(),
                         "actor_grad_norm_max": actor_grad_norms.max(),
                         "actor_grad_norm_after_clip_mean": (
@@ -974,6 +1293,10 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         "actor_update_norm_mean": actor_update_norms.mean(),
                         "actor_update_norm_max": actor_update_norms.max(),
                         "critic_grad_norm": critic_grad_norm,
+                        "critic_rl_grad_norm": critic_rl_grad_norm,
+                        "critic_cross_grad_norm": critic_cross_grad_norm,
+                        "critic_cross_to_rl_grad_ratio": critic_cross_grad_norm
+                        / jnp.maximum(critic_rl_grad_norm, 1e-12),
                         "critic_grad_norm_after_clip": jnp.minimum(
                             critic_grad_norm, config["MAX_GRAD_NORM"]
                         ),
@@ -983,6 +1306,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         "critic_update_norm": tree_l2_norm(
                             critic_param_updates
                         ),
+                        "alive_agent_fraction": traj_batch.alive_mask.mean(),
                     }
 
                     if config["MATCHED_COMPARISON"]:
@@ -1123,6 +1447,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                 traj_batch.info,
             )
             metric["loss"] = loss_info
+            metric["shuffle"] = shuffle_audit
             rng = update_state[-1]
 
             def callback(metric):
@@ -1139,6 +1464,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                     * config["NUM_ENVS"]
                     * config["NUM_STEPS"],
                     **metric["loss"],
+                    **metric["shuffle"],
                 }
                 if progress_bar is not None:
                     completed = int(np.asarray(metric["update_steps"]).item()) + 1
@@ -1165,6 +1491,9 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                 )
                 is_final = completed_updates == config["NUM_UPDATES"]
                 should_save = jnp.logical_or(crossed_interval, is_final)
+                nominal_env_steps = (
+                    completed_env_steps // checkpoint_interval
+                ) * checkpoint_interval
 
                 def save_checkpoint(_):
                     return io_callback(
@@ -1173,7 +1502,9 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         train_states[0].params,
                         train_states[1].params,
                         completed_env_steps,
+                        nominal_env_steps,
                         is_final,
+                        jnp.asarray(False),
                         ordered=True,
                     )
 
@@ -1211,6 +1542,27 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
 def main(config):
 
     config = OmegaConf.to_container(config)
+    if not config.get("GIT_COMMIT"):
+        try:
+            config["GIT_COMMIT"] = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            config["GIT_COMMIT"] = "unknown"
+    condition = config["ALIGN_MODE"]
+    if config["ALIGN_TARGET_SHUFFLE"]:
+        condition = f"{condition}_shuffled"
+    if config.get("EXPERIMENT_CONDITION"):
+        if config["EXPERIMENT_CONDITION"] != condition:
+            raise ValueError(
+                "EXPERIMENT_CONDITION does not match ALIGN_MODE/shuffle: "
+                f"{config['EXPERIMENT_CONDITION']!r} != {condition!r}"
+            )
+    else:
+        config["EXPERIMENT_CONDITION"] = condition
     sharing_mode = (
         "shared-actor"
         if config["ACTOR_PARAMETER_SHARING"]
@@ -1229,12 +1581,14 @@ def main(config):
         group=os.environ.get("WANDB_RUN_GROUP") or None,
         name=os.environ.get("WANDB_NAME")
         or (
-            f"MAPPO-{actor_mode}-{config['ALIGN_MODE']}-"
+            f"MAPPO-{actor_mode}-{condition}-"
             f"{config['MAP_NAME']}-seed{config['SEED']}"
         ),
         config=config,
         mode=config["WANDB_MODE"],
     )
+    run.define_metric("env_step")
+    run.define_metric("*", step_metric="env_step")
     checkpoint_callback = None
     checkpoint_run_dir = None
     if config["SAVE_CHECKPOINTS"]:
@@ -1252,7 +1606,7 @@ def main(config):
     progress_bar = tqdm(
         total=num_updates,
         desc=(
-            f"MAPPO {actor_mode} {config['ALIGN_MODE']} "
+            f"MAPPO {actor_mode} {condition} "
             f"{config['MAP_NAME']} seed={config['SEED']}"
         ),
         unit="update",

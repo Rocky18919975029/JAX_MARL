@@ -19,6 +19,12 @@
 "MATCHED_COMPARISON": False
 "ALIGN_MODE": "none" # none | c_to_a | a_to_c | reciprocal | joint
 "ALIGNMENT_COEF": 0.1
+"ALIGN_TARGET_SHUFFLE": False
+"ALIGN_TARGET_SHUFFLE_SCOPE": "same_agent_env_time"
+"ALIGN_SHUFFLE_SEED_OFFSET": 700000
+"EXPERIMENT_CONDITION": ""
+"PROTOCOL_VERSION": ""
+"GIT_COMMIT": ""
 "ENV_NAME": "HeuristicEnemySMAX"
 "MAP_NAME": "2s3z"
 "SEED": 0

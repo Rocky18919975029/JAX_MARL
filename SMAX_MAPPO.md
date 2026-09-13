@@ -69,6 +69,19 @@ minibatches and epochs in that update. Joint mode obtains actor and critic
 gradients from one combined forward loss, so neither side observes parameters
 already updated by the other side.
 
+For the H1 semantic-correspondence controls, enable target shuffling only with
+a directional frozen-target mode:
+
+```bash
+ALIGN_MODE=a_to_c ALIGN_TARGET_SHUFFLE=true
+ALIGN_MODE=c_to_a ALIGN_TARGET_SHUFFLE=true
+```
+
+Targets are cyclically deranged within each agent's alive environment-by-time
+pool once per PPO update. The same permutation is reused by every minibatch and
+epoch, and its RNG substream does not alter rollout/action sampling. See
+`H1_EXPERIMENT.md` for the locked 280-run protocol and post-hoc diagnostics.
+
 ## Checkpoints and post-training evaluation
 
 Checkpointing is disabled by default for individual baseline commands. Enable
@@ -82,8 +95,8 @@ python baselines/MAPPO/mappo_rnn_smax.py ...
 ```
 
 The controlled-heterogeneity launcher enables checkpointing by default. Each
-run gets its own directory containing checkpoints near every requested
-environment-step interval and a separate `final` checkpoint. Every checkpoint
+run gets its own directory containing an `initial` checkpoint, nominal
+interval checkpoints, and a separate `final` checkpoint. Every checkpoint
 contains:
 
 - `model.safetensors`: complete actor and critic parameter trees;

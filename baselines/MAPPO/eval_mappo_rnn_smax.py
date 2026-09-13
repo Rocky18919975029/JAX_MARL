@@ -235,6 +235,12 @@ def main():
     checkpoint_dir, model_path, config_path = resolve_checkpoint(args.checkpoint)
     with config_path.open(encoding="utf-8") as file:
         config = json.load(file)
+    metadata_path = checkpoint_dir / "metadata.json"
+    checkpoint_metadata = (
+        json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata_path.is_file()
+        else {}
+    )
     if args.map_name is not None:
         config["MAP_NAME"] = args.map_name
 
@@ -277,7 +283,12 @@ def main():
 
     result = {
         "checkpoint": str(checkpoint_dir),
+        "run_id": checkpoint_metadata.get("wandb_run_id"),
+        "run_name": checkpoint_metadata.get("wandb_run_name"),
         "checkpoint_env_step": config.get("CHECKPOINT_ENV_STEP"),
+        "checkpoint_nominal_env_step": config.get(
+            "CHECKPOINT_NOMINAL_ENV_STEP"
+        ),
         "map_name": config["MAP_NAME"],
         "training_seed": config["SEED"],
         "eval_seed": args.seed,
@@ -286,7 +297,11 @@ def main():
         "num_envs": args.num_envs,
         "actor_parameter_sharing": config["ACTOR_PARAMETER_SHARING"],
         "align_mode": config["ALIGN_MODE"],
+        "align_target_shuffle": config.get("ALIGN_TARGET_SHUFFLE", False),
+        "condition": config.get("EXPERIMENT_CONDITION", config["ALIGN_MODE"]),
         "alignment_coef": config["ALIGNMENT_COEF"],
+        "protocol_version": config.get("PROTOCOL_VERSION", ""),
+        "git_commit": config.get("GIT_COMMIT", ""),
         "return_mean": return_mean,
         "return_std": return_std,
         "return_stderr": return_stderr,
