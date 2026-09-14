@@ -62,6 +62,15 @@ def bootstrap_mean(values, rng, repetitions=10_000):
     return tuple(np.quantile(means, (0.025, 0.975)).tolist())
 
 
+def trapezoidal_integral(values, x):
+    """Integrate with the API available in both NumPy 1.x and current NumPy."""
+
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is not None:
+        return trapezoid(values, x)
+    return np.trapz(values, x)
+
+
 def summarize(values, rng):
     values = np.asarray(values, dtype=np.float64)
     std = float(values.std(ddof=1)) if values.size > 1 else 0.0
@@ -157,8 +166,8 @@ def seed_endpoints(records):
                 "actor_parameterization": key[1],
                 "condition": key[2],
                 "seed": key[3],
-                "return_auc": float(np.trapz(returns, x) / budget),
-                "win_rate_auc": float(np.trapz(wins, x) / budget),
+                "return_auc": float(trapezoidal_integral(returns, x) / budget),
+                "win_rate_auc": float(trapezoidal_integral(wins, x) / budget),
                 "final_return": float(returns[-1]),
                 "final_win_rate": float(wins[-1]),
                 "last_nominal_step": int(x[-1]),
