@@ -229,7 +229,16 @@ def make_brancher(config, checkpoint, continuations):
 
         return jax.vmap(evaluate_action)(candidate_actions)
 
-    return jax.jit(branch_all), env, action_dim
+    def branch_all_agents(state, obs, hidden, anchor_key):
+        agent_ids = jnp.arange(num_agents, dtype=jnp.int32)
+        agent_keys = jax.vmap(lambda agent: jax.random.fold_in(anchor_key, agent))(
+            agent_ids
+        )
+        return jax.vmap(branch_all, in_axes=(0, None, None, None, 0))(
+            agent_ids, state, obs, hidden, agent_keys
+        )
+
+    return jax.jit(branch_all_agents), env, action_dim
 
 
 def initialize_probe(key, input_dim, hidden_dim):
@@ -429,6 +438,10 @@ def main():
         }
         obs["world_state"] = jnp.asarray(arrays["world_state"][episode, timestep])[None]
         hidden = jnp.asarray(arrays["actor_hidden_before"][episode, timestep])
+        key = jax.random.fold_in(jax.random.PRNGKey(args.seed), anchor_id)
+        anchor_q_values, anchor_q_std = brancher(state, obs, hidden, key)
+        anchor_q_values = np.asarray(anchor_q_values)
+        anchor_q_std = np.asarray(anchor_q_std)
         for agent in range(env.num_agents):
             if not arrays["alive"][episode, timestep, agent]:
                 continue
@@ -437,11 +450,8 @@ def main():
             )
             if available.sum() < 2:
                 continue
-            key = jax.random.fold_in(jax.random.PRNGKey(args.seed), anchor_id)
-            key = jax.random.fold_in(key, agent)
-            q_values, q_std = brancher(agent, state, obs, hidden, key)
-            q_values = np.asarray(q_values)
-            q_std = np.asarray(q_std)
+            q_values = anchor_q_values[agent]
+            q_std = anchor_q_std[agent]
             latent = arrays["actor_latent"][episode, timestep, agent]
             unit_type = int(arrays["state_unit_types"][episode, timestep, agent])
             for action in np.flatnonzero(available):

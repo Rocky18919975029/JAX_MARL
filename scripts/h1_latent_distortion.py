@@ -82,7 +82,9 @@ def cross_fitted_reference(states, returns, episode_ids, active, seed, width, ri
     return predictions, fold_metrics
 
 
-def fisher_metrics(scores, reference_advantage, critic_advantage, ridge_multiplier):
+def fisher_statistics(scores, reference_advantage, critic_advantage):
+    """Compute ridge-independent Fisher quantities once for one sample pool."""
+
     scores = np.asarray(scores, dtype=np.float64)
     reference_advantage = np.asarray(reference_advantage, dtype=np.float64)
     critic_advantage = np.asarray(critic_advantage, dtype=np.float64)
@@ -93,6 +95,27 @@ def fisher_metrics(scores, reference_advantage, critic_advantage, ridge_multipli
     fisher = (scores.T @ scores) / count
     fisher = (fisher + fisher.T) / 2.0
     eigenvalues = np.linalg.eigvalsh(fisher)
+    return {
+        "count": count,
+        "dimension": dimension,
+        "delta": delta,
+        "g_reference": g_reference,
+        "g_critic": g_critic,
+        "fisher": fisher,
+        "eigenvalues": eigenvalues,
+    }
+
+
+def fisher_metrics_from_statistics(statistics, ridge_multiplier):
+    """Apply a ridge choice without rebuilding the expensive Fisher matrix."""
+
+    count = statistics["count"]
+    dimension = statistics["dimension"]
+    delta = statistics["delta"]
+    g_reference = statistics["g_reference"]
+    g_critic = statistics["g_critic"]
+    fisher = statistics["fisher"]
+    eigenvalues = statistics["eigenvalues"]
     base_ridge = ridge_multiplier * np.trace(fisher) / dimension
     ridge = max(float(base_ridge), 1e-12)
     attempts = 0
@@ -148,6 +171,13 @@ def fisher_metrics(scores, reference_advantage, critic_advantage, ridge_multipli
     }
 
 
+def fisher_metrics(scores, reference_advantage, critic_advantage, ridge_multiplier):
+    return fisher_metrics_from_statistics(
+        fisher_statistics(scores, reference_advantage, critic_advantage),
+        ridge_multiplier,
+    )
+
+
 def append_csv(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists()
@@ -195,19 +225,20 @@ def main():
     unit_types = arrays["state_unit_types"][:, :, : metadata["num_agents"]]
     for agent in range(metadata["num_agents"]):
         mask = active & arrays["alive"][:, :, agent].astype(bool)
-        metrics = fisher_metrics(
+        agent_statistics = fisher_statistics(
             arrays["actor_score"][:, :, agent][mask],
             reference_advantage[mask],
             arrays["gae_raw"][:, :, agent][mask],
+        )
+        metrics = fisher_metrics_from_statistics(
+            agent_statistics,
             args.fisher_ridge,
         )
         per_agent_epsilon.append(metrics["epsilon_lat"])
         per_agent_energy.append(metrics["energy_ref"])
         for ridge_multiplier in (1e-4, 1e-3, 1e-2):
-            sensitivity_metrics = fisher_metrics(
-                arrays["actor_score"][:, :, agent][mask],
-                reference_advantage[mask],
-                arrays["gae_raw"][:, :, agent][mask],
+            sensitivity_metrics = fisher_metrics_from_statistics(
+                agent_statistics,
                 ridge_multiplier,
             )
             ridge_sensitivity.append(

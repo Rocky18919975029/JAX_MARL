@@ -30,7 +30,7 @@ STAGE_MARKERS = {
 }
 
 
-def worker_environment(base_environment, gpu):
+def worker_environment(base_environment, gpu, cpu_threads=None):
     """Build a training-dtype-compatible environment for a diagnostic worker."""
 
     environment = dict(base_environment)
@@ -45,6 +45,15 @@ def worker_environment(base_environment, gpu):
             "JAX_ENABLE_X64": "false",
         }
     )
+    if cpu_threads is not None:
+        for variable in (
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        ):
+            environment[variable] = str(cpu_threads)
     return environment
 
 
@@ -68,10 +77,24 @@ def main():
     parser.add_argument("--anchors", type=int, default=256)
     parser.add_argument("--continuations", type=int, default=32)
     parser.add_argument("--bellman-heads", type=int, default=32)
+    parser.add_argument(
+        "--cpu-threads-per-worker",
+        type=int,
+        default=0,
+        help="BLAS threads per worker; 0 divides detected CPUs across worker slots",
+    )
     parser.add_argument("--allow-missing", action="store_true")
     args = parser.parse_args()
     run_root = args.run_root.expanduser().resolve()
     gpu_ids = tuple(item.strip() for item in args.gpus.split(",") if item.strip())
+    if not gpu_ids or args.max_runs_per_gpu <= 0:
+        raise ValueError("Select GPUs and a positive --max-runs-per-gpu")
+    worker_slots = len(gpu_ids) * args.max_runs_per_gpu
+    cpu_threads = args.cpu_threads_per_worker or max(
+        1, (os.cpu_count() or worker_slots) // worker_slots
+    )
+    if cpu_threads <= 0:
+        raise ValueError("--cpu-threads-per-worker must be non-negative")
     stages = tuple(item.strip() for item in args.stages.split(",") if item.strip())
     unknown = set(stages) - set(STAGE_MARKERS)
     if unknown:
@@ -89,6 +112,7 @@ def main():
         and fnmatch.fnmatch(task.checkpoint_dir.name, args.checkpoint_name_glob)
     ]
     selected = []
+    stage_label = "-".join(stages)
     for task in tasks:
         output = run_root / args.output_tree / task.run_name / task.checkpoint_dir.name
         complete = all((output / STAGE_MARKERS[stage]).is_file() for stage in stages)
@@ -113,7 +137,7 @@ def main():
 
     log(
         f"stages={','.join(stages)} discovered={len(tasks)} pending={len(selected)} "
-        f"missing={len(missing)}"
+        f"missing={len(missing)} cpu_threads_per_worker={cpu_threads}"
     )
     running = {}
     stopping = False
@@ -136,7 +160,10 @@ def main():
             while pending[gpu] and active < args.max_runs_per_gpu:
                 task, output = pending[gpu].popleft()
                 output.mkdir(parents=True, exist_ok=True)
-                log_path = log_dir / f"{task.run_name}-{task.checkpoint_dir.name}.log"
+                log_path = (
+                    log_dir
+                    / f"{task.run_name}-{task.checkpoint_dir.name}-{stage_label}.log"
+                )
                 handle = log_path.open("w", encoding="utf-8")
                 command = [
                     sys.executable,
@@ -162,7 +189,7 @@ def main():
                     "--bellman-heads",
                     str(args.bellman_heads),
                 ]
-                environment = worker_environment(os.environ, gpu)
+                environment = worker_environment(os.environ, gpu, cpu_threads)
                 started = dt.datetime.now(dt.timezone.utc).isoformat()
                 process = subprocess.Popen(
                     command,

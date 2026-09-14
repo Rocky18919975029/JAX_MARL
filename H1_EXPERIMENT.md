@@ -314,6 +314,33 @@ float32 training/checkpoint dtype. Fisher and bootstrap/statistical operations
 that require additional precision explicitly promote their inputs to NumPy
 float64 inside the corresponding analysis scripts.
 
+For better hardware utilization, the exact same formal protocol can be run in
+four resumable phases. Collection can use two workers per GPU; CPU-heavy latent
+analysis and the GPU-heavy decision/Bellman stages use one worker per GPU. The
+launcher automatically caps BLAS threads across active worker slots, caches
+ridge-independent Fisher statistics, batches all agents in each counterfactual
+anchor, and trains Bellman heads in multi-update device blocks. These are
+execution optimizations only: episode, anchor, continuation, head, seed, and
+checkpoint budgets are unchanged.
+
+```bash
+python scripts/run_h1_diagnostics.py --run-root "$H1_REDUCED_ROOT" \
+  --gpus 0,1,2,3 --max-runs-per-gpu 2 --output-tree diagnostics_raw \
+  --stages collect --episodes 512 --batch-size 64
+
+python scripts/run_h1_diagnostics.py --run-root "$H1_REDUCED_ROOT" \
+  --gpus 0,1,2,3 --max-runs-per-gpu 1 --output-tree diagnostics_raw \
+  --stages latent
+
+python scripts/run_h1_diagnostics.py --run-root "$H1_REDUCED_ROOT" \
+  --gpus 0,1,2,3 --max-runs-per-gpu 1 --output-tree diagnostics_raw \
+  --stages decision --anchors 256 --continuations 32
+
+python scripts/run_h1_diagnostics.py --run-root "$H1_REDUCED_ROOT" \
+  --gpus 0,1,2,3 --max-runs-per-gpu 1 --output-tree diagnostics_raw \
+  --stages bellman --bellman-heads 32
+```
+
 Stages can be scheduled separately with, for example,
 `--stages collect,latent`.  Merge immutable per-checkpoint CSV files after all
 workers finish:

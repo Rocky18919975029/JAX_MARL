@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -14,7 +15,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def run(command):
     print("RUN", " ".join(map(str, command)), flush=True)
+    started = time.monotonic()
     subprocess.run(command, cwd=REPO_ROOT, check=True)
+    print(f"DONE elapsed_seconds={time.monotonic() - started:.3f}", flush=True)
 
 
 def main():

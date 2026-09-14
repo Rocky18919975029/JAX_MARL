@@ -9,6 +9,7 @@ def test_diagnostic_worker_matches_float32_checkpoint_dtype():
             "JAX_ENABLE_X64": "true",
         },
         3,
+        7,
     )
 
     assert environment["PATH"] == "/example/bin"
@@ -16,3 +17,8 @@ def test_diagnostic_worker_matches_float32_checkpoint_dtype():
     assert environment["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
     assert environment["JAX_ENABLE_X64"] == "false"
     assert "LD_LIBRARY_PATH" not in environment
+    assert environment["OMP_NUM_THREADS"] == "7"
+    assert environment["OPENBLAS_NUM_THREADS"] == "7"
+    assert environment["MKL_NUM_THREADS"] == "7"
+    assert environment["NUMEXPR_NUM_THREADS"] == "7"
+    assert environment["VECLIB_MAXIMUM_THREADS"] == "7"

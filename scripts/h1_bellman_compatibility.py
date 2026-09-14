@@ -24,6 +24,9 @@ from baselines.MAPPO.eval_mappo_rnn_smax import resolve_checkpoint
 from jaxmarl.wrappers.baselines import load_params
 
 
+HEAD_OPTIMIZER = optax.adam(3e-4)
+
+
 def load_diagnostics(directory):
     directory = directory.expanduser().resolve()
     metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
@@ -62,6 +65,26 @@ def checkpoint_head(critic_params):
     }
 
 
+@jax.jit
+def update_head_block(params, optimizer_state, inputs, targets, batch_indices):
+    """Run a block of head updates in one device dispatch."""
+
+    def update_one(carry, indices):
+        current_params, current_optimizer_state = carry
+        x = inputs[indices]
+        y = targets[indices]
+        loss, grads = jax.value_and_grad(
+            lambda values: jnp.mean(jnp.square(predict(values, x) - y))
+        )(current_params)
+        updates, current_optimizer_state = HEAD_OPTIMIZER.update(
+            grads, current_optimizer_state, current_params
+        )
+        current_params = optax.apply_updates(current_params, updates)
+        return (current_params, current_optimizer_state), loss
+
+    return jax.lax.scan(update_one, (params, optimizer_state), batch_indices)
+
+
 def fit_head(
     inputs,
     targets,
@@ -77,54 +100,62 @@ def fit_head(
     target_std = float(targets[train_indices].std() + 1e-8)
     normalized_targets = ((targets - target_mean) / target_std).astype(np.float32)
     params = initialize_head(jax.random.PRNGKey(seed), inputs.shape[1], hidden_dim)
-    optimizer = optax.adam(3e-4)
-    optimizer_state = optimizer.init(params)
-
-    @jax.jit
-    def update(params, optimizer_state, x, y):
-        loss, grads = jax.value_and_grad(
-            lambda values: jnp.mean(jnp.square(predict(values, x) - y))
-        )(params)
-        updates, optimizer_state = optimizer.update(grads, optimizer_state, params)
-        return optax.apply_updates(params, updates), optimizer_state, loss
+    optimizer_state = HEAD_OPTIMIZER.init(params)
+    device_inputs = jnp.asarray(inputs)
+    device_targets = jnp.asarray(normalized_targets)
+    validation_indices_device = jnp.asarray(validation_indices)
 
     rng = np.random.default_rng(seed)
     best_params = params
     best_validation = math.inf
     stale = 0
     history = []
-    for step in range(steps):
-        minibatch = rng.choice(
-            train_indices,
-            size=min(batch_size, len(train_indices)),
-            replace=len(train_indices) < batch_size,
-        )
-        params, optimizer_state, train_loss = update(
+    validation_steps = list(range(0, steps, 50))
+    if validation_steps[-1] != steps - 1:
+        validation_steps.append(steps - 1)
+    previous_step = -1
+    minibatch_size = min(batch_size, len(train_indices))
+    replace = len(train_indices) < batch_size
+    for step in validation_steps:
+        block_length = step - previous_step
+        minibatches = np.stack(
+            [
+                rng.choice(
+                    train_indices,
+                    size=minibatch_size,
+                    replace=replace,
+                )
+                for _ in range(block_length)
+            ]
+        ).astype(np.int32)
+        (params, optimizer_state), train_losses = update_head_block(
             params,
             optimizer_state,
-            jnp.asarray(inputs[minibatch]),
-            jnp.asarray(normalized_targets[minibatch]),
+            device_inputs,
+            device_targets,
+            jnp.asarray(minibatches),
         )
-        if step % 50 == 0 or step == steps - 1:
-            validation_prediction = np.asarray(
-                predict(params, jnp.asarray(inputs[validation_indices]))
-            )
-            validation_loss = float(
-                np.mean(
-                    np.square(
-                        validation_prediction - normalized_targets[validation_indices]
-                    )
+        train_loss = train_losses[-1]
+        validation_prediction = np.asarray(
+            predict(params, device_inputs[validation_indices_device])
+        )
+        validation_loss = float(
+            np.mean(
+                np.square(
+                    validation_prediction - normalized_targets[validation_indices]
                 )
             )
-            history.append((step, float(train_loss), validation_loss))
-            if validation_loss < best_validation - 1e-7:
-                best_validation = validation_loss
-                best_params = params
-                stale = 0
-            else:
-                stale += 50
-                if stale >= patience:
-                    break
+        )
+        history.append((step, float(train_loss), validation_loss))
+        if validation_loss < best_validation - 1e-7:
+            best_validation = validation_loss
+            best_params = params
+            stale = 0
+        else:
+            stale += 50
+            if stale >= patience:
+                break
+        previous_step = step
     # Store affine target scaling alongside the network without changing its
     # architecture. Predictions are mapped back to reward units by this pair.
     return best_params, target_mean, target_std, history
@@ -178,8 +209,8 @@ def main():
     parser.add_argument("--patience", type=int, default=250)
     parser.add_argument("--seed", type=int, default=51001)
     args = parser.parse_args()
-    if args.heads < 1:
-        raise ValueError("--heads must be positive")
+    if args.heads < 1 or args.steps < 1:
+        raise ValueError("--heads and --steps must be positive")
     metadata, arrays = load_diagnostics(args.diagnostics_dir)
     checkpoint_dir, model_path, config_path = resolve_checkpoint(args.checkpoint)
     config = json.loads(config_path.read_text(encoding="utf-8"))
