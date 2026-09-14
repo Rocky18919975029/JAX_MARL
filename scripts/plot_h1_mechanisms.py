@@ -15,9 +15,12 @@ COLORS = {
     "none": "#e63946",
     "a_to_c": "#80b918",
     "c_to_a": "#377bd1",
+    "joint": "#b46f40",
+    "reciprocal": "#7f8c8d",
     "a_to_c_shuffled": "#b5d56a",
     "c_to_a_shuffled": "#75a7e6",
 }
+CONDITION_ORDER = tuple(COLORS)
 
 
 def read(path):
@@ -25,10 +28,13 @@ def read(path):
         return list(csv.DictReader(file))
 
 
-def conditions_for(task):
-    if task == "10m_vs_11m":
-        return ("none", "a_to_c", "c_to_a", "a_to_c_shuffled")
-    return ("none", "c_to_a", "a_to_c", "c_to_a_shuffled")
+def conditions_for(rows, task, actor):
+    available = {
+        row["condition"]
+        for row in rows
+        if row["task"] == task and row["actor_parameterization"] == actor
+    }
+    return tuple(condition for condition in CONDITION_ORDER if condition in available)
 
 
 def draw_curve(axis, rows, metric, conditions):
@@ -75,7 +81,7 @@ def main():
         set((row["task"], row["actor_parameterization"]) for row in mechanisms)
     )
     for task, actor in strata:
-        conditions = conditions_for(task)
+        conditions = conditions_for(mechanisms, task, actor)
         performance_rows = [
             row
             for row in performance
