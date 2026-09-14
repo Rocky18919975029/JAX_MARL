@@ -49,7 +49,7 @@ export H1_PROJECT_LINK="$HOME/JaxMARL/h1_smax_runs"
 mkdir -p "$H1_DATA_ROOT"
 
 if [ -L "$H1_PROJECT_LINK" ]; then
-  test "$(readlink -f "$H1_PROJECT_LINK")" = "$H1_RUN_ROOT" || {
+  test "$H1_PROJECT_LINK" -ef "$H1_RUN_ROOT" || {
     echo "Existing symlink points somewhere else: $H1_PROJECT_LINK"
     exit 1
   }
@@ -65,7 +65,8 @@ else
   ln -s "$H1_RUN_ROOT" "$H1_PROJECT_LINK"
 fi
 
-test "$(readlink -f "$H1_PROJECT_LINK")" = "$H1_RUN_ROOT"
+test "$H1_PROJECT_LINK" -ef "$H1_RUN_ROOT"
+echo "Resolved output root: $(readlink -f "$H1_PROJECT_LINK")"
 df -h "$H1_RUN_ROOT"
 ```
 
@@ -75,6 +76,9 @@ both locations already exist, because silently merging two experiment trees is
 unsafe.  In every new shell, export `H1_RUN_ROOT` again.  The launcher resolves
 symlinks and puts checkpoints, stdout logs, status files, W&B local
 data/cache/artifact staging, and Hydra run metadata below this data-disk root.
+The printed canonical path may begin with `/mnt/sda` when `/home/data` itself is
+a mount alias; `test -ef` verifies directory identity without relying on the
+spelling of those two equivalent paths.
 
 Freeze the exact W&B pilot baseline config that generated the pilot curves.
 The source may be a JSON export or W&B's local `files/config.yaml`:

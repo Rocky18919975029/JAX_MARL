@@ -17,5 +17,5 @@ wandb/
 outputs/
 models/
 checkpoints/
-h1_smax_runs/
+/h1_smax_runs
 build/
