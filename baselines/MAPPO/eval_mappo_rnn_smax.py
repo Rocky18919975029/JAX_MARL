@@ -23,6 +23,7 @@ from baselines.MAPPO.mappo_rnn_smax import (
     batchify,
     unbatchify,
 )
+from baselines.MAPPO.smax_rollout import smax_rollout_horizon
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import load_params
 
@@ -95,6 +96,7 @@ def make_eval_batch(config, actor_params, num_envs, deterministic):
     hidden_dim = config["GRU_HIDDEN_DIM"]
     actor_network = ActorRNN(env.action_space(env.agents[0]).n, config=config)
     actor_parameter_sharing = config["ACTOR_PARAMETER_SHARING"]
+    rollout_horizon = smax_rollout_horizon(env.max_steps)
 
     if not actor_parameter_sharing:
         first_leaf = jax.tree.leaves(actor_params)[0]
@@ -211,10 +213,10 @@ def make_eval_batch(config, actor_params, num_envs, deterministic):
                 finished,
             )
 
-        carry = jax.lax.fori_loop(0, env.max_steps, step_once, carry)
+        carry = jax.lax.fori_loop(0, rollout_horizon, step_once, carry)
         return carry[5], carry[6], carry[7], carry[8]
 
-    return jax.jit(eval_batch)
+    return jax.jit(eval_batch), rollout_horizon
 
 
 def mean_standard_error(values):
@@ -252,7 +254,7 @@ def main():
     actor_params = checkpoint["actor"]
 
     deterministic = args.policy == "deterministic"
-    eval_batch = make_eval_batch(
+    eval_batch, rollout_horizon = make_eval_batch(
         config,
         actor_params,
         args.num_envs,
@@ -269,7 +271,11 @@ def main():
         batch_returns, batch_wins, batch_lengths, batch_finished = eval_batch(batch_key)
         batch_finished = np.asarray(batch_finished)
         if not batch_finished.all():
-            raise RuntimeError("Some evaluation episodes did not terminate")
+            unfinished = int((~batch_finished).sum())
+            raise RuntimeError(
+                f"{unfinished}/{len(batch_finished)} evaluation episodes did not "
+                f"terminate after {rollout_horizon} transitions"
+            )
         returns.append(np.asarray(batch_returns))
         wins.append(np.asarray(batch_wins))
         lengths.append(np.asarray(batch_lengths))
@@ -286,15 +292,14 @@ def main():
         "run_id": checkpoint_metadata.get("wandb_run_id"),
         "run_name": checkpoint_metadata.get("wandb_run_name"),
         "checkpoint_env_step": config.get("CHECKPOINT_ENV_STEP"),
-        "checkpoint_nominal_env_step": config.get(
-            "CHECKPOINT_NOMINAL_ENV_STEP"
-        ),
+        "checkpoint_nominal_env_step": config.get("CHECKPOINT_NOMINAL_ENV_STEP"),
         "map_name": config["MAP_NAME"],
         "training_seed": config["SEED"],
         "eval_seed": args.seed,
         "policy": args.policy,
         "episodes": args.episodes,
         "num_envs": args.num_envs,
+        "rollout_horizon": rollout_horizon,
         "actor_parameter_sharing": config["ACTOR_PARAMETER_SHARING"],
         "align_mode": config["ALIGN_MODE"],
         "align_target_shuffle": config.get("ALIGN_TARGET_SHUFFLE", False),

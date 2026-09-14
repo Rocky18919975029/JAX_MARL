@@ -26,6 +26,7 @@ from baselines.MAPPO.mappo_rnn_smax import (
     SMAXWorldStateWrapper,
     batchify,
 )
+from baselines.MAPPO.smax_rollout import smax_rollout_horizon
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.environments.smax.heuristic_enemy import HeuristicPolicyState
 from jaxmarl.environments.smax.heuristic_enemy_smax_env import State as EnemyState
@@ -203,7 +204,9 @@ def make_brancher(config, checkpoint, continuations):
             )
 
         carry = (obs, state, hidden, done, finished, key, total_return, discount)
-        carry = jax.lax.fori_loop(1, env.max_steps, future_step, carry)
+        carry = jax.lax.fori_loop(
+            1, smax_rollout_horizon(env.max_steps), future_step, carry
+        )
         return carry[6]
 
     candidate_actions = jnp.arange(action_dim, dtype=jnp.int32)

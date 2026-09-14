@@ -26,11 +26,12 @@ from baselines.MAPPO.mappo_rnn_smax import (
     batchify,
     unbatchify,
 )
+from baselines.MAPPO.smax_rollout import smax_rollout_horizon
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import load_params
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def parse_args():
@@ -114,6 +115,7 @@ def make_collector(config, checkpoint, batch_size):
     actor_params = checkpoint["actor"]
     critic_params = checkpoint["critic"]
     sharing = config["ACTOR_PARAMETER_SHARING"]
+    rollout_horizon = smax_rollout_horizon(env.max_steps)
 
     def policy_step(actor_hidden, obs, done, env_state, key):
         available = jax.vmap(env.get_avail_actions)(env_state)
@@ -291,7 +293,7 @@ def make_collector(config, checkpoint, batch_size):
             finished,
             rollout_key,
         )
-        carry, records = jax.lax.scan(one_step, carry, None, env.max_steps)
+        carry, records = jax.lax.scan(one_step, carry, None, rollout_horizon)
         return records, carry[5]
 
     return jax.jit(collect_batch), env
@@ -375,6 +377,7 @@ def main():
         "episodes": args.episodes,
         "batch_size": args.batch_size,
         "max_steps": env.max_steps,
+        "rollout_horizon": smax_rollout_horizon(env.max_steps),
         "num_agents": env.num_agents,
         "actor_parameter_sharing": config["ACTOR_PARAMETER_SHARING"],
         "condition": config.get("EXPERIMENT_CONDITION", config["ALIGN_MODE"]),
