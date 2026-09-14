@@ -35,8 +35,8 @@ CONDITIONS = (
 CONFIRMATORY_SEEDS = tuple(range(101, 111))
 REDUCED_SEEDS = (1, 2, 3, 4)
 REDUCED_ACTOR_VARIANTS = ("nps",)
-REDUCED_CONDITIONS = ("c_to_a", "a_to_c", "joint")
-MATRIX_PROFILES = ("confirmatory", "reduced-nps-3mode")
+REDUCED_CONDITIONS = ("none", "c_to_a", "a_to_c", "joint")
+MATRIX_PROFILES = ("confirmatory", "reduced-nps-4condition")
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,9 @@ class Task:
 
     @property
     def run_name(self):
-        prefix = "H1-reduced" if self.matrix_profile == "reduced-nps-3mode" else "H1"
+        prefix = (
+            "H1-reduced" if self.matrix_profile == "reduced-nps-4condition" else "H1"
+        )
         return (
             f"{prefix}-{self.map_name}-{self.actor_label}-{self.condition}-"
             f"lam0p1-seed{self.seed}"
@@ -120,7 +122,7 @@ def validate_matrix_profile(args):
     ]
     if mismatches:
         raise ValueError(
-            "The reduced-nps-3mode profile is locked to exactly 24 runs:\n"
+            "The reduced-nps-4condition profile is locked to exactly 32 runs:\n"
             + "\n".join(mismatches)
         )
 
@@ -257,8 +259,8 @@ def main():
     validate_matrix_profile(args)
     if args.project is None:
         args.project = (
-            "h1-smax-reduced-nps-3mode"
-            if args.matrix_profile == "reduced-nps-3mode"
+            "h1-smax-reduced-nps-4condition"
+            if args.matrix_profile == "reduced-nps-4condition"
             else "h1-smax-confirmatory"
         )
 
@@ -300,8 +302,8 @@ def main():
     if not gpu_ids:
         raise ValueError("--gpus must select at least one GPU")
     tasks = task_matrix(args)
-    if args.matrix_profile == "reduced-nps-3mode" and len(tasks) != 24:
-        raise AssertionError(f"Reduced matrix must contain 24 runs, got {len(tasks)}")
+    if args.matrix_profile == "reduced-nps-4condition" and len(tasks) != 32:
+        raise AssertionError(f"Reduced matrix must contain 32 runs, got {len(tasks)}")
     args.run_root.mkdir(parents=True, exist_ok=True)
     logs_dir = args.run_root / "logs"
     status_dir = args.run_root / "status"
@@ -383,14 +385,14 @@ def main():
                         "WANDB_ARTIFACT_DIR": str(wandb_artifact_dir),
                         "WANDB_NAME": task.run_name,
                         "WANDB_RUN_GROUP": (
-                            f"{'H1-reduced' if args.matrix_profile == 'reduced-nps-3mode' else 'H1'}-"
+                            f"{'H1-reduced' if args.matrix_profile == 'reduced-nps-4condition' else 'H1'}-"
                             f"{task.map_name}-{task.actor_label}-{task.condition}-lam0p1"
                         ),
                         "WANDB_TAGS": ",".join(
                             (
                                 (
                                     "h1-reduced"
-                                    if args.matrix_profile == "reduced-nps-3mode"
+                                    if args.matrix_profile == "reduced-nps-4condition"
                                     else "h1-confirmatory"
                                 ),
                                 "smax",

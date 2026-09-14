@@ -4,8 +4,8 @@ This repository implements the execution protocol in
 `H1_SMAX_EXPERIMENT_EXECUTION_MANUAL.md` on top of the existing matched MAPPO
 code.  The original full matrix is two maps, PS/NPS actors, seven conditions,
 and seeds 101--110 (280 runs).  Before that larger confirmatory study, the first
-formal stage is a locked reduced matrix: both maps, NPS only, `c_to_a`,
-`a_to_c`, and `joint`, with seeds 1--4 (24 runs).
+formal stage is a locked reduced matrix: both maps, NPS only, the `none`
+baseline plus `c_to_a`, `a_to_c`, and `joint`, with seeds 1--4 (32 runs).
 
 ## What is implemented
 
@@ -124,16 +124,16 @@ protocol/tests/matched_initialization_audit.json
 Do not start confirmatory training unless both report `pass` and the frozen
 Git commit matches the checked-out commit.
 
-## Reduced first formal stage (24 runs)
+## Reduced first formal stage (32 runs)
 
-This profile deliberately contains no PS actors, `none` baseline, reciprocal,
-or shuffled controls.  It supports comparison among the three selected
-alignment modes, but it cannot estimate paired effects relative to `none`.
+This profile deliberately contains no PS actors, reciprocal, or shuffled
+controls.  The `none` condition supplies the seed-paired NPS baseline for all
+three selected alignment modes.
 Use a separate root and W&B project so it cannot be mixed with a later full
 confirmatory matrix:
 
 ```bash
-export H1_REDUCED_ROOT="$H1_RUN_ROOT/reduced_nps_3mode"
+export H1_REDUCED_ROOT="$H1_RUN_ROOT/reduced_nps_4condition"
 
 python scripts/h1_protocol.py freeze \
   --source baselines/MAPPO/config/mappo_homogenous_rnn_smax.yaml \
@@ -147,15 +147,15 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false \
 python scripts/run_h1_protocol_tests.py --run-root "$H1_REDUCED_ROOT"
 ```
 
-Preview the exact 24-run matrix before launching:
+Preview the exact 32-run matrix before launching:
 
 ```bash
 python scripts/run_h1_smax_confirmatory.py \
-  --matrix-profile reduced-nps-3mode \
+  --matrix-profile reduced-nps-4condition \
   --run-root "$H1_REDUCED_ROOT" \
   --maps 10m_vs_11m,smacv2_10_units \
   --actor-variants nps \
-  --conditions c_to_a,a_to_c,joint \
+  --conditions none,c_to_a,a_to_c,joint \
   --seeds 1-4 \
   --gpus 0,1,2,3 \
   --max-runs-per-gpu 5 \
@@ -163,15 +163,15 @@ python scripts/run_h1_smax_confirmatory.py \
 ```
 
 Then launch it online in W&B.  Twenty runs start immediately (five per GPU),
-and the remaining four start as capacity becomes available:
+and the remaining twelve start as capacity becomes available:
 
 ```bash
 nohup python scripts/run_h1_smax_confirmatory.py \
-  --matrix-profile reduced-nps-3mode \
+  --matrix-profile reduced-nps-4condition \
   --run-root "$H1_REDUCED_ROOT" \
   --maps 10m_vs_11m,smacv2_10_units \
   --actor-variants nps \
-  --conditions c_to_a,a_to_c,joint \
+  --conditions none,c_to_a,a_to_c,joint \
   --seeds 1-4 \
   --gpus 0,1,2,3 \
   --max-runs-per-gpu 5 \
@@ -180,9 +180,9 @@ nohup python scripts/run_h1_smax_confirmatory.py \
 
 The profile rejects any different seed, actor, condition, or map selection.
 Runs are named `H1-reduced-{map}-nps-{condition}-lam0p1-seed{seed}` in the
-`h1-smax-reduced-nps-3mode` W&B project.  Each
+`h1-smax-reduced-nps-4condition` W&B project.  Each
 `H1-reduced-{map}-nps-{condition}-lam0p1` W&B group contains exactly the four
-seeds for one task/condition pair, so grouping a chart by `Group` produces six
+seeds for one task/condition pair, so grouping a chart by `Group` produces eight
 mean curves rather than averaging different alignment modes together.
 
 ## Full confirmatory training (deferred)
