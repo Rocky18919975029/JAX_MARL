@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate every preregistered H1 checkpoint with paired deterministic seeds."""
+"""Evaluate preregistered or all H1 checkpoints with paired deterministic seeds."""
 
 from __future__ import annotations
 
@@ -29,6 +29,31 @@ CHECKPOINT_SPECS = (
 )
 
 
+def checkpoint_specs(run_dir, include_all=False):
+    """Return the preregistered checkpoints plus any saved dense checkpoints.
+
+    Preregistered entries keep their original indices so existing evaluation
+    JSON remains reusable. Additional checkpoints receive stable indices after
+    that fixed set, ordered by nominal environment step.
+    """
+
+    if not include_all:
+        return CHECKPOINT_SPECS
+    known_names = {name for name, _ in CHECKPOINT_SPECS}
+    additional = []
+    for checkpoint_dir in run_dir.glob("step_*"):
+        if checkpoint_dir.name in known_names:
+            continue
+        try:
+            nominal_step = int(checkpoint_dir.name.removeprefix("step_"))
+        except ValueError:
+            continue
+        if (checkpoint_dir / "model.safetensors").is_file():
+            additional.append((checkpoint_dir.name, nominal_step))
+    additional.sort(key=lambda item: item[1])
+    return CHECKPOINT_SPECS + tuple(additional)
+
+
 @dataclass(frozen=True)
 class EvalTask:
     run_dir: Path
@@ -50,7 +75,7 @@ def append_jsonl(path, payload):
         file.flush()
 
 
-def discover_tasks(run_root):
+def discover_tasks(run_root, include_all=False):
     checkpoint_root = run_root / "checkpoints"
     run_dirs = sorted(
         path.parent.parent
@@ -76,7 +101,7 @@ def discover_tasks(run_root):
         training_seed = int(config["SEED"])
         output_dir = run_root / "evaluation" / run_name
         for checkpoint_index, (directory_name, nominal_step) in enumerate(
-            CHECKPOINT_SPECS
+            checkpoint_specs(run_dir, include_all)
         ):
             checkpoint_dir = run_dir / directory_name
             if not (checkpoint_dir / "model.safetensors").is_file():
@@ -104,6 +129,11 @@ def main():
     parser.add_argument("--max-runs-per-gpu", type=int, default=1)
     parser.add_argument("--episodes", type=int, default=256)
     parser.add_argument("--num-envs", type=int, default=128)
+    parser.add_argument(
+        "--all-checkpoints",
+        action="store_true",
+        help="Evaluate every saved step_* checkpoint, not only preregistered points",
+    )
     parser.add_argument("--rerun", action="store_true")
     parser.add_argument("--allow-missing", action="store_true")
     args = parser.parse_args()
@@ -111,7 +141,7 @@ def main():
     gpu_ids = tuple(item.strip() for item in args.gpus.split(",") if item.strip())
     if not gpu_ids or args.max_runs_per_gpu <= 0:
         raise ValueError("Select GPUs and a positive --max-runs-per-gpu")
-    tasks, missing = discover_tasks(run_root)
+    tasks, missing = discover_tasks(run_root, include_all=args.all_checkpoints)
     if missing:
         report = run_root / "evaluation" / "missing_checkpoints.txt"
         report.parent.mkdir(parents=True, exist_ok=True)
@@ -138,6 +168,7 @@ def main():
             file.write(line + "\n")
 
     log(
+        f"mode={'all' if args.all_checkpoints else 'preregistered'} "
         f"discovered={len(tasks)} pending={len(selected)} missing={len(missing)} "
         f"episodes={args.episodes}"
     )

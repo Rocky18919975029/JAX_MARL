@@ -252,6 +252,23 @@ python scripts/analyze_h1_performance.py --run-root "$H1_RUN_ROOT"
 The resulting CSV files and unsmoothed PNG/PDF figures live under `analysis/`.
 Bootstrap and shaded intervals use training seeds as the independent units.
 
+For dense visualization at every saved 500k checkpoint, rerun the resumable
+launcher with `--all-checkpoints`. Existing preregistered JSON files are kept
+and only the additional checkpoints are evaluated. The performance plots use
+all available points, while confirmatory AUC and endpoint statistics retain the
+frozen preregistered checkpoint grid.
+
+```bash
+nohup python scripts/eval_h1_checkpoints.py \
+  --run-root "$H1_REDUCED_ROOT" \
+  --gpus 0,1,2,3 \
+  --max-runs-per-gpu 5 \
+  --episodes 256 \
+  --num-envs 128 \
+  --all-checkpoints \
+  > "$H1_REDUCED_ROOT/evaluation_dense.stdout" 2>&1 &
+```
+
 ## Mechanism diagnostics
 
 The full preregistered mechanism suite is computationally and storage

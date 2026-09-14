@@ -43,6 +43,9 @@ COLORS = {
     "a_to_c_shuffled": "#b5d56a",
     "c_to_a_shuffled": "#75a7e6",
 }
+PREREGISTERED_NOMINAL_STEPS = frozenset(
+    (0, 500_000, 1_000_000, 2_000_000, 4_000_000, 6_000_000, 8_000_000, 10_000_000)
+)
 
 
 def write_csv(path, rows, fieldnames):
@@ -126,6 +129,9 @@ def load_evaluations(root):
                 "checkpoint": path.stem,
                 "checkpoint_step": actual_step,
                 "nominal_step": int(nominal_step),
+                "preregistered_checkpoint": (
+                    int(nominal_step) in PREREGISTERED_NOMINAL_STEPS
+                ),
                 "return_mean": float(payload["return_mean"]),
                 "win_rate": float(payload["win_rate"]),
                 "episodes": int(payload["episodes"]),
@@ -151,6 +157,9 @@ def seed_endpoints(records):
         grouped[key].append(record)
     rows = []
     for key, points in sorted(grouped.items()):
+        # Dense 500k evaluations improve the plotted learning curves, while
+        # confirmatory AUC/endpoints retain the frozen preregistered grid.
+        points = [point for point in points if point["preregistered_checkpoint"]]
         points.sort(key=lambda row: (row["nominal_step"], row["checkpoint"] == "final"))
         # If a scheduled checkpoint and final share an x value, final is the
         # authoritative endpoint and the duplicate scheduled point is removed.
