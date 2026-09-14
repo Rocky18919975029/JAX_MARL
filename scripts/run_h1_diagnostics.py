@@ -15,7 +15,10 @@ import time
 from collections import deque
 from pathlib import Path
 
-from eval_h1_checkpoints import discover_tasks
+try:
+    from eval_h1_checkpoints import discover_tasks
+except ModuleNotFoundError:  # Imported as scripts.run_h1_diagnostics in tests.
+    from scripts.eval_h1_checkpoints import discover_tasks
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +28,24 @@ STAGE_MARKERS = {
     "decision": "decision_summary.json",
     "bellman": "bellman_summary.json",
 }
+
+
+def worker_environment(base_environment, gpu):
+    """Build a training-dtype-compatible environment for a diagnostic worker."""
+
+    environment = dict(base_environment)
+    environment.pop("LD_LIBRARY_PATH", None)
+    environment.update(
+        {
+            "CUDA_VISIBLE_DEVICES": str(gpu),
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+            # Frozen checkpoints and recurrent carries were trained in
+            # float32. Statistical routines promote selected quantities to
+            # NumPy float64 internally when required.
+            "JAX_ENABLE_X64": "false",
+        }
+    )
+    return environment
 
 
 def append_jsonl(path, payload):
@@ -141,15 +162,7 @@ def main():
                     "--bellman-heads",
                     str(args.bellman_heads),
                 ]
-                environment = os.environ.copy()
-                environment.pop("LD_LIBRARY_PATH", None)
-                environment.update(
-                    {
-                        "CUDA_VISIBLE_DEVICES": gpu,
-                        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                        "JAX_ENABLE_X64": "true",
-                    }
-                )
+                environment = worker_environment(os.environ, gpu)
                 started = dt.datetime.now(dt.timezone.utc).isoformat()
                 process = subprocess.Popen(
                     command,

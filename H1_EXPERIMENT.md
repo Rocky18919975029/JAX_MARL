@@ -279,8 +279,7 @@ The smoke output is isolated under `diagnostics_smoke/`; the formal run uses
 the default `diagnostics_raw/` tree. Run the formal suite with:
 
 ```bash
-nohup env JAX_ENABLE_X64=true \
-python scripts/run_h1_diagnostics.py \
+nohup python scripts/run_h1_diagnostics.py \
   --run-root "$H1_RUN_ROOT" \
   --gpus 0,1,2,3 \
   --max-runs-per-gpu 1 \
@@ -291,6 +290,12 @@ python scripts/run_h1_diagnostics.py \
   --bellman-heads 32 \
   > "$H1_RUN_ROOT/diagnostics.stdout" 2>&1 &
 ```
+
+The diagnostic launcher deliberately runs frozen-policy rollouts and
+counterfactual environment branches with `JAX_ENABLE_X64=false`, matching the
+float32 training/checkpoint dtype. Fisher and bootstrap/statistical operations
+that require additional precision explicitly promote their inputs to NumPy
+float64 inside the corresponding analysis scripts.
 
 Stages can be scheduled separately with, for example,
 `--stages collect,latent`.  Merge immutable per-checkpoint CSV files after all
