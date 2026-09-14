@@ -121,6 +121,7 @@ def make_checkpoint_callback(config, run):
                 "alignment_coef": config["ALIGNMENT_COEF"],
                 "align_target_shuffle": config["ALIGN_TARGET_SHUFFLE"],
                 "condition": config.get("EXPERIMENT_CONDITION", ""),
+                "matrix_profile": config.get("MATRIX_PROFILE", ""),
                 "protocol_version": config.get("PROTOCOL_VERSION", ""),
                 "git_commit": config.get("GIT_COMMIT", ""),
                 "wandb_project": run.project,

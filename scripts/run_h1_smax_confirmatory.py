@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the frozen H1 SMAX matrix with bounded per-GPU concurrency."""
+"""Launch a frozen H1 SMAX matrix with bounded per-GPU concurrency."""
 
 from __future__ import annotations
 
@@ -15,7 +15,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from h1_protocol import FROZEN_KEYS, PROTOCOL_VERSION, repository_root
+try:
+    from h1_protocol import FROZEN_KEYS, PROTOCOL_VERSION, repository_root
+except ModuleNotFoundError:  # Imported as scripts.run_h1_smax_confirmatory in tests.
+    from scripts.h1_protocol import FROZEN_KEYS, PROTOCOL_VERSION, repository_root
 
 
 MAPS = ("10m_vs_11m", "smacv2_10_units")
@@ -29,11 +32,16 @@ CONDITIONS = (
     "a_to_c_shuffled",
     "c_to_a_shuffled",
 )
-DEFAULT_SEEDS = tuple(range(101, 111))
+CONFIRMATORY_SEEDS = tuple(range(101, 111))
+REDUCED_SEEDS = (1, 2, 3, 4)
+REDUCED_ACTOR_VARIANTS = ("nps",)
+REDUCED_CONDITIONS = ("c_to_a", "a_to_c", "joint")
+MATRIX_PROFILES = ("confirmatory", "reduced-nps-3mode")
 
 
 @dataclass(frozen=True)
 class Task:
+    matrix_profile: str
     map_name: str
     actor_label: str
     sharing: bool
@@ -50,8 +58,9 @@ class Task:
 
     @property
     def run_name(self):
+        prefix = "H1-reduced" if self.matrix_profile == "reduced-nps-3mode" else "H1"
         return (
-            f"H1-{self.map_name}-{self.actor_label}-{self.condition}-"
+            f"{prefix}-{self.map_name}-{self.actor_label}-{self.condition}-"
             f"lam0p1-seed{self.seed}"
         )
 
@@ -78,12 +87,42 @@ def parse_seeds(value):
             seeds.append(int(piece))
     if not seeds or len(seeds) != len(set(seeds)):
         raise argparse.ArgumentTypeError("seeds must be a non-empty unique list/range")
-    invalid = sorted(set(seeds) - set(DEFAULT_SEEDS))
-    if invalid:
-        raise argparse.ArgumentTypeError(
-            f"H1 confirmatory seeds must be 101-110; got {invalid}"
-        )
+    if any(seed < 0 for seed in seeds):
+        raise argparse.ArgumentTypeError("seeds must be non-negative")
     return tuple(seeds)
+
+
+def validate_matrix_profile(args):
+    if args.matrix_profile == "confirmatory":
+        invalid = sorted(set(args.seeds) - set(CONFIRMATORY_SEEDS))
+        if invalid:
+            raise ValueError(
+                "The confirmatory profile only accepts seeds 101-110; " f"got {invalid}"
+            )
+        return
+
+    expected = {
+        "maps": MAPS,
+        "actor variants": REDUCED_ACTOR_VARIANTS,
+        "conditions": REDUCED_CONDITIONS,
+        "seeds": REDUCED_SEEDS,
+    }
+    actual = {
+        "maps": args.maps,
+        "actor variants": args.actor_variants,
+        "conditions": args.conditions,
+        "seeds": args.seeds,
+    }
+    mismatches = [
+        f"{name}: expected {expected[name]}, got {actual[name]}"
+        for name in expected
+        if tuple(actual[name]) != tuple(expected[name])
+    ]
+    if mismatches:
+        raise ValueError(
+            "The reduced-nps-3mode profile is locked to exactly 24 runs:\n"
+            + "\n".join(mismatches)
+        )
 
 
 def hydra_value(value):
@@ -145,6 +184,7 @@ def build_command(args, frozen, task, commit):
             "ALIGN_TARGET_SHUFFLE_SCOPE=same_agent_env_time",
             f"ALIGN_SHUFFLE_SEED_OFFSET={args.shuffle_seed_offset}",
             f"EXPERIMENT_CONDITION={task.condition}",
+            f"MATRIX_PROFILE={args.matrix_profile}",
             f"PROTOCOL_VERSION={PROTOCOL_VERSION}",
             f"GIT_COMMIT={commit}",
             "SAVE_CHECKPOINTS=true",
@@ -162,7 +202,14 @@ def build_command(args, frozen, task, commit):
 def task_matrix(args):
     actor_lookup = dict(ACTOR_VARIANTS)
     return [
-        Task(map_name, actor_label, actor_lookup[actor_label], condition, seed)
+        Task(
+            args.matrix_profile,
+            map_name,
+            actor_label,
+            actor_lookup[actor_label],
+            condition,
+            seed,
+        )
         for map_name in args.maps
         for actor_label in args.actor_variants
         for condition in args.conditions
@@ -178,7 +225,10 @@ def main():
         type=Path,
         help="defaults to RUN_ROOT/protocol/frozen_training_config.json",
     )
-    parser.add_argument("--project", default="h1-smax-confirmatory")
+    parser.add_argument(
+        "--matrix-profile", choices=MATRIX_PROFILES, default="confirmatory"
+    )
+    parser.add_argument("--project", default=None)
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--max-runs-per-gpu", type=int, default=5)
     parser.add_argument("--seeds", type=parse_seeds, default=(101, 102))
@@ -204,6 +254,13 @@ def main():
     parser.add_argument("--rerun-successful", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    validate_matrix_profile(args)
+    if args.project is None:
+        args.project = (
+            "h1-smax-reduced-nps-3mode"
+            if args.matrix_profile == "reduced-nps-3mode"
+            else "h1-smax-confirmatory"
+        )
 
     args.run_root = args.run_root.expanduser().resolve()
     frozen_path = args.frozen_config or (
@@ -243,6 +300,8 @@ def main():
     if not gpu_ids:
         raise ValueError("--gpus must select at least one GPU")
     tasks = task_matrix(args)
+    if args.matrix_profile == "reduced-nps-3mode" and len(tasks) != 24:
+        raise AssertionError(f"Reduced matrix must contain 24 runs, got {len(tasks)}")
     args.run_root.mkdir(parents=True, exist_ok=True)
     logs_dir = args.run_root / "logs"
     status_dir = args.run_root / "status"
@@ -276,7 +335,8 @@ def main():
 
     append_log(
         launcher_log,
-        f"protocol={PROTOCOL_VERSION} commit={commit} selected={len(tasks)} "
+        f"profile={args.matrix_profile} protocol={PROTOCOL_VERSION} "
+        f"commit={commit} selected={len(tasks)} "
         f"pending={sum(map(len, pending_by_gpu.values()))} skipped={skipped}",
     )
     if args.dry_run:
@@ -323,11 +383,16 @@ def main():
                         "WANDB_ARTIFACT_DIR": str(wandb_artifact_dir),
                         "WANDB_NAME": task.run_name,
                         "WANDB_RUN_GROUP": (
-                            f"H1-{task.map_name}-{task.actor_label}-lam0p1"
+                            f"{'H1-reduced' if args.matrix_profile == 'reduced-nps-3mode' else 'H1'}-"
+                            f"{task.map_name}-{task.actor_label}-{task.condition}-lam0p1"
                         ),
                         "WANDB_TAGS": ",".join(
                             (
-                                "h1-confirmatory",
+                                (
+                                    "h1-reduced"
+                                    if args.matrix_profile == "reduced-nps-3mode"
+                                    else "h1-confirmatory"
+                                ),
                                 "smax",
                                 task.map_name,
                                 task.actor_label,
@@ -369,6 +434,7 @@ def main():
             status = "completed" if process.returncode == 0 else "failed"
             record = {
                 "schema_version": 1,
+                "matrix_profile": args.matrix_profile,
                 "protocol_version": PROTOCOL_VERSION,
                 "git_commit": commit,
                 "run_name": task.run_name,

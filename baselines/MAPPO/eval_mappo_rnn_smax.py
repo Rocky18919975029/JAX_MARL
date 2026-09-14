@@ -299,6 +299,7 @@ def main():
         "align_mode": config["ALIGN_MODE"],
         "align_target_shuffle": config.get("ALIGN_TARGET_SHUFFLE", False),
         "condition": config.get("EXPERIMENT_CONDITION", config["ALIGN_MODE"]),
+        "matrix_profile": config.get("MATRIX_PROFILE", ""),
         "alignment_coef": config["ALIGNMENT_COEF"],
         "protocol_version": config.get("PROTOCOL_VERSION", ""),
         "git_commit": config.get("GIT_COMMIT", ""),

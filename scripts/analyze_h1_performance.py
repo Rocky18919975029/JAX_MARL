@@ -18,6 +18,22 @@ PRIMARY = {
     ("10m_vs_11m", "nps", "a_to_c"),
     ("smacv2_10_units", "nps", "c_to_a"),
 }
+EFFECT_FIELDS = (
+    "task",
+    "actor_parameterization",
+    "condition",
+    "baseline",
+    "metric",
+    "preregistered_primary",
+    "paired_mean_difference",
+    "paired_ci95_low",
+    "paired_ci95_high",
+    "standardized_effect_dz",
+    "p_value",
+    "n_paired_seeds",
+    "seeds",
+    "bh_fdr_q",
+)
 COLORS = {
     "none": "#e63946",
     "a_to_c": "#80b918",
@@ -96,6 +112,7 @@ def load_evaluations(root):
                 "task": payload["map_name"],
                 "actor_parameterization": actor,
                 "condition": condition,
+                "matrix_profile": payload.get("matrix_profile", ""),
                 "seed": int(payload["training_seed"]),
                 "checkpoint": path.stem,
                 "checkpoint_step": actual_step,
@@ -229,10 +246,10 @@ def paired_effects(endpoints, rng):
         )
         for condition in conditions:
             seeds = sorted(
-                seed
-                for seed in range(101, 111)
-                if (task, actor, condition, seed) in lookup
-                and (task, actor, "none", seed) in lookup
+                row[3]
+                for row in lookup
+                if row[:3] == (task, actor, condition)
+                and (task, actor, "none", row[3]) in lookup
             )
             if not seeds:
                 continue
@@ -356,7 +373,11 @@ def main():
     write_csv(output / "seed_endpoints.csv", endpoints, list(endpoints[0]))
     write_csv(output / "curve_summary.csv", curves, list(curves[0]))
     write_csv(output / "endpoint_summary.csv", summaries, list(summaries[0]))
-    write_csv(output / "confirmatory_effects.csv", effects, list(effects[0]))
+    write_csv(
+        output / "confirmatory_effects.csv",
+        effects,
+        list(effects[0]) if effects else EFFECT_FIELDS,
+    )
     if not args.no_figures:
         figure_dir = output / "figures"
         figure_dir.mkdir(exist_ok=True)
