@@ -51,6 +51,26 @@ def _json_default(value):
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
+def make_metrics_jsonl_callback(path):
+    """Create an optional host callback for machine-readable training metrics."""
+
+    if not path:
+        return None
+    destination = Path(path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    def callback(metrics):
+        payload = {}
+        for key, value in metrics.items():
+            array = np.asarray(value)
+            payload[key] = array.item() if array.ndim == 0 else array.tolist()
+        with destination.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(payload, sort_keys=True, allow_nan=True) + "\n")
+            file.flush()
+
+    return callback
+
+
 def make_checkpoint_callback(config, run):
     """Create a host callback that writes evaluation-ready checkpoints."""
 
@@ -118,6 +138,8 @@ def make_checkpoint_callback(config, run):
                 "actor_parameter_sharing": config["ACTOR_PARAMETER_SHARING"],
                 "matched_comparison": config["MATCHED_COMPARISON"],
                 "align_mode": config["ALIGN_MODE"],
+                "align_distance": config["ALIGN_DISTANCE"],
+                "align_distance_eps": config["ALIGN_DISTANCE_EPS"],
                 "alignment_coef": config["ALIGNMENT_COEF"],
                 "align_target_shuffle": config["ALIGN_TARGET_SHUFFLE"],
                 "condition": config.get("EXPERIMENT_CONDITION", ""),
@@ -355,22 +377,105 @@ def vmapped_optimizer(tx):
 
 
 def tree_l2_norm(tree):
-    return jnp.sqrt(
-        sum(jnp.sum(jnp.square(x)) for x in jax.tree.leaves(tree))
-    )
+    return jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree.leaves(tree)))
+
+
+def normalize_latent_samples(latent):
+    """Parameter-free LayerNorm over each latent sample's feature axis."""
+
+    mean = latent.mean(axis=-1, keepdims=True)
+    variance = jnp.square(latent - mean).mean(axis=-1, keepdims=True)
+    return (latent - mean) * jax.lax.rsqrt(variance + 1e-5)
 
 
 def latent_distance(source, target, mask):
-    """Masked MSE after parameter-free, per-sample layer normalization."""
+    """Masked per-sample LayerNorm MSE used by the original experiments."""
 
-    def normalize(x):
-        mean = x.mean(axis=-1, keepdims=True)
-        variance = jnp.square(x - mean).mean(axis=-1, keepdims=True)
-        return (x - mean) * jax.lax.rsqrt(variance + 1e-5)
-
-    distance = jnp.square(normalize(source) - normalize(target)).mean(axis=-1)
+    distance = jnp.square(
+        normalize_latent_samples(source) - normalize_latent_samples(target)
+    ).mean(axis=-1)
     mask = mask.astype(distance.dtype)
     return (distance * mask).sum() / jnp.maximum(mask.sum(), 1.0)
+
+
+def linear_cka_distance(source, target, mask, epsilon=1e-8):
+    """Masked linear CKA distance after per-sample LayerNorm.
+
+    All non-feature axes form the sample batch. Invalid samples have zero
+    weight both when estimating the batch mean and when forming cross/self
+    covariance matrices. A batch with fewer than two valid samples carries no
+    alignment information and therefore contributes zero loss.
+    """
+
+    source = normalize_latent_samples(source).reshape((-1, source.shape[-1]))
+    target = normalize_latent_samples(target).reshape((-1, target.shape[-1]))
+    weights = mask.reshape((-1,)).astype(source.dtype)
+    count = weights.sum()
+    safe_count = jnp.maximum(count, 1.0)
+    weights = weights[:, None]
+
+    source_mean = (source * weights).sum(axis=0, keepdims=True) / safe_count
+    target_mean = (target * weights).sum(axis=0, keepdims=True) / safe_count
+    source_centered = (source - source_mean) * weights
+    target_centered = (target - target_mean) * weights
+
+    cross = source_centered.T @ target_centered
+    source_self = source_centered.T @ source_centered
+    target_self = target_centered.T @ target_centered
+    numerator = jnp.square(cross).sum()
+    denominator = jnp.sqrt(jnp.square(source_self).sum()) * jnp.sqrt(
+        jnp.square(target_self).sum()
+    )
+    similarity = numerator / (denominator + jnp.asarray(epsilon, source.dtype))
+    distance = 1.0 - similarity
+    return jnp.where(count > 1, distance, jnp.zeros_like(distance))
+
+
+def representation_distance(
+    source,
+    target,
+    mask,
+    distance_name="ln_mse",
+    num_agent_groups=1,
+    epsilon=1e-8,
+):
+    """Dispatch to the configured alignment distance.
+
+    Linear CKA is evaluated independently within each agent's sample pool.
+    This avoids comparing coordinates emitted by different independent actor
+    encoders and gives PS and NPS runs the same loss definition.
+    """
+
+    if distance_name == "ln_mse":
+        return latent_distance(source, target, mask)
+    if distance_name != "linear_cka":
+        raise ValueError(f"Unknown alignment distance: {distance_name!r}")
+    if source.shape[-2] % num_agent_groups != 0:
+        raise ValueError("The latent sample axis must be divisible by num_agent_groups")
+
+    def split_groups(value):
+        value = value.reshape(
+            (
+                value.shape[0],
+                num_agent_groups,
+                value.shape[1] // num_agent_groups,
+                *value.shape[2:],
+            )
+        )
+        return jnp.swapaxes(value, 0, 1)
+
+    grouped_source = split_groups(source)
+    grouped_target = split_groups(target)
+    grouped_mask = split_groups(mask)
+    distances = jax.vmap(linear_cka_distance, in_axes=(0, 0, 0, None))(
+        grouped_source,
+        grouped_target,
+        grouped_mask,
+        epsilon,
+    )
+    valid_groups = grouped_mask.reshape((num_agent_groups, -1)).sum(axis=1) > 1
+    valid_groups = valid_groups.astype(distances.dtype)
+    return (distances * valid_groups).sum() / jnp.maximum(valid_groups.sum(), 1.0)
 
 
 def shuffle_targets_within_agent(
@@ -434,18 +539,16 @@ def shuffle_targets_within_agent(
         target_by_agent, target_indices[..., None], axis=1
     )
 
-    shuffled = shuffled_by_agent.reshape(
-        (num_agents, num_steps, num_envs, latent_dim)
-    )
+    shuffled = shuffled_by_agent.reshape((num_agents, num_steps, num_envs, latent_dim))
     shuffled = jnp.transpose(shuffled, (1, 0, 2, 3)).reshape(target_latent.shape)
     alignment_mask = jnp.transpose(
         eligible.reshape((num_agents, num_steps, num_envs)), (1, 0, 2)
     ).reshape(alive_mask.shape)
 
     eligible_count = alignment_mask.sum(dtype=jnp.int32)
-    fixed_count = jnp.logical_and(
-        eligible, target_indices == positions_by_agent
-    ).sum(dtype=jnp.int32)
+    fixed_count = jnp.logical_and(eligible, target_indices == positions_by_agent).sum(
+        dtype=jnp.int32
+    )
     fixed_point_proportion = fixed_count.astype(jnp.float32) / jnp.maximum(
         eligible_count, 1
     )
@@ -498,7 +601,15 @@ def maybe_shuffle_targets_within_agent(
     )
 
 
-def make_train(config, progress_bar=None, checkpoint_callback=None):
+def make_train(
+    config,
+    progress_bar=None,
+    checkpoint_callback=None,
+    metrics_jsonl_callback=None,
+):
+    config.setdefault("ALIGN_DISTANCE", "ln_mse")
+    config.setdefault("ALIGN_DISTANCE_EPS", 1e-8)
+    config.setdefault("ALIGN_GRADIENT_CALIBRATION", False)
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
@@ -514,9 +625,20 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
             f"ALIGN_MODE must be one of {sorted(valid_align_modes)}, got "
             f"{config['ALIGN_MODE']!r}."
         )
-    if config["ALIGN_MODE"] != "none" and not config["MATCHED_COMPARISON"]:
+    valid_align_distances = {"ln_mse", "linear_cka"}
+    if config["ALIGN_DISTANCE"] not in valid_align_distances:
         raise ValueError(
-            "Representation alignment requires MATCHED_COMPARISON=true."
+            f"ALIGN_DISTANCE must be one of {sorted(valid_align_distances)}, got "
+            f"{config['ALIGN_DISTANCE']!r}."
+        )
+    if float(config["ALIGN_DISTANCE_EPS"]) <= 0:
+        raise ValueError("ALIGN_DISTANCE_EPS must be positive.")
+    if config["ALIGN_MODE"] != "none" and not config["MATCHED_COMPARISON"]:
+        raise ValueError("Representation alignment requires MATCHED_COMPARISON=true.")
+    if config["ALIGN_MODE"] == "none" and config["ALIGN_DISTANCE"] != "ln_mse":
+        raise ValueError(
+            "ALIGN_MODE=none must use ALIGN_DISTANCE=ln_mse so the distance-free "
+            "baseline is not duplicated."
         )
     if config["ALIGN_TARGET_SHUFFLE"]:
         if config["ALIGN_MODE"] not in {"a_to_c", "c_to_a"}:
@@ -529,10 +651,37 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                 "The confirmatory protocol only supports "
                 "ALIGN_TARGET_SHUFFLE_SCOPE=same_agent_env_time."
             )
+        if config["ALIGN_DISTANCE"] != "ln_mse":
+            raise ValueError(
+                "Shuffled controls belong to the LN-MSE protocol and cannot be "
+                "combined with ALIGN_DISTANCE=linear_cka."
+            )
+    if config["ALIGN_GRADIENT_CALIBRATION"]:
+        if not config["MATCHED_COMPARISON"]:
+            raise ValueError("Gradient calibration requires MATCHED_COMPARISON=true.")
+        if config["ALIGN_MODE"] not in {"a_to_c", "c_to_a"}:
+            raise ValueError(
+                "Gradient calibration requires ALIGN_MODE=a_to_c or c_to_a."
+            )
+        if config["ALIGN_TARGET_SHUFFLE"]:
+            raise ValueError("Gradient calibration does not support shuffled targets.")
+        if float(config["ALIGNMENT_COEF"]) != 0.0:
+            raise ValueError(
+                "Gradient calibration requires ALIGNMENT_COEF=0 so the probe does "
+                "not alter the RL update."
+            )
+        if config["NUM_UPDATES"] != 1 or config["UPDATE_EPOCHS"] != 1:
+            raise ValueError(
+                "Gradient calibration requires exactly one rollout/update epoch."
+            )
+        if float(config["LR"]) != 0.0:
+            raise ValueError(
+                "Gradient calibration requires LR=0 to hold parameters fixed across "
+                "the rollout's minibatches."
+            )
     if (
-        (not config["ACTOR_PARAMETER_SHARING"] or config["MATCHED_COMPARISON"])
-        and config["NUM_ENVS"] % config["NUM_MINIBATCHES"] != 0
-    ):
+        not config["ACTOR_PARAMETER_SHARING"] or config["MATCHED_COMPARISON"]
+    ) and config["NUM_ENVS"] % config["NUM_MINIBATCHES"] != 0:
         raise ValueError(
             "NUM_ENVS must be divisible by NUM_MINIBATCHES for independent actors "
             "or the matched comparison protocol."
@@ -569,10 +718,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
         ac_init_hstate = ScannedRNN.initialize_carry(
             config["NUM_ENVS"], config["GRU_HIDDEN_DIM"]
         )
-        if (
-            not config["ACTOR_PARAMETER_SHARING"]
-            and not config["MATCHED_COMPARISON"]
-        ):
+        if not config["ACTOR_PARAMETER_SHARING"] and not config["MATCHED_COMPARISON"]:
             actor_rngs = jax.random.split(_rng_actor, env.num_agents)
             actor_network_params = jax.vmap(
                 actor_network.init, in_axes=(0, None, None)
@@ -701,28 +847,22 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         )
                     )
                     actor_in = (
-                        obs_batch.reshape(
-                            (env.num_agents, config["NUM_ENVS"], -1)
-                        )[:, None, ...],
-                        last_done.reshape(
-                            (env.num_agents, config["NUM_ENVS"])
-                        )[:, None, ...],
-                        avail_actions.reshape(
-                            (env.num_agents, config["NUM_ENVS"], -1)
-                        ),
+                        obs_batch.reshape((env.num_agents, config["NUM_ENVS"], -1))[
+                            :, None, ...
+                        ],
+                        last_done.reshape((env.num_agents, config["NUM_ENVS"]))[
+                            :, None, ...
+                        ],
+                        avail_actions.reshape((env.num_agents, config["NUM_ENVS"], -1)),
                     )
                     actor_rngs = jax.random.split(_rng, env.num_agents)
 
                     def apply_and_sample(params, hidden, inputs, sample_rng):
-                        hidden, pi, latent = actor_network.apply(
-                            params, hidden, inputs
-                        )
+                        hidden, pi, latent = actor_network.apply(params, hidden, inputs)
                         action = pi.sample(seed=sample_rng)
                         return hidden, action, pi.log_prob(action), latent
 
-                    parameter_axis = (
-                        None if config["ACTOR_PARAMETER_SHARING"] else 0
-                    )
+                    parameter_axis = None if config["ACTOR_PARAMETER_SHARING"] else 0
                     ac_hstate, action, log_prob, actor_latent = jax.vmap(
                         apply_and_sample,
                         in_axes=(parameter_axis, 0, 0, 0),
@@ -971,9 +1111,9 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
 
                     actor_grad_fn = jax.value_and_grad(_actor_loss_fn, has_aux=True)
                     if config["MATCHED_COMPARISON"]:
-                        actor_advantages = (
-                            advantages - advantages.mean()
-                        ) / (advantages.std() + 1e-8)
+                        actor_advantages = (advantages - advantages.mean()) / (
+                            advantages.std() + 1e-8
+                        )
                     else:
                         actor_advantages = advantages
 
@@ -985,7 +1125,11 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                             None if config["ACTOR_PARAMETER_SHARING"] else 0
                         )
 
-                        def matched_total_loss(actor_params, critic_params):
+                        def matched_total_loss(
+                            actor_params,
+                            critic_params,
+                            distance_name=config["ALIGN_DISTANCE"],
+                        ):
                             actor_losses, actor_aux = jax.vmap(
                                 _actor_loss_fn,
                                 in_axes=(parameter_axis, 0, 0, 0),
@@ -1002,27 +1146,36 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                                 targets,
                             )
 
-                            actor_latent = actor_aux[5].swapaxes(0, 1).reshape(
-                                traj_batch.actor_latent_old.shape
+                            actor_latent = (
+                                actor_aux[5]
+                                .swapaxes(0, 1)
+                                .reshape(traj_batch.actor_latent_old.shape)
                             )
                             critic_latent = critic_aux[1]
                             mask = traj_batch.alignment_mask
-                            c_to_a_loss = latent_distance(
+                            c_to_a_loss = representation_distance(
                                 actor_latent,
-                                jax.lax.stop_gradient(
-                                    traj_batch.critic_latent_old
-                                ),
+                                jax.lax.stop_gradient(traj_batch.critic_latent_old),
                                 mask,
+                                distance_name,
+                                env.num_agents,
+                                config["ALIGN_DISTANCE_EPS"],
                             )
-                            a_to_c_loss = latent_distance(
+                            a_to_c_loss = representation_distance(
                                 critic_latent,
-                                jax.lax.stop_gradient(
-                                    traj_batch.actor_latent_old
-                                ),
+                                jax.lax.stop_gradient(traj_batch.actor_latent_old),
                                 mask,
+                                distance_name,
+                                env.num_agents,
+                                config["ALIGN_DISTANCE_EPS"],
                             )
-                            joint_loss = latent_distance(
-                                actor_latent, critic_latent, mask
+                            joint_loss = representation_distance(
+                                actor_latent,
+                                critic_latent,
+                                mask,
+                                distance_name,
+                                env.num_agents,
+                                config["ALIGN_DISTANCE_EPS"],
                             )
                             zero = jnp.zeros((), dtype=actor_latent.dtype)
                             actor_alignment = zero
@@ -1039,15 +1192,12 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                                 joint_alignment = joint_loss
 
                             alignment_objective = (
-                                actor_alignment
-                                + critic_alignment
-                                + joint_alignment
+                                actor_alignment + critic_alignment + joint_alignment
                             )
                             total_loss = (
                                 actor_losses.mean()
                                 + critic_rl_loss
-                                + config["ALIGNMENT_COEF"]
-                                * alignment_objective
+                                + config["ALIGNMENT_COEF"] * alignment_objective
                             )
                             return total_loss, (
                                 actor_losses,
@@ -1086,16 +1236,12 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                             )
                         else:
 
-                            def matched_cross_objective(
-                                actor_params, critic_params
-                            ):
+                            def matched_cross_objective(actor_params, critic_params):
                                 _, auxiliary = matched_total_loss(
                                     actor_params, critic_params
                                 )
                                 return config["ALIGNMENT_COEF"] * (
-                                    auxiliary[7]
-                                    + auxiliary[8]
-                                    + auxiliary[9]
+                                    auxiliary[7] + auxiliary[8] + auxiliary[9]
                                 )
 
                             actor_cross_grads, critic_cross_grads = jax.grad(
@@ -1105,6 +1251,30 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                                 actor_train_state.params,
                                 critic_train_state.params,
                             )
+                        if config["ALIGN_GRADIENT_CALIBRATION"]:
+
+                            def calibration_cross_grads(distance_name):
+                                def objective(actor_params, critic_params):
+                                    _, auxiliary = matched_total_loss(
+                                        actor_params,
+                                        critic_params,
+                                        distance_name,
+                                    )
+                                    return auxiliary[7] + auxiliary[8] + auxiliary[9]
+
+                                return jax.grad(objective, argnums=(0, 1))(
+                                    actor_train_state.params,
+                                    critic_train_state.params,
+                                )
+
+                            (
+                                calibration_ln_actor_grads,
+                                calibration_ln_critic_grads,
+                            ) = calibration_cross_grads("ln_mse")
+                            (
+                                calibration_cka_actor_grads,
+                                calibration_cka_critic_grads,
+                            ) = calibration_cross_grads("linear_cka")
                         if not config["ACTOR_PARAMETER_SHARING"]:
                             actor_grads = jax.tree.map(
                                 lambda x: x * env.num_agents, actor_grads
@@ -1113,6 +1283,15 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                                 lambda x: x * env.num_agents,
                                 actor_cross_grads,
                             )
+                            if config["ALIGN_GRADIENT_CALIBRATION"]:
+                                calibration_ln_actor_grads = jax.tree.map(
+                                    lambda x: x * env.num_agents,
+                                    calibration_ln_actor_grads,
+                                )
+                                calibration_cka_actor_grads = jax.tree.map(
+                                    lambda x: x * env.num_agents,
+                                    calibration_cka_actor_grads,
+                                )
                         actor_rl_grads = jax.tree.map(
                             lambda total, cross: total - cross,
                             actor_grads,
@@ -1154,12 +1333,8 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         actor_alignment_loss = zero
                         critic_alignment_loss = zero
                         joint_alignment_loss = zero
-                        actor_cross_grads = jax.tree.map(
-                            jnp.zeros_like, actor_grads
-                        )
-                        critic_cross_grads = jax.tree.map(
-                            jnp.zeros_like, critic_grads
-                        )
+                        actor_cross_grads = jax.tree.map(jnp.zeros_like, actor_grads)
+                        critic_cross_grads = jax.tree.map(jnp.zeros_like, critic_grads)
                         actor_rl_grads = actor_grads
                         critic_rl_grads = critic_grads
                     else:
@@ -1180,9 +1355,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                             traj_batch,
                             targets,
                         )
-                        combined_total_loss = (
-                            actor_loss[0].mean() + critic_loss[0]
-                        )
+                        combined_total_loss = actor_loss[0].mean() + critic_loss[0]
                         zero = jnp.zeros((), dtype=advantages.dtype)
                         c_to_a_loss = zero
                         a_to_c_loss = zero
@@ -1190,12 +1363,8 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         actor_alignment_loss = zero
                         critic_alignment_loss = zero
                         joint_alignment_loss = zero
-                        actor_cross_grads = jax.tree.map(
-                            jnp.zeros_like, actor_grads
-                        )
-                        critic_cross_grads = jax.tree.map(
-                            jnp.zeros_like, critic_grads
-                        )
+                        actor_cross_grads = jax.tree.map(jnp.zeros_like, actor_grads)
+                        critic_cross_grads = jax.tree.map(jnp.zeros_like, critic_grads)
                         actor_rl_grads = actor_grads
                         critic_rl_grads = critic_grads
 
@@ -1210,6 +1379,19 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                     critic_grad_norm = tree_l2_norm(critic_grads)
                     critic_rl_grad_norm = tree_l2_norm(critic_rl_grads)
                     critic_cross_grad_norm = tree_l2_norm(critic_cross_grads)
+                    if config["ALIGN_GRADIENT_CALIBRATION"]:
+                        calibration_ln_actor_grad_norms = actor_tree_norms(
+                            calibration_ln_actor_grads
+                        )
+                        calibration_cka_actor_grad_norms = actor_tree_norms(
+                            calibration_cka_actor_grads
+                        )
+                        calibration_ln_critic_grad_norm = tree_l2_norm(
+                            calibration_ln_critic_grads
+                        )
+                        calibration_cka_critic_grad_norm = tree_l2_norm(
+                            calibration_cka_critic_grads
+                        )
 
                     old_actor_params = actor_train_state.params
                     old_critic_params = critic_train_state.params
@@ -1234,9 +1416,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                             [tree_l2_norm(actor_param_updates)]
                         )
                     else:
-                        actor_update_norms = jax.vmap(tree_l2_norm)(
-                            actor_param_updates
-                        )
+                        actor_update_norms = jax.vmap(tree_l2_norm)(actor_param_updates)
                     actor_grad_norms_after_clip = jnp.minimum(
                         actor_grad_norms, config["MAX_GRAD_NORM"]
                     )
@@ -1272,9 +1452,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         ),
                         "actor_rl_grad_norm_mean": actor_rl_grad_norms.mean(),
                         "actor_rl_grad_norm_max": actor_rl_grad_norms.max(),
-                        "actor_cross_grad_norm_mean": (
-                            actor_cross_grad_norms.mean()
-                        ),
+                        "actor_cross_grad_norm_mean": (actor_cross_grad_norms.mean()),
                         "actor_cross_grad_norm_max": actor_cross_grad_norms.max(),
                         "actor_cross_to_rl_grad_ratio_mean": (
                             actor_cross_grad_norms
@@ -1304,11 +1482,31 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         "critic_grad_clipped": (
                             critic_grad_norm > config["MAX_GRAD_NORM"]
                         ),
-                        "critic_update_norm": tree_l2_norm(
-                            critic_param_updates
-                        ),
+                        "critic_update_norm": tree_l2_norm(critic_param_updates),
                         "alive_agent_fraction": traj_batch.alive_mask.mean(),
                     }
+
+                    if config["ALIGN_GRADIENT_CALIBRATION"]:
+                        loss_info.update(
+                            {
+                                "calibration_ln_mse_actor_cross_grad_norm_mean": calibration_ln_actor_grad_norms.mean(),
+                                "calibration_linear_cka_actor_cross_grad_norm_mean": calibration_cka_actor_grad_norms.mean(),
+                                "calibration_ln_mse_actor_cross_to_rl_ratio": (
+                                    calibration_ln_actor_grad_norms
+                                    / jnp.maximum(actor_rl_grad_norms, 1e-12)
+                                ).mean(),
+                                "calibration_linear_cka_actor_cross_to_rl_ratio": (
+                                    calibration_cka_actor_grad_norms
+                                    / jnp.maximum(actor_rl_grad_norms, 1e-12)
+                                ).mean(),
+                                "calibration_ln_mse_critic_cross_grad_norm": calibration_ln_critic_grad_norm,
+                                "calibration_linear_cka_critic_cross_grad_norm": calibration_cka_critic_grad_norm,
+                                "calibration_ln_mse_critic_cross_to_rl_ratio": calibration_ln_critic_grad_norm
+                                / jnp.maximum(critic_rl_grad_norm, 1e-12),
+                                "calibration_linear_cka_critic_cross_to_rl_ratio": calibration_cka_critic_grad_norm
+                                / jnp.maximum(critic_rl_grad_norm, 1e-12),
+                            }
+                        )
 
                     if config["MATCHED_COMPARISON"]:
                         raw_advantages_by_agent = split_agents(advantages)
@@ -1351,9 +1549,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                     config["ACTOR_PARAMETER_SHARING"]
                     and not config["MATCHED_COMPARISON"]
                 ):
-                    permutation = jax.random.permutation(
-                        _rng, config["NUM_ACTORS"]
-                    )
+                    permutation = jax.random.permutation(_rng, config["NUM_ACTORS"])
                     shuffled_batch = jax.tree.map(
                         lambda x: jnp.take(x, permutation, axis=1), batch
                     )
@@ -1374,9 +1570,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                     # shared and independent runs therefore give the critic the
                     # same samples in the same update order.
                     permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
-                    envs_per_minibatch = (
-                        config["NUM_ENVS"] // config["NUM_MINIBATCHES"]
-                    )
+                    envs_per_minibatch = config["NUM_ENVS"] // config["NUM_MINIBATCHES"]
 
                     def make_stratified_minibatches(x):
                         x = x.reshape(
@@ -1407,9 +1601,7 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                             )
                         )
 
-                    minibatches = jax.tree.map(
-                        make_stratified_minibatches, batch
-                    )
+                    minibatches = jax.tree.map(make_stratified_minibatches, batch)
 
                 # train_states = (actor_train_state, critic_train_state)
                 train_states, loss_info = jax.lax.scan(
@@ -1476,6 +1668,25 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
                         postfix["win"] = f"{win_rate:.3f}"
                     progress_bar.set_postfix(postfix)
                 wandb.log(log_data)
+                if metrics_jsonl_callback is not None:
+                    metrics_output = log_data
+                    if config["ALIGN_GRADIENT_CALIBRATION"]:
+                        # The calibration artifact intentionally contains no
+                        # performance signal; lambda is selected only from
+                        # initial cross/RL gradient ratios.
+                        audit_keys = {
+                            "env_step",
+                            "actor_rl_grad_norm_mean",
+                            "critic_rl_grad_norm",
+                            "alignment_c_to_a_distance",
+                            "alignment_a_to_c_distance",
+                        }
+                        metrics_output = {
+                            key: value
+                            for key, value in log_data.items()
+                            if key.startswith("calibration_") or key in audit_keys
+                        }
+                    metrics_jsonl_callback(metrics_output)
 
             metric["update_steps"] = update_steps
             jax.debug.callback(callback, metric, ordered=True)
@@ -1543,6 +1754,11 @@ def make_train(config, progress_bar=None, checkpoint_callback=None):
 def main(config):
 
     config = OmegaConf.to_container(config)
+    # Defaults keep older external config dictionaries/checkpoints compatible.
+    config.setdefault("ALIGN_DISTANCE", "ln_mse")
+    config.setdefault("ALIGN_DISTANCE_EPS", 1e-8)
+    config.setdefault("ALIGN_GRADIENT_CALIBRATION", False)
+    config.setdefault("METRICS_JSONL", "")
     if not config.get("GIT_COMMIT"):
         try:
             config["GIT_COMMIT"] = subprocess.run(
@@ -1556,6 +1772,8 @@ def main(config):
     condition = config["ALIGN_MODE"]
     if config["ALIGN_TARGET_SHUFFLE"]:
         condition = f"{condition}_shuffled"
+    elif config["ALIGN_DISTANCE"] == "linear_cka" and condition != "none":
+        condition = f"{condition}_cka"
     if config.get("EXPERIMENT_CONDITION"):
         if config["EXPERIMENT_CONDITION"] != condition:
             raise ValueError(
@@ -1565,14 +1783,10 @@ def main(config):
     else:
         config["EXPERIMENT_CONDITION"] = condition
     sharing_mode = (
-        "shared-actor"
-        if config["ACTOR_PARAMETER_SHARING"]
-        else "independent-actors"
+        "shared-actor" if config["ACTOR_PARAMETER_SHARING"] else "independent-actors"
     )
     actor_mode = (
-        f"matched-{sharing_mode}"
-        if config["MATCHED_COMPARISON"]
-        else sharing_mode
+        f"matched-{sharing_mode}" if config["MATCHED_COMPARISON"] else sharing_mode
     )
 
     run = wandb.init(
@@ -1599,6 +1813,7 @@ def main(config):
         config["CHECKPOINT_INTERVAL_TIMESTEPS"] = checkpoint_interval
         checkpoint_callback, checkpoint_run_dir = make_checkpoint_callback(config, run)
         print(f"Checkpoints: {checkpoint_run_dir}", flush=True)
+    metrics_jsonl_callback = make_metrics_jsonl_callback(config["METRICS_JSONL"])
 
     rng = jax.random.PRNGKey(config["SEED"])
     num_updates = int(
@@ -1616,7 +1831,12 @@ def main(config):
     try:
         with jax.disable_jit(False):
             train_jit = jax.jit(
-                make_train(config, progress_bar, checkpoint_callback)
+                make_train(
+                    config,
+                    progress_bar,
+                    checkpoint_callback,
+                    metrics_jsonl_callback,
+                )
             )
             result = train_jit(rng)
             jax.block_until_ready(result)

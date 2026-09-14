@@ -10,8 +10,59 @@ pytest.importorskip("wandb")
 
 from baselines.MAPPO.mappo_rnn_smax import (
     latent_distance,
+    linear_cka_distance,
     maybe_shuffle_targets_within_agent,
+    representation_distance,
 )
+
+
+def test_linear_cka_ignores_an_orthogonal_sign_flip_but_ln_mse_does_not():
+    source = jax.random.normal(jax.random.PRNGKey(20), (3, 7, 8))
+    target = -source
+    mask = jnp.ones(source.shape[:-1], dtype=jnp.bool_)
+
+    assert abs(float(linear_cka_distance(source, target, mask))) < 1e-5
+    assert float(latent_distance(source, target, mask)) > 3.9
+
+
+def test_linear_cka_mask_excludes_invalid_samples():
+    source = jax.random.normal(jax.random.PRNGKey(21), (2, 8, 6))
+    target = jax.random.normal(jax.random.PRNGKey(22), (2, 8, 6))
+    mask = jnp.ones((2, 8), dtype=jnp.bool_).at[:, -2:].set(False)
+    changed_source = source.at[:, -2:].set(1e6)
+    changed_target = target.at[:, -2:].set(-1e6)
+
+    np.testing.assert_allclose(
+        linear_cka_distance(source, target, mask),
+        linear_cka_distance(changed_source, changed_target, mask),
+        atol=1e-6,
+    )
+
+
+def test_grouped_linear_cka_is_the_mean_of_per_agent_distances():
+    source = jax.random.normal(jax.random.PRNGKey(23), (4, 6, 5))
+    target = jax.random.normal(jax.random.PRNGKey(24), (4, 6, 5))
+    mask = jnp.ones((4, 6), dtype=jnp.bool_)
+    grouped = representation_distance(
+        source,
+        target,
+        mask,
+        distance_name="linear_cka",
+        num_agent_groups=3,
+    )
+    expected = jnp.mean(
+        jnp.asarray(
+            [
+                linear_cka_distance(
+                    source[:, 2 * agent : 2 * (agent + 1)],
+                    target[:, 2 * agent : 2 * (agent + 1)],
+                    mask[:, 2 * agent : 2 * (agent + 1)],
+                )
+                for agent in range(3)
+            ]
+        )
+    )
+    np.testing.assert_allclose(grouped, expected, atol=1e-6)
 
 
 def test_h1_shuffle_is_a_deterministic_alive_derangement():
@@ -82,6 +133,40 @@ def test_h1_alignment_gradient_routing(mode, actor_nonzero, critic_nonzero):
                 critic_value, actor_target, mask
             )
         return latent_distance(actor_value, critic_value, mask)
+
+    actor_grad, critic_grad = jax.grad(loss, argnums=(0, 1))(actor, critic)
+    assert (float(jnp.linalg.norm(actor_grad)) > 1e-9) is actor_nonzero
+    assert (float(jnp.linalg.norm(critic_grad)) > 1e-9) is critic_nonzero
+
+
+@pytest.mark.parametrize(
+    ("mode", "actor_nonzero", "critic_nonzero"),
+    [
+        ("c_to_a", True, False),
+        ("a_to_c", False, True),
+        ("joint", True, True),
+    ],
+)
+def test_linear_cka_gradient_routing(mode, actor_nonzero, critic_nonzero):
+    actor = jax.random.normal(jax.random.PRNGKey(25), (3, 12, 8))
+    critic = jax.random.normal(jax.random.PRNGKey(26), (3, 12, 8))
+    mask = jnp.ones((3, 12), dtype=jnp.bool_)
+
+    def distance(source, target):
+        return representation_distance(
+            source,
+            target,
+            mask,
+            distance_name="linear_cka",
+            num_agent_groups=3,
+        )
+
+    def loss(actor_value, critic_value):
+        if mode == "c_to_a":
+            return distance(actor_value, jax.lax.stop_gradient(critic_value))
+        if mode == "a_to_c":
+            return distance(critic_value, jax.lax.stop_gradient(actor_value))
+        return distance(actor_value, critic_value)
 
     actor_grad, critic_grad = jax.grad(loss, argnums=(0, 1))(actor, critic)
     assert (float(jnp.linalg.norm(actor_grad)) > 1e-9) is actor_nonzero

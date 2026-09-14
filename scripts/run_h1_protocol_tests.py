@@ -20,6 +20,7 @@ from baselines.MAPPO.mappo_rnn_smax import (
     ActorRNN,
     ScannedRNN,
     latent_distance,
+    linear_cka_distance,
     maybe_shuffle_targets_within_agent,
 )
 from h1_latent_distortion import fisher_metrics
@@ -136,11 +137,12 @@ def alignment_gradient_audit():
     critic_target = jax.lax.stop_gradient(critic - 0.3)
     mask = jnp.ones((31,), dtype=jnp.bool_)
 
-    def objective(mode, actor_value, critic_value):
+    def objective(mode, actor_value, critic_value, distance_name="ln_mse"):
         zero = jnp.zeros(())
-        c_to_a = latent_distance(actor_value, critic_target, mask)
-        a_to_c = latent_distance(critic_value, actor_target, mask)
-        joint = latent_distance(actor_value, critic_value, mask)
+        distance = latent_distance if distance_name == "ln_mse" else linear_cka_distance
+        c_to_a = distance(actor_value, critic_target, mask)
+        a_to_c = distance(critic_value, actor_target, mask)
+        joint = distance(actor_value, critic_value, mask)
         if mode == "none":
             return zero
         if mode == "c_to_a":
@@ -180,7 +182,37 @@ def alignment_gradient_audit():
             "actor_cross_grad_norm": actor_norm,
             "critic_cross_grad_norm": critic_norm,
         }
-    return {"status": "pass", "modes": result}
+
+    cka_result = {}
+    for mode in ("c_to_a", "a_to_c", "joint"):
+        expected_nonzero = expected[mode]
+        actor_grad, critic_grad = jax.grad(
+            lambda a, c: objective(mode, a, c, "linear_cka"), argnums=(0, 1)
+        )(actor, critic)
+        actor_norm = norm(actor_grad)
+        critic_norm = norm(critic_grad)
+        actual_nonzero = (actor_norm > 1e-9, critic_norm > 1e-9)
+        if actual_nonzero != expected_nonzero:
+            raise AssertionError(
+                f"linear CKA {mode}: gradient routing {actual_nonzero}, "
+                f"expected {expected_nonzero}"
+            )
+        cka_result[mode] = {
+            "actor_cross_grad_norm": actor_norm,
+            "critic_cross_grad_norm": critic_norm,
+        }
+
+    sign_flip_cka = float(linear_cka_distance(actor, -actor, mask))
+    sign_flip_ln_mse = float(latent_distance(actor, -actor, mask))
+    if abs(sign_flip_cka) > 1e-5 or sign_flip_ln_mse < 3.9:
+        raise AssertionError("linear CKA did not preserve sign-flipped geometry")
+    return {
+        "status": "pass",
+        "modes": result,
+        "linear_cka_modes": cka_result,
+        "sign_flip_linear_cka_distance": sign_flip_cka,
+        "sign_flip_ln_mse_distance": sign_flip_ln_mse,
+    }
 
 
 def latent_distortion_audit():

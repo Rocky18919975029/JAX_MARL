@@ -2,18 +2,24 @@
 
 This repository implements the execution protocol in
 `H1_SMAX_EXPERIMENT_EXECUTION_MANUAL.md` on top of the existing matched MAPPO
-code.  The original full matrix is two maps, PS/NPS actors, seven conditions,
-and seeds 101--110 (280 runs).  Before that larger confirmatory study, the first
+code.  The full distance-robustness matrix contains 200 LN-MSE runs (five
+alignment modes) plus 80 linear-CKA runs (the two directional modes), across
+two maps, PS/NPS actors, and seeds 101--110.  The distance-free `none` baseline
+is trained only in the LN-MSE matrix and reused, for 280 runs total.  Before that larger confirmatory study, the first
 formal stage is a locked reduced matrix: both maps, NPS only, the `none`
 baseline plus `c_to_a`, `a_to_c`, and `joint`, with seeds 1--4 (32 runs).
 
 ## What is implemented
 
-- Semantic and within-agent shuffled `a_to_c` / `c_to_a` targets.  The
-  shuffled target is a no-fixed-point cyclic permutation of the alive
-  environment-by-time pool, generated once per PPO update from an RNG substream
-  independent of rollout sampling.
-- Per-update shuffle checksums and valid/fixed-point statistics in W&B.
+- Parameter-free per-sample LayerNorm followed by either coordinate-wise MSE
+  or agent-grouped linear CKA. CKA centers along each agent's
+  time-by-environment sample batch and compares relational geometry, avoiding
+  cross-agent basis mixing for independent actors.
+- Unchanged `a_to_c`, `c_to_a`, reciprocal, and joint stop-gradient routing
+  across both distances. Legacy shuffled controls remain testable but are
+  excluded from the 280-run distance-robustness matrix.
+- Return-independent gradient-scale calibration that probes LN-MSE and CKA on
+  the same initial rollout/minibatches and locks one global CKA coefficient.
 - Separate RL, cross-loss, total-gradient, clipping, parameter-update,
   advantage, alive-fraction, training-return, and rollout-win diagnostics.
 - Initial, nominal 500k-step, and final checkpoints carrying exact actual
@@ -187,6 +193,26 @@ mean curves rather than averaging different alignment modes together.
 
 ## Full confirmatory training (deferred)
 
+First calibrate the single CKA coefficient.  Seed 9001 is a pilot seed and is
+not one of the confirmatory seeds.  Each of the eight cells computes both
+distance gradients on the exact same initial parameters and rollout.  `LR=0`
+holds parameters fixed across the frozen-config minibatches.  The global
+coefficient matches the pooled RMS cross/RL gradient ratio of LN-MSE at 0.1;
+returns are neither read nor written into the selection rule.
+
+```bash
+export CKA_CALIBRATION_ROOT="$H1_RUN_ROOT/cka_gradient_calibration"
+
+python scripts/calibrate_h1_cka.py \
+  --frozen-config "$H1_RUN_ROOT/protocol/frozen_training_config.json" \
+  --output-root "$CKA_CALIBRATION_ROOT" \
+  --pilot-seed 9001 \
+  --gpus 0,1,2,3
+
+export CKA_CALIBRATION="$CKA_CALIBRATION_ROOT/cka_gradient_calibration.json"
+python -m json.tool "$CKA_CALIBRATION"
+```
+
 Phase 1 runs seeds 101--102.  Five concurrent runs per 24 GB GPU matches the
 capacity previously validated on the four RTX 4090 server; lower it if another
 process uses memory.
@@ -194,6 +220,7 @@ process uses memory.
 ```bash
 nohup python scripts/run_h1_smax_confirmatory.py \
   --run-root "$H1_RUN_ROOT" \
+  --cka-calibration "$CKA_CALIBRATION" \
   --seeds 101-102 \
   --gpus 0,1,2,3 \
   --max-runs-per-gpu 5 \
@@ -206,6 +233,7 @@ evaluation/diagnostic smoke test, launch the locked second phase:
 ```bash
 nohup python scripts/run_h1_smax_confirmatory.py \
   --run-root "$H1_RUN_ROOT" \
+  --cka-calibration "$CKA_CALIBRATION" \
   --seeds 103-110 \
   --gpus 0,1,2,3 \
   --max-runs-per-gpu 5 \
@@ -219,8 +247,10 @@ tail -f "$H1_RUN_ROOT/launcher.log"
 watch -n 2 nvidia-smi
 ```
 
-Runs are named exactly
-`H1-{map}-{ps_or_nps}-{condition}-lam0p1-seed{seed}`.  The launcher is
+LN-MSE runs are named
+`H1-{map}-{ps_or_nps}-{condition}-lam0p1-seed{seed}`. CKA conditions are named
+`a_to_c_cka` / `c_to_a_cka` and record the calibrated coefficient in both the
+run name and W&B config. The launcher is
 resumable: a rerun skips status records already marked `completed` and never
 silently substitutes a seed.
 

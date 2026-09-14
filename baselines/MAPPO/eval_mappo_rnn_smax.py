@@ -302,6 +302,7 @@ def main():
         "rollout_horizon": rollout_horizon,
         "actor_parameter_sharing": config["ACTOR_PARAMETER_SHARING"],
         "align_mode": config["ALIGN_MODE"],
+        "align_distance": config.get("ALIGN_DISTANCE", "ln_mse"),
         "align_target_shuffle": config.get("ALIGN_TARGET_SHUFFLE", False),
         "condition": config.get("EXPERIMENT_CONDITION", config["ALIGN_MODE"]),
         "matrix_profile": config.get("MATRIX_PROFILE", ""),

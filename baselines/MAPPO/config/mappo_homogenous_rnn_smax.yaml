@@ -18,7 +18,10 @@
 "ACTOR_PARAMETER_SHARING": True
 "MATCHED_COMPARISON": False
 "ALIGN_MODE": "none" # none | c_to_a | a_to_c | reciprocal | joint
+"ALIGN_DISTANCE": "ln_mse" # ln_mse | linear_cka
+"ALIGN_DISTANCE_EPS": 1e-8
 "ALIGNMENT_COEF": 0.1
+"ALIGN_GRADIENT_CALIBRATION": False
 "ALIGN_TARGET_SHUFFLE": False
 "ALIGN_TARGET_SHUFFLE_SCOPE": "same_agent_env_time"
 "ALIGN_SHUFFLE_SEED_OFFSET": 700000
@@ -26,6 +29,7 @@
 "MATRIX_PROFILE": ""
 "PROTOCOL_VERSION": ""
 "GIT_COMMIT": ""
+"METRICS_JSONL": ""
 "ENV_NAME": "HeuristicEnemySMAX"
 "MAP_NAME": "2s3z"
 "SEED": 0

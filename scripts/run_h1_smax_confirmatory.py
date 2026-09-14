@@ -23,15 +23,15 @@ except ModuleNotFoundError:  # Imported as scripts.run_h1_smax_confirmatory in t
 
 MAPS = ("10m_vs_11m", "smacv2_10_units")
 ACTOR_VARIANTS = (("ps", True), ("nps", False))
-CONDITIONS = (
+LN_MSE_CONDITIONS = (
     "none",
     "a_to_c",
     "c_to_a",
     "reciprocal",
     "joint",
-    "a_to_c_shuffled",
-    "c_to_a_shuffled",
 )
+CKA_CONDITIONS = ("a_to_c_cka", "c_to_a_cka")
+CONDITIONS = LN_MSE_CONDITIONS + CKA_CONDITIONS
 CONFIRMATORY_SEEDS = tuple(range(101, 111))
 REDUCED_SEEDS = (1, 2, 3, 4)
 REDUCED_ACTOR_VARIANTS = ("nps",)
@@ -47,14 +47,24 @@ class Task:
     sharing: bool
     condition: str
     seed: int
+    alignment_coef: float = 0.1
 
     @property
     def align_mode(self):
-        return self.condition.removesuffix("_shuffled")
+        return self.condition.removesuffix("_cka")
+
+    @property
+    def align_distance(self):
+        return "linear_cka" if self.condition.endswith("_cka") else "ln_mse"
 
     @property
     def shuffled(self):
-        return self.condition.endswith("_shuffled")
+        return False
+
+    @property
+    def lambda_label(self):
+        value = f"{self.alignment_coef:.10g}".replace("-", "m").replace(".", "p")
+        return f"lam{value}"
 
     @property
     def run_name(self):
@@ -63,7 +73,7 @@ class Task:
         )
         return (
             f"{prefix}-{self.map_name}-{self.actor_label}-{self.condition}-"
-            f"lam0p1-seed{self.seed}"
+            f"{self.lambda_label}-seed{self.seed}"
         )
 
 
@@ -175,14 +185,18 @@ def build_command(args, frozen, task, commit):
             for nested_key, value in frozen[key].items():
                 command.append(f"ENV_KWARGS.{nested_key}={hydra_value(value)}")
         else:
-            command.append(f"{key}={hydra_value(frozen[key])}")
+            value = task.alignment_coef if key == "ALIGNMENT_COEF" else frozen[key]
+            command.append(f"{key}={hydra_value(value)}")
     command.extend(
         (
             f"MAP_NAME={task.map_name}",
             f"SEED={task.seed}",
             f"ACTOR_PARAMETER_SHARING={hydra_value(task.sharing)}",
             f"ALIGN_MODE={task.align_mode}",
-            f"ALIGN_TARGET_SHUFFLE={hydra_value(task.shuffled)}",
+            f"ALIGN_DISTANCE={task.align_distance}",
+            "ALIGN_DISTANCE_EPS=1e-8",
+            "ALIGN_GRADIENT_CALIBRATION=false",
+            "ALIGN_TARGET_SHUFFLE=false",
             "ALIGN_TARGET_SHUFFLE_SCOPE=same_agent_env_time",
             f"ALIGN_SHUFFLE_SEED_OFFSET={args.shuffle_seed_offset}",
             f"EXPERIMENT_CONDITION={task.condition}",
@@ -211,12 +225,31 @@ def task_matrix(args):
             actor_lookup[actor_label],
             condition,
             seed,
+            (args.cka_alignment_coef if condition.endswith("_cka") else 0.1),
         )
         for map_name in args.maps
         for actor_label in args.actor_variants
         for condition in args.conditions
         for seed in args.seeds
     ]
+
+
+def load_cka_calibration(path):
+    payload = json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
+    if payload.get("selection_uses_return") is not False:
+        raise ValueError("CKA calibration must explicitly record no return selection")
+    if payload.get("performance_fields_persisted") is not False:
+        raise ValueError("CKA calibration artifact must exclude performance fields")
+    if payload.get("reference_distance") != "ln_mse":
+        raise ValueError("CKA calibration reference must be ln_mse")
+    if float(payload.get("reference_alignment_coef", -1)) != 0.1:
+        raise ValueError("CKA calibration must reference LN-MSE lambda=0.1")
+    if payload.get("target_distance") != "linear_cka":
+        raise ValueError("Calibration target must be linear_cka")
+    coefficient = float(payload["global_alignment_coef"])
+    if not (coefficient > 0 and coefficient < float("inf")):
+        raise ValueError("Calibrated CKA coefficient must be finite and positive")
+    return coefficient
 
 
 def main():
@@ -248,6 +281,14 @@ def main():
         "--conditions",
         type=lambda value: parse_csv(value, CONDITIONS),
         default=CONDITIONS,
+    )
+    parser.add_argument(
+        "--cka-calibration",
+        type=Path,
+        help=(
+            "JSON produced by calibrate_h1_cka.py; required when a linear-CKA "
+            "condition is selected"
+        ),
     )
     parser.add_argument("--shuffle-seed-offset", type=int, default=700000)
     parser.add_argument("--upload-checkpoints", action="store_true")
@@ -281,6 +322,16 @@ def main():
         raise ValueError("H1 v1.0 locks MATCHED_COMPARISON=true")
     if args.max_runs_per_gpu <= 0:
         raise ValueError("--max-runs-per-gpu must be positive")
+    uses_cka = any(condition.endswith("_cka") for condition in args.conditions)
+    if uses_cka:
+        if args.cka_calibration is None:
+            raise ValueError(
+                "Linear-CKA conditions require --cka-calibration; do not select "
+                "lambda from returns or copy the LN-MSE coefficient."
+            )
+        args.cka_alignment_coef = load_cka_calibration(args.cka_calibration)
+    else:
+        args.cka_alignment_coef = None
 
     repo = repository_root()
     commit, status = git_state(repo)
@@ -386,7 +437,8 @@ def main():
                         "WANDB_NAME": task.run_name,
                         "WANDB_RUN_GROUP": (
                             f"{'H1-reduced' if args.matrix_profile == 'reduced-nps-4condition' else 'H1'}-"
-                            f"{task.map_name}-{task.actor_label}-{task.condition}-lam0p1"
+                            f"{task.map_name}-{task.actor_label}-{task.condition}-"
+                            f"{task.lambda_label}"
                         ),
                         "WANDB_TAGS": ",".join(
                             (
@@ -399,7 +451,8 @@ def main():
                                 task.map_name,
                                 task.actor_label,
                                 task.condition,
-                                "lambda-0.1",
+                                f"distance-{task.align_distance}",
+                                f"lambda-{task.alignment_coef:.10g}",
                                 PROTOCOL_VERSION,
                             )
                         ),
@@ -445,8 +498,9 @@ def main():
                 "actor_parameter_sharing": task.sharing,
                 "condition": task.condition,
                 "align_mode": task.align_mode,
+                "align_distance": task.align_distance,
                 "shuffled": task.shuffled,
-                "alignment_coef": 0.1,
+                "alignment_coef": task.alignment_coef,
                 "seed": task.seed,
                 "gpu": gpu,
                 "pid": pid,

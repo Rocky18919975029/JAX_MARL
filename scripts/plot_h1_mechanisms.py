@@ -17,6 +17,8 @@ COLORS = {
     "c_to_a": "#377bd1",
     "joint": "#b46f40",
     "reciprocal": "#7f8c8d",
+    "a_to_c_cka": "#80b918",
+    "c_to_a_cka": "#377bd1",
     "a_to_c_shuffled": "#b5d56a",
     "c_to_a_shuffled": "#75a7e6",
 }
@@ -53,7 +55,12 @@ def draw_curve(axis, rows, metric, conditions):
         mean = np.asarray([float(row["mean"]) for row in selected])
         low = np.asarray([float(row["ci95_low"]) for row in selected])
         high = np.asarray([float(row["ci95_high"]) for row in selected])
-        linestyle = "--" if condition.endswith("_shuffled") else "-"
+        if condition.endswith("_cka"):
+            linestyle = ":"
+        elif condition.endswith("_shuffled"):
+            linestyle = "--"
+        else:
+            linestyle = "-"
         axis.plot(
             x,
             mean,
