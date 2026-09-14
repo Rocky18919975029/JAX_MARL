@@ -378,6 +378,7 @@ def main():
         "num_agents": env.num_agents,
         "actor_parameter_sharing": config["ACTOR_PARAMETER_SHARING"],
         "condition": config.get("EXPERIMENT_CONDITION", config["ALIGN_MODE"]),
+        "matrix_profile": config.get("MATRIX_PROFILE", ""),
         "alignment_coef": config["ALIGNMENT_COEF"],
         "protocol_version": config.get("PROTOCOL_VERSION", ""),
         "git_commit": config.get("GIT_COMMIT", ""),

@@ -84,6 +84,7 @@ def load_mechanism_rows(root):
                     "ps" if metadata["actor_parameter_sharing"] else "nps"
                 ),
                 "condition": metadata["condition"],
+                "matrix_profile": metadata.get("matrix_profile", ""),
                 "seed": int(metadata["training_seed"]),
                 "checkpoint_step": int(metadata.get("checkpoint_env_step") or 0),
                 "nominal_step": int(metadata.get("checkpoint_nominal_env_step") or 0),
@@ -166,10 +167,11 @@ def paired_checkpoint_effects(rows, rng):
     )
     for task, actor, condition, step in strata:
         seeds = sorted(
-            seed
-            for seed in range(101, 111)
-            if (task, actor, condition, seed, step) in lookup
-            and (task, actor, "none", seed, step) in lookup
+            row[3]
+            for row in lookup
+            if row[:3] == (task, actor, condition)
+            and row[4] == step
+            and (task, actor, "none", row[3], step) in lookup
         )
         for metric in ("r_lat", "epsilon_dec", "epsilon_bell_excess"):
             if not seeds:

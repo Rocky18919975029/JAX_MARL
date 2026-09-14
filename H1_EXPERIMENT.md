@@ -228,6 +228,10 @@ silently substitutes a seed.
 
 After all selected training runs finish:
 
+For the reduced stage, use `H1_REDUCED_ROOT` in place of `H1_RUN_ROOT` in all
+evaluation, diagnostic, merge, analysis, and plotting commands below.  Its
+four seeds remain the independent statistical units.
+
 ```bash
 nohup python scripts/eval_h1_checkpoints.py \
   --run-root "$H1_RUN_ROOT" \
@@ -257,8 +261,8 @@ Bellman source heads.  Smoke-test one run/checkpoint first:
 
 ```bash
 python scripts/run_h1_diagnostics.py \
-  --run-root "$H1_RUN_ROOT" \
-  --run-name-glob 'H1-10m_vs_11m-ps-none-lam0p1-seed101' \
+  --run-root "$H1_REDUCED_ROOT" \
+  --run-name-glob 'H1-reduced-10m_vs_11m-nps-none-lam0p1-seed1' \
   --checkpoint-name-glob final \
   --gpus 0 \
   --output-tree diagnostics_smoke \
