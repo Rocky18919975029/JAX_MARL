@@ -911,7 +911,10 @@ class SMAX(MultiAgentEnv):
         )
         attack_action_obs = jax.lax.select(
             (team_i_idx == team_j_idx) | self.see_enemy_actions,
-            state.prev_attack_actions[j_idx].astype(jnp.float32) / max_j_action,
+            # Preserve the environment's active floating-point dtype. Forcing
+            # this branch to float32 conflicts with the float64 scalar below
+            # when diagnostics run with JAX_ENABLE_X64=true.
+            state.prev_attack_actions[j_idx] / max_j_action,
             0.0,
         )
         features = features.at[3:5].set(move_action_obs)
