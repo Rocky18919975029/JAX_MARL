@@ -153,6 +153,7 @@ def build_command(args, frozen, task, commit):
             f"WANDB_UPLOAD_CHECKPOINTS={hydra_value(args.upload_checkpoints)}",
             "WANDB_MODE=online",
             f"PROJECT={args.project}",
+            f"hydra.run.dir={args.run_root / 'hydra' / task.run_name}",
         )
     )
     return command
@@ -245,8 +246,18 @@ def main():
     args.run_root.mkdir(parents=True, exist_ok=True)
     logs_dir = args.run_root / "logs"
     status_dir = args.run_root / "status"
+    wandb_dir = args.run_root / "wandb"
+    wandb_cache_dir = args.run_root / "wandb_cache"
+    wandb_data_dir = args.run_root / "wandb_staging"
+    wandb_artifact_dir = args.run_root / "wandb_artifacts"
+    hydra_dir = args.run_root / "hydra"
     logs_dir.mkdir(parents=True, exist_ok=True)
     status_dir.mkdir(parents=True, exist_ok=True)
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    wandb_cache_dir.mkdir(parents=True, exist_ok=True)
+    wandb_data_dir.mkdir(parents=True, exist_ok=True)
+    wandb_artifact_dir.mkdir(parents=True, exist_ok=True)
+    hydra_dir.mkdir(parents=True, exist_ok=True)
     launcher_log = args.run_root / "launcher.log"
     manifest_path = args.run_root / "completion_manifest.jsonl"
     failure_registry = args.run_root / "failure_registry.jsonl"
@@ -306,6 +317,10 @@ def main():
                         "CUDA_VISIBLE_DEVICES": gpu,
                         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                         "HYDRA_FULL_ERROR": "1",
+                        "WANDB_DIR": str(wandb_dir),
+                        "WANDB_CACHE_DIR": str(wandb_cache_dir),
+                        "WANDB_DATA_DIR": str(wandb_data_dir),
+                        "WANDB_ARTIFACT_DIR": str(wandb_artifact_dir),
                         "WANDB_NAME": task.run_name,
                         "WANDB_RUN_GROUP": (
                             f"H1-{task.map_name}-{task.actor_label}-lam0p1"

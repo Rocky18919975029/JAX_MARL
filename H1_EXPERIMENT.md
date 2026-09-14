@@ -31,8 +31,10 @@ or optimizer state.
 
 ## One-time protocol preparation
 
-On the GPU server, first pull the committed implementation and choose an
-absolute output directory:
+On the GPU server, the project checkout lives on a space-constrained disk.  All
+experiment outputs must therefore live under the data disk.  The canonical H1
+output root is `/home/data/zeshenghong/JaxMARL/h1_smax_runs`; the path inside
+the checkout is only a convenience symlink to that directory.  Prepare it once:
 
 ```bash
 cd ~/JaxMARL
@@ -40,9 +42,39 @@ git pull --ff-only
 conda activate jaxmarl
 unset LD_LIBRARY_PATH
 
-export H1_RUN_ROOT="$HOME/JaxMARL/h1_smax_runs"
-mkdir -p "$H1_RUN_ROOT"
+export H1_DATA_ROOT="/home/data/zeshenghong/JaxMARL"
+export H1_RUN_ROOT="$H1_DATA_ROOT/h1_smax_runs"
+export H1_PROJECT_LINK="$HOME/JaxMARL/h1_smax_runs"
+
+mkdir -p "$H1_DATA_ROOT"
+
+if [ -L "$H1_PROJECT_LINK" ]; then
+  test "$(readlink -f "$H1_PROJECT_LINK")" = "$H1_RUN_ROOT" || {
+    echo "Existing symlink points somewhere else: $H1_PROJECT_LINK"
+    exit 1
+  }
+elif [ -e "$H1_PROJECT_LINK" ]; then
+  test ! -e "$H1_RUN_ROOT" || {
+    echo "Both project and data-disk output directories exist; merge manually."
+    exit 1
+  }
+  mv "$H1_PROJECT_LINK" "$H1_RUN_ROOT"
+  ln -s "$H1_RUN_ROOT" "$H1_PROJECT_LINK"
+else
+  mkdir -p "$H1_RUN_ROOT"
+  ln -s "$H1_RUN_ROOT" "$H1_PROJECT_LINK"
+fi
+
+test "$(readlink -f "$H1_PROJECT_LINK")" = "$H1_RUN_ROOT"
+df -h "$H1_RUN_ROOT"
 ```
+
+The `mv` branch preserves an existing protocol-test or smoke-test directory by
+moving it to the data disk before creating the link.  It deliberately stops if
+both locations already exist, because silently merging two experiment trees is
+unsafe.  In every new shell, export `H1_RUN_ROOT` again.  The launcher resolves
+symlinks and puts checkpoints, stdout logs, status files, W&B local
+data/cache/artifact staging, and Hydra run metadata below this data-disk root.
 
 Freeze the exact W&B pilot baseline config that generated the pilot curves.
 The source may be a JSON export or W&B's local `files/config.yaml`:
