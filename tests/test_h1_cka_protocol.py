@@ -35,6 +35,50 @@ def test_full_matrix_replaces_shuffled_controls_with_cka_runs():
     )
 
 
+def reduced_cka_args(**overrides):
+    values = {
+        "matrix_profile": "reduced-nps-cka",
+        "maps": launcher.MAPS,
+        "actor_variants": launcher.REDUCED_ACTOR_VARIANTS,
+        "conditions": launcher.REDUCED_CKA_CONDITIONS,
+        "seeds": launcher.REDUCED_SEEDS,
+        "cka_alignment_coef": 0.037,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_reduced_cka_matrix_exactly_pairs_prior_nps_seeds():
+    args = reduced_cka_args()
+    launcher.validate_matrix_profile(args)
+    tasks = launcher.task_matrix(args)
+
+    assert len(tasks) == 16
+    assert {task.map_name for task in tasks} == set(launcher.MAPS)
+    assert {task.actor_label for task in tasks} == {"nps"}
+    assert {task.sharing for task in tasks} == {False}
+    assert {task.condition for task in tasks} == set(
+        launcher.REDUCED_CKA_CONDITIONS
+    )
+    assert {task.seed for task in tasks} == {1, 2, 3, 4}
+    assert all(task.align_distance == "linear_cka" for task in tasks)
+    assert all(task.run_name.startswith("H1-reduced-") for task in tasks)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("maps", ("10m_vs_11m",)),
+        ("actor_variants", ("ps",)),
+        ("conditions", ("c_to_a_cka",)),
+        ("seeds", (1, 2, 3)),
+    ),
+)
+def test_reduced_cka_matrix_rejects_unpaired_scope(field, value):
+    with pytest.raises(ValueError, match="locked to exactly 16 runs"):
+        launcher.validate_matrix_profile(reduced_cka_args(**{field: value}))
+
+
 def test_pooled_rms_calibration_uses_relative_rl_gradient_scale():
     cells = [
         {

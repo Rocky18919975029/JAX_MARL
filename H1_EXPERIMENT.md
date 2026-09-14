@@ -191,6 +191,11 @@ Runs are named `H1-reduced-{map}-nps-{condition}-lam0p1-seed{seed}` in the
 seeds for one task/condition pair, so grouping a chart by `Group` produces eight
 mean curves rather than averaging different alignment modes together.
 
+The paired linear-CKA robustness run uses the same two maps, NPS actor,
+frozen training configuration, and seeds 1--4 as the reduced LN-MSE run. The
+locked `reduced-nps-cka` profile contains only `c_to_a_cka` and `a_to_c_cka`
+(16 runs total); the distance-free `none` runs are reused.
+
 ## Full confirmatory training (deferred)
 
 First calibrate the single CKA coefficient.  Seed 9001 is a pilot seed and is
