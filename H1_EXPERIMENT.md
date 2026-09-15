@@ -95,11 +95,11 @@ criteria use one frozen-checkpoint data protocol.
 
 ## Required preregistration values
 
-Before recomputation, choose and record these without looking at the new result:
+The values fixed before recomputation are:
 
-- `FISHER_RIDGE_ABSOLUTE`: the fixed `xi > 0`
-- `DELTA_DEC >= 0`: decision non-inferiority tolerance
-- `DELTA_BELL >= 0`: Bellman non-inferiority tolerance
+- `FISHER_RIDGE_ABSOLUTE=0.001`: the fixed absolute Fisher ridge `xi`
+- `DELTA_DEC=0.05`: decision non-inferiority tolerance
+- `DELTA_BELL=0.005`: Bellman non-inferiority tolerance
 
 The launcher requires all three explicitly and writes them to
 `recompute_manifest.json` before processing and `analysis_protocol.json` in
@@ -118,10 +118,9 @@ export CKA_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs/cka_distance_robust
 export H1_ANALYSIS_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs/nps_mse_cka_h1"
 mkdir -p "$H1_ANALYSIS_ROOT"
 
-# Fill these with the values fixed before inspecting the recomputed metrics.
-export FISHER_RIDGE_ABSOLUTE="<xi>"
-export DELTA_DEC="<delta_A>"
-export DELTA_BELL="<delta_C>"
+export FISHER_RIDGE_ABSOLUTE=0.001
+export DELTA_DEC=0.05
+export DELTA_BELL=0.005
 
 python scripts/run_h1_nps_diagnostics.py \
   --mse-root "$MSE_ROOT" \
