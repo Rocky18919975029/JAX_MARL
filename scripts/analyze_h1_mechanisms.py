@@ -13,6 +13,9 @@ from pathlib import Path
 import numpy as np
 
 
+LATENT_REFERENCE_PROTOCOL = "baseline_free_full_return_mc_v1"
+
+
 def read_csv(path):
     with path.open(newline="", encoding="utf-8") as file:
         return list(csv.DictReader(file))
@@ -65,7 +68,7 @@ def load_mechanism_rows(root):
     ):
         directory = metadata_path.parent
         required = (
-            directory / "latent_distortion_summary.json",
+            directory / "latent_distortion_mc_summary.json",
             directory / "decision_summary.json",
             directory / "bellman_summary.json",
         )
@@ -75,6 +78,11 @@ def load_mechanism_rows(root):
         latent = json.loads(required[0].read_text(encoding="utf-8"))
         decision = json.loads(required[1].read_text(encoding="utf-8"))
         bellman = json.loads(required[2].read_text(encoding="utf-8"))
+        if latent.get("reference_protocol") != LATENT_REFERENCE_PROTOCOL:
+            raise RuntimeError(
+                f"Unexpected latent reference protocol in {required[0]}: "
+                f"{latent.get('reference_protocol')!r}"
+            )
         rows.append(
             {
                 "run_id": metadata.get("run_id"),
@@ -90,6 +98,7 @@ def load_mechanism_rows(root):
                 "nominal_step": int(metadata.get("checkpoint_nominal_env_step") or 0),
                 "epsilon_lat": float(latent["epsilon_lat"]),
                 "r_lat": float(latent["r_lat"]),
+                "latent_reference_protocol": latent["reference_protocol"],
                 "epsilon_dec": float(decision["epsilon_dec"]),
                 "kendall_tau": float(decision["kendall_tau"]),
                 "pairwise_accuracy": float(decision["pairwise_accuracy"]),
@@ -129,6 +138,7 @@ def curve_summary(rows, rng):
                     "actor_parameterization": key[1],
                     "condition": key[2],
                     "nominal_step": key[3],
+                    "latent_reference_protocol": LATENT_REFERENCE_PROTOCOL,
                     "metric": metric,
                     "mean": float(values.mean()),
                     "std": std,
@@ -190,6 +200,7 @@ def paired_checkpoint_effects(rows, rng):
                 "condition": condition,
                 "baseline": "none",
                 "nominal_step": step,
+                "latent_reference_protocol": LATENT_REFERENCE_PROTOCOL,
                 "metric": metric,
                 "paired_mean_difference": float(differences.mean()),
                 "paired_ci95_low": low,
@@ -256,6 +267,7 @@ def prospective(rows, evaluation_rows, rng):
                 "actor_parameterization": key[1],
                 "condition": key[2],
                 "seed": key[3],
+                "latent_reference_protocol": LATENT_REFERENCE_PROTOCOL,
                 "early_r_lat": float(np.mean(values)),
                 "future_return_gain": later - early,
             }
@@ -277,6 +289,7 @@ def prospective(rows, evaluation_rows, rng):
             {
                 "task": key[0],
                 "actor_parameterization": key[1],
+                "latent_reference_protocol": LATENT_REFERENCE_PROTOCOL,
                 "spearman_negative_early_r_lat_vs_future_gain": observed,
                 "ci95_low": (
                     float(np.quantile(finite, 0.025)) if len(finite) else math.nan

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compute H1 latent policy-update distortion from diagnostic rollout shards."""
+"""Compute H1 latent distortion using a baseline-free Monte Carlo reference."""
 
 from __future__ import annotations
 
@@ -10,6 +10,10 @@ import math
 from pathlib import Path
 
 import numpy as np
+
+
+REFERENCE_PROTOCOL = "baseline_free_full_return_mc_v1"
+CONTROL_VARIATE_PROTOCOL = "cross_fitted_state_baseline_sensitivity_v1"
 
 
 def load_diagnostics(directory):
@@ -82,16 +86,16 @@ def cross_fitted_reference(states, returns, episode_ids, active, seed, width, ri
     return predictions, fold_metrics
 
 
-def fisher_statistics(scores, reference_advantage, critic_advantage):
+def fisher_statistics(scores, reference_signal, critic_advantage):
     """Compute ridge-independent Fisher quantities once for one sample pool."""
 
     scores = np.asarray(scores, dtype=np.float64)
-    reference_advantage = np.asarray(reference_advantage, dtype=np.float64)
+    reference_signal = np.asarray(reference_signal, dtype=np.float64)
     critic_advantage = np.asarray(critic_advantage, dtype=np.float64)
     count, dimension = scores.shape
-    delta = np.mean(scores * (reference_advantage - critic_advantage)[:, None], axis=0)
-    g_reference = np.mean(scores * reference_advantage[:, None], axis=0)
+    g_reference = np.mean(scores * reference_signal[:, None], axis=0)
     g_critic = np.mean(scores * critic_advantage[:, None], axis=0)
+    delta = g_reference - g_critic
     fisher = (scores.T @ scores) / count
     fisher = (fisher + fisher.T) / 2.0
     eigenvalues = np.linalg.eigvalsh(fisher)
@@ -104,6 +108,49 @@ def fisher_statistics(scores, reference_advantage, critic_advantage):
         "fisher": fisher,
         "eigenvalues": eigenvalues,
     }
+
+
+def reweight_reference(statistics, scores, reference_signal):
+    """Reuse the same Fisher matrix when only the reference control variate changes."""
+
+    scores = np.asarray(scores, dtype=np.float64)
+    reference_signal = np.asarray(reference_signal, dtype=np.float64)
+    if len(scores) != statistics["count"] or len(reference_signal) != len(scores):
+        raise ValueError(
+            "Reference sensitivity requires the identical score sample pool"
+        )
+    g_reference = np.mean(scores * reference_signal[:, None], axis=0)
+    return {
+        **statistics,
+        "g_reference": g_reference,
+        "delta": g_reference - statistics["g_critic"],
+    }
+
+
+def aggregate_agent_metrics(metrics):
+    epsilon = float(np.mean([row["epsilon_lat"] for row in metrics]))
+    energy = float(np.mean([row["energy_ref"] for row in metrics]))
+    return {
+        "epsilon_lat": epsilon,
+        "energy_ref": energy,
+        "r_lat": epsilon / (energy + 1e-8),
+    }
+
+
+def vector_cosine(first, second):
+    denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
+    return float(first @ second / denominator) if denominator > 0 else math.nan
+
+
+def convergence_episode_budgets(episode_ids):
+    """Use nested 1/4, 1/2, and full sets of complete independent rollouts."""
+
+    ids = np.asarray(episode_ids, dtype=np.int64)
+    episodes = len(ids)
+    if episodes < 4 or episodes % 4 or not np.array_equal(ids, np.arange(episodes)):
+        raise ValueError("MC convergence requires 4M sequential, complete episodes")
+    base = episodes // 4
+    return (base, 2 * base, 4 * base)
 
 
 def fisher_metrics_from_statistics(statistics, ridge_multiplier):
@@ -171,9 +218,9 @@ def fisher_metrics_from_statistics(statistics, ridge_multiplier):
     }
 
 
-def fisher_metrics(scores, reference_advantage, critic_advantage, ridge_multiplier):
+def fisher_metrics(scores, reference_signal, critic_advantage, ridge_multiplier):
     return fisher_metrics_from_statistics(
-        fisher_statistics(scores, reference_advantage, critic_advantage),
+        fisher_statistics(scores, reference_signal, critic_advantage),
         ridge_multiplier,
     )
 
@@ -201,9 +248,11 @@ def main():
     metadata, arrays = load_diagnostics(args.diagnostics_dir)
     active = arrays["active"].astype(bool)
     episode_ids = arrays["diagnostic_episode_id"].astype(np.int64)
-    # Agent 0's view contains the raw global state plus a constant agent-ID
-    # suffix. Using one fixed view prevents the tested critic from defining the
-    # independent reference baseline.
+    episode_budgets = convergence_episode_budgets(episode_ids)
+    # The primary reference is the complete discounted return from independent
+    # frozen-checkpoint rollouts. It has no learned baseline and no bootstrap.
+    # Agent 0's world-state view is used only for the cross-fitted control-variate
+    # sensitivity analysis below; it does not enter the primary reference.
     states = arrays["world_state"][:, :, 0]
     team_returns = arrays["mc_return"][:, :, 0]
     baseline, fold_metrics = cross_fitted_reference(
@@ -215,27 +264,76 @@ def main():
         args.reference_width,
         args.reference_ridge,
     )
-    reference_advantage = team_returns - baseline
+    cross_fitted_signal = team_returns - baseline
     rows = []
-    per_agent_epsilon = []
-    per_agent_energy = []
+    cross_fitted_rows = []
+    primary_agent_metrics = []
+    cross_fitted_agent_metrics = []
+    primary_reference_gradients = []
+    convergence_by_budget = {budget: [] for budget in episode_budgets}
+    convergence_reference_gradients = {budget: [] for budget in episode_budgets}
+    convergence_budget_labels = dict(zip(episode_budgets, ("M", "2M", "4M")))
+    convergence_rows = []
+    convergence_common = {
+        "run_id": metadata.get("run_id"),
+        "run_name": metadata["run_name"],
+        "task": metadata["map_name"],
+        "actor_parameterization": (
+            "ps" if metadata["actor_parameter_sharing"] else "nps"
+        ),
+        "align_mode": metadata["condition"],
+        "seed": metadata["training_seed"],
+        "checkpoint_step": metadata.get("checkpoint_env_step"),
+        "reference_protocol": REFERENCE_PROTOCOL,
+        "protocol_version": metadata["protocol_version"],
+        "git_commit": metadata["git_commit"],
+    }
     ridge_sensitivity = []
     minibatch_distribution = []
     distribution_rng = np.random.default_rng(args.reference_seed + 99)
     unit_types = arrays["state_unit_types"][:, :, : metadata["num_agents"]]
     for agent in range(metadata["num_agents"]):
         mask = active & arrays["alive"][:, :, agent].astype(bool)
+        scores = arrays["actor_score"][:, :, agent][mask]
+        mc_signal = team_returns[mask]
+        critic_signal = arrays["gae_raw"][:, :, agent][mask]
         agent_statistics = fisher_statistics(
-            arrays["actor_score"][:, :, agent][mask],
-            reference_advantage[mask],
-            arrays["gae_raw"][:, :, agent][mask],
+            scores,
+            mc_signal,
+            critic_signal,
         )
         metrics = fisher_metrics_from_statistics(
             agent_statistics,
             args.fisher_ridge,
         )
-        per_agent_epsilon.append(metrics["epsilon_lat"])
-        per_agent_energy.append(metrics["energy_ref"])
+        primary_agent_metrics.append(metrics)
+        primary_reference_gradients.append(agent_statistics["g_reference"])
+        cross_fitted_statistics = reweight_reference(
+            agent_statistics,
+            scores,
+            cross_fitted_signal[mask],
+        )
+        cross_fitted_metrics = fisher_metrics_from_statistics(
+            cross_fitted_statistics,
+            args.fisher_ridge,
+        )
+        cross_fitted_item = {
+            **cross_fitted_metrics,
+            "agent_id": agent,
+            "reference_gradient_cosine_to_primary": vector_cosine(
+                cross_fitted_statistics["g_reference"],
+                agent_statistics["g_reference"],
+            ),
+        }
+        cross_fitted_agent_metrics.append(cross_fitted_item)
+        cross_fitted_rows.append(
+            {
+                **convergence_common,
+                "reference_protocol": CONTROL_VARIATE_PROTOCOL,
+                "reference_control_variate": "five_fold_episode_disjoint_state_baseline",
+                **cross_fitted_item,
+            }
+        )
         for ridge_multiplier in (1e-4, 1e-3, 1e-2):
             sensitivity_metrics = fisher_metrics_from_statistics(
                 agent_statistics,
@@ -249,19 +347,16 @@ def main():
                     "r_lat": sensitivity_metrics["r_lat"],
                 }
             )
-        score_pool = arrays["actor_score"][:, :, agent][mask]
-        reference_pool = reference_advantage[mask]
-        critic_pool = arrays["gae_raw"][:, :, agent][mask]
-        permutation = distribution_rng.permutation(len(score_pool))
+        permutation = distribution_rng.permutation(len(scores))
         chunk_size = args.minibatch_samples_per_agent
         for chunk_index, start in enumerate(range(0, len(permutation), chunk_size)):
             indices = permutation[start : start + chunk_size]
-            if len(indices) < max(score_pool.shape[-1] + 1, chunk_size // 2):
+            if len(indices) < max(scores.shape[-1] + 1, chunk_size // 2):
                 continue
             chunk_metrics = fisher_metrics(
-                score_pool[indices],
-                reference_pool[indices],
-                critic_pool[indices],
+                scores[indices],
+                mc_signal[indices],
+                critic_signal[indices],
                 args.fisher_ridge,
             )
             minibatch_distribution.append(
@@ -287,6 +382,8 @@ def main():
                 "checkpoint_step": metadata.get("checkpoint_env_step"),
                 "agent_id": agent,
                 "unit_type": "all",
+                "reference_protocol": REFERENCE_PROTOCOL,
+                "reference_control_variate": "none",
                 **metrics,
                 "protocol_version": metadata["protocol_version"],
                 "git_commit": metadata["git_commit"],
@@ -298,7 +395,7 @@ def main():
                 continue
             type_metrics = fisher_metrics(
                 arrays["actor_score"][:, :, agent][type_mask],
-                reference_advantage[type_mask],
+                team_returns[type_mask],
                 arrays["gae_raw"][:, :, agent][type_mask],
                 args.fisher_ridge,
             )
@@ -310,35 +407,145 @@ def main():
                 }
             )
 
+        for episode_budget in episode_budgets:
+            budget_mask = mask & (episode_ids[:, None] < episode_budget)
+            budget_statistics = fisher_statistics(
+                arrays["actor_score"][:, :, agent][budget_mask],
+                team_returns[budget_mask],
+                arrays["gae_raw"][:, :, agent][budget_mask],
+            )
+            budget_metrics = fisher_metrics_from_statistics(
+                budget_statistics,
+                args.fisher_ridge,
+            )
+            item = {
+                **budget_metrics,
+                "agent_id": agent,
+                "episode_budget": episode_budget,
+                "episode_budget_label": convergence_budget_labels[episode_budget],
+                "valid_score_samples": budget_statistics["count"],
+                "reference_gradient_l2": float(
+                    np.linalg.norm(budget_statistics["g_reference"])
+                ),
+                "reference_gradient_cosine_to_4m": vector_cosine(
+                    budget_statistics["g_reference"],
+                    agent_statistics["g_reference"],
+                ),
+                "reference_gradient_relative_l2_to_4m": float(
+                    np.linalg.norm(
+                        budget_statistics["g_reference"]
+                        - agent_statistics["g_reference"]
+                    )
+                    / (np.linalg.norm(agent_statistics["g_reference"]) + 1e-12)
+                ),
+                "epsilon_lat_relative_error_to_4m": float(
+                    abs(budget_metrics["epsilon_lat"] - metrics["epsilon_lat"])
+                    / (abs(metrics["epsilon_lat"]) + 1e-12)
+                ),
+                "r_lat_relative_error_to_4m": float(
+                    abs(budget_metrics["r_lat"] - metrics["r_lat"])
+                    / (abs(metrics["r_lat"]) + 1e-12)
+                ),
+            }
+            convergence_by_budget[episode_budget].append(item)
+            convergence_reference_gradients[episode_budget].append(
+                budget_statistics["g_reference"]
+            )
+            convergence_rows.append(
+                {
+                    **convergence_common,
+                    "scope": "agent",
+                    "agent_id": agent,
+                    **item,
+                }
+            )
+
+    primary = aggregate_agent_metrics(primary_agent_metrics)
+    cross_fitted = aggregate_agent_metrics(cross_fitted_agent_metrics)
+    primary_reference_gradient = np.concatenate(primary_reference_gradients)
+    convergence_summary = []
+    for episode_budget in episode_budgets:
+        agent_rows = convergence_by_budget[episode_budget]
+        budget_reference_gradient = np.concatenate(
+            convergence_reference_gradients[episode_budget]
+        )
+        summary = {
+            "scope": "aggregate",
+            "agent_id": "all",
+            "episode_budget": episode_budget,
+            "episode_budget_label": convergence_budget_labels[episode_budget],
+            "valid_score_samples": int(
+                np.sum([row["valid_score_samples"] for row in agent_rows])
+            ),
+            **aggregate_agent_metrics(agent_rows),
+            "reference_gradient_l2": float(np.linalg.norm(budget_reference_gradient)),
+            "reference_gradient_cosine_to_4m": vector_cosine(
+                budget_reference_gradient,
+                primary_reference_gradient,
+            ),
+            "reference_gradient_relative_l2_to_4m": float(
+                np.linalg.norm(budget_reference_gradient - primary_reference_gradient)
+                / (np.linalg.norm(primary_reference_gradient) + 1e-12)
+            ),
+        }
+        summary["epsilon_lat_relative_error_to_4m"] = float(
+            abs(summary["epsilon_lat"] - primary["epsilon_lat"])
+            / (abs(primary["epsilon_lat"]) + 1e-12)
+        )
+        summary["r_lat_relative_error_to_4m"] = float(
+            abs(summary["r_lat"] - primary["r_lat"]) / (abs(primary["r_lat"]) + 1e-12)
+        )
+        convergence_summary.append(summary)
+        convergence_rows.append({**convergence_common, **summary})
+
     aggregate = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": metadata.get("run_id"),
         "run_name": metadata["run_name"],
         "checkpoint_step": metadata.get("checkpoint_env_step"),
-        "epsilon_lat": float(np.mean(per_agent_epsilon)),
-        "energy_ref": float(np.mean(per_agent_energy)),
-        "r_lat": float(np.mean(per_agent_epsilon) / (np.mean(per_agent_energy) + 1e-8)),
+        "reference_protocol": REFERENCE_PROTOCOL,
+        "reference_signal": "complete_discounted_mc_return",
+        "reference_baseline": "none",
+        "reference_rollout_episodes": int(len(episode_ids)),
+        "reference_base_episode_budget_m": int(episode_budgets[0]),
+        "reference_sample_weighting": "equal_over_valid_alive_actor_decisions",
+        "reference_has_bootstrap": False,
+        **primary,
         "per_agent_mean_matches": bool(
             np.isclose(
-                np.mean(per_agent_epsilon),
+                primary["epsilon_lat"],
                 np.mean(
                     [row["epsilon_lat"] for row in rows if row["unit_type"] == "all"]
                 ),
             )
         ),
-        "reference_baseline_folds": fold_metrics,
+        "mc_convergence_episode_budgets": list(episode_budgets),
+        "mc_convergence": convergence_summary,
+        "cross_fitted_state_baseline_sensitivity": {
+            "reference_protocol": CONTROL_VARIATE_PROTOCOL,
+            "reference_signal": "complete_discounted_mc_return_minus_cross_fitted_state_baseline",
+            **cross_fitted,
+            "per_agent": cross_fitted_agent_metrics,
+            "reference_baseline_folds": fold_metrics,
+        },
         "fisher_ridge_multiplier": args.fisher_ridge,
         "ridge_sensitivity": ridge_sensitivity,
         "training_minibatch_sized_distribution": minibatch_distribution,
     }
     output_dir = args.diagnostics_dir.expanduser().resolve()
-    (output_dir / "latent_distortion_summary.json").write_text(
+    (output_dir / "latent_distortion_mc_summary.json").write_text(
         json.dumps(aggregate, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     np.savez_compressed(
-        output_dir / "reference_advantages.npz",
-        reference_baseline=baseline,
-        reference_advantage=reference_advantage,
+        output_dir / "reference_signals_mc.npz",
+        mc_return=team_returns,
+        cross_fitted_state_baseline=baseline,
+        cross_fitted_control_variate_signal=cross_fitted_signal,
+    )
+    write_csv(output_dir / "mc_reference_convergence.csv", convergence_rows)
+    write_csv(
+        output_dir / "compatibility_crossfit_sensitivity_metrics.csv",
+        cross_fitted_rows,
     )
     write_csv(args.output_csv.expanduser().resolve(), rows)
     print(json.dumps(aggregate, indent=2, sort_keys=True))

@@ -66,7 +66,10 @@ def main():
             f"Diagnostic rollout missing: {output / 'metadata.json'}"
         )
 
-    if "latent" in stages and not (output / "latent_distortion_summary.json").is_file():
+    if (
+        "latent" in stages
+        and not (output / "latent_distortion_mc_summary.json").is_file()
+    ):
         run(
             [
                 sys.executable,
@@ -74,7 +77,7 @@ def main():
                 "--diagnostics-dir",
                 str(output),
                 "--output-csv",
-                str(output / "compatibility_metrics.csv"),
+                str(output / "compatibility_mc_metrics.csv"),
                 "--reference-seed",
                 str(30_000 + diagnostic_seed),
             ]

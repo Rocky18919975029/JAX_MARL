@@ -29,9 +29,9 @@ baseline plus `c_to_a`, `a_to_c`, and `joint`, with seeds 1--4 (32 runs).
 - Paired-seed deterministic checkpoint evaluation and unsmoothed performance
   AUC/bootstrap analysis.
 - Complete stochastic diagnostic rollout shards, actor latent score vectors,
-  cross-fitted reference-advantage/Fisher distortion, counterfactual SMAX
-  action branching with common random numbers, and empirical Bellman-closure
-  probes.
+  baseline-free full-return Monte Carlo/Fisher distortion, a cross-fitted
+  state-baseline sensitivity analysis, counterfactual SMAX action branching
+  with common random numbers, and empirical Bellman-closure probes.
 
 The diagnostic scripts intentionally run after training and never mutate model
 or optimizer state.
@@ -352,6 +352,19 @@ intensive: it collects 512 complete stochastic episodes per checkpoint, runs
 32 continuations for every candidate action at 256 anchor states, and fits 32
 Bellman source heads.  Smoke-test one run/checkpoint first:
 
+The primary latent reference is now
+`u * complete_discounted_mc_return`: it uses neither a fitted baseline nor a
+bootstrap target. The same 512 independent complete episodes are evaluated on
+nested 128/256/512-episode prefixes. Per-agent and aggregate gradient-direction,
+`epsilon_lat`, and `r_lat` convergence are saved to
+`mc_reference_convergence.csv`. A five-fold episode-disjoint state baseline is
+still evaluated on the identical full sample pool, but only under
+`cross_fitted_state_baseline_sensitivity` in
+`latent_distortion_mc_summary.json`; it is not the headline result. Existing
+legacy `latent_distortion_summary.json`, `compatibility_metrics.csv`, and
+`reference_advantages.npz` files are retained for provenance and are never
+silently treated as the new protocol.
+
 ```bash
 python scripts/run_h1_diagnostics.py \
   --run-root "$H1_REDUCED_ROOT" \
@@ -428,7 +441,27 @@ python scripts/plot_h1_mechanisms.py --run-root "$H1_RUN_ROOT"
 ```
 
 Raw arrays remain under `diagnostics_raw/`; merged tables and the diagnostic
-completion manifest are under `diagnostics_summary/`.
+completion manifest are under `diagnostics_summary/`. The new primary files are
+`compatibility_mc_metrics.csv`, `mc_reference_convergence.csv`,
+`latent_distortion_mc_summary.json`, and `reference_signals_mc.npz`. The
+control-variate comparison is also exported separately as
+`compatibility_crossfit_sensitivity_metrics.csv`.
+
+For an existing `diagnostics_raw/` tree that already contains the 512 complete
+rollouts, recompute only the new latent reference; collection, decision, and
+Bellman stages are reused unchanged:
+
+```bash
+python scripts/run_h1_diagnostics.py \
+  --run-root "$H1_REDUCED_ROOT" \
+  --gpus 0,1,2,3 \
+  --max-runs-per-gpu 1 \
+  --output-tree diagnostics_raw \
+  --stages latent
+python scripts/merge_h1_diagnostics.py --run-root "$H1_REDUCED_ROOT"
+python scripts/analyze_h1_mechanisms.py --run-root "$H1_REDUCED_ROOT"
+python scripts/plot_h1_mechanisms.py --run-root "$H1_REDUCED_ROOT"
+```
 
 ## Important interpretation details
 

@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # Imported as scripts.run_h1_diagnostics in tests.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STAGE_MARKERS = {
     "collect": "metadata.json",
-    "latent": "latent_distortion_summary.json",
+    "latent": "latent_distortion_mc_summary.json",
     "decision": "decision_summary.json",
     "bellman": "bellman_summary.json",
 }

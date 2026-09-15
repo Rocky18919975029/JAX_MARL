@@ -9,7 +9,9 @@ from pathlib import Path
 
 
 FILES = (
-    "compatibility_metrics.csv",
+    "compatibility_mc_metrics.csv",
+    "compatibility_crossfit_sensitivity_metrics.csv",
+    "mc_reference_convergence.csv",
     "decision_metrics.csv",
     "bellman_metrics.csv",
 )
