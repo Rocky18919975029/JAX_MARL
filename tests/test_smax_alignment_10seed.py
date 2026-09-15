@@ -64,3 +64,57 @@ def test_exact_prior_checkpoint_is_reused_but_mismatched_config_is_not(tmp_path)
     wrong["NUM_ENVS"] = 64
     (final / "config.json").write_text(json.dumps(wrong))
     assert reusable_tasks((tmp_path,), tasks, MANUAL_REFERENCE) == {}
+
+
+def test_legacy_checkpoint_without_align_distance_is_reused(tmp_path):
+    tasks = task_matrix(("10m_vs_11m",), ("nps",), (1,), 0.037)
+    target = next(task for task in tasks if task.condition == "c_to_a")
+    final = tmp_path / "checkpoints" / "legacy-mse" / "final"
+    final.mkdir(parents=True)
+    metadata = {
+        "map_name": target.map_name,
+        "seed": target.seed,
+        "actor_parameter_sharing": target.sharing,
+        "matched_comparison": True,
+        "align_mode": target.align_mode,
+        "alignment_coef": target.alignment_coef,
+        "condition": target.condition,
+    }
+    (final / "metadata.json").write_text(json.dumps(metadata))
+    (final / "config.json").write_text(json.dumps(MANUAL_REFERENCE))
+    (final / "model.safetensors").write_bytes(b"model")
+
+    assert reusable_tasks((tmp_path,), tasks, MANUAL_REFERENCE) == {
+        target.key: final
+    }
+
+
+def test_align_distance_can_be_recovered_from_legacy_config_or_condition(tmp_path):
+    tasks = task_matrix(("10m_vs_11m",), ("nps",), (1,), 0.037)
+    target = next(task for task in tasks if task.condition == "a_to_c_cka")
+    final = tmp_path / "checkpoints" / "legacy-cka" / "final"
+    final.mkdir(parents=True)
+    metadata = {
+        "map_name": target.map_name,
+        "seed": target.seed,
+        "actor_parameter_sharing": target.sharing,
+        "matched_comparison": True,
+        "align_mode": target.align_mode,
+        "alignment_coef": target.alignment_coef,
+        "condition": target.condition,
+    }
+    config = dict(MANUAL_REFERENCE)
+    config["ALIGN_DISTANCE"] = "linear_cka"
+    (final / "metadata.json").write_text(json.dumps(metadata))
+    (final / "config.json").write_text(json.dumps(config))
+    (final / "model.safetensors").write_bytes(b"model")
+
+    assert reusable_tasks((tmp_path,), tasks, MANUAL_REFERENCE) == {
+        target.key: final
+    }
+
+    config.pop("ALIGN_DISTANCE")
+    (final / "config.json").write_text(json.dumps(config))
+    assert reusable_tasks((tmp_path,), tasks, MANUAL_REFERENCE) == {
+        target.key: final
+    }

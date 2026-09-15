@@ -203,27 +203,50 @@ def reusable_tasks(roots, tasks, frozen, exclude_root=None):
                 continue
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            if metadata.get("matched_comparison") is not True:
+            matched = metadata.get(
+                "matched_comparison", config.get("MATCHED_COMPARISON")
+            )
+            if matched is not True:
                 continue
             if not matching_frozen_config(config, frozen):
                 continue
-            sharing = bool(metadata["actor_parameter_sharing"])
-            actor_label = "ps" if sharing else "nps"
-            align_mode = metadata["align_mode"]
-            distance = (
-                "distance_free" if align_mode == "none" else metadata["align_distance"]
+            sharing = metadata.get(
+                "actor_parameter_sharing", config.get("ACTOR_PARAMETER_SHARING")
             )
+            align_mode = metadata.get("align_mode", config.get("ALIGN_MODE"))
+            map_name = metadata.get("map_name", config.get("MAP_NAME"))
+            seed = metadata.get("seed", config.get("SEED"))
+            coefficient = metadata.get(
+                "alignment_coef", config.get("ALIGNMENT_COEF")
+            )
+            if None in (sharing, align_mode, map_name, seed, coefficient):
+                continue
+            actor_label = "ps" if sharing else "nps"
+            raw_distance = metadata.get(
+                "align_distance", config.get("ALIGN_DISTANCE")
+            )
+            if raw_distance is None:
+                condition = metadata.get(
+                    "condition", config.get("EXPERIMENT_CONDITION", "")
+                )
+                # ALIGN_DISTANCE did not exist before Linear CKA support. Such
+                # legacy aligned checkpoints are necessarily LN-MSE unless the
+                # explicitly recorded condition carries the later CKA suffix.
+                raw_distance = (
+                    "linear_cka" if str(condition).endswith("_cka") else "ln_mse"
+                )
+            distance = "distance_free" if align_mode == "none" else raw_distance
             key = (
-                metadata["map_name"],
+                map_name,
                 actor_label,
                 distance,
                 align_mode,
-                int(metadata["seed"]),
+                int(seed),
             )
             target = targets.get(key)
             if target is None:
                 continue
-            if not abs(float(metadata["alignment_coef"]) - target.alignment_coef) < 1e-12:
+            if not abs(float(coefficient) - target.alignment_coef) < 1e-12:
                 continue
             matches.setdefault(key, directory)
     return matches
