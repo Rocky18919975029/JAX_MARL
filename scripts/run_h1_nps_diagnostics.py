@@ -170,10 +170,6 @@ def phase_plan(args):
                     str(args.analysis_root.expanduser().resolve()),
                     "--fisher-ridge-absolute",
                     str(args.fisher_ridge_absolute),
-                    "--delta-dec",
-                    str(args.delta_dec),
-                    "--delta-bell",
-                    str(args.delta_bell),
                 ),
             ),
             Phase(
@@ -196,8 +192,6 @@ def main():
     parser.add_argument("--cka-root", type=Path, required=True)
     parser.add_argument("--analysis-root", type=Path, required=True)
     parser.add_argument("--fisher-ridge-absolute", type=float, required=True)
-    parser.add_argument("--delta-dec", type=float, required=True)
-    parser.add_argument("--delta-bell", type=float, required=True)
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--max-runs-per-gpu", type=int, default=1)
     parser.add_argument("--anchors", type=int, default=256)
@@ -210,8 +204,6 @@ def main():
         parser.error("--gpus must contain unique GPU IDs")
     if args.max_runs_per_gpu < 1 or args.fisher_ridge_absolute <= 0:
         parser.error("worker count and Fisher ridge must be positive")
-    if args.delta_dec < 0 or args.delta_bell < 0:
-        parser.error("non-inferiority tolerances must be non-negative")
 
     mse_root = args.mse_root.expanduser().resolve()
     cka_root = args.cka_root.expanduser().resolve()
@@ -240,7 +232,7 @@ def main():
     manifest_path = analysis_root / "recompute_manifest.json"
     manifest = {
         "schema_version": 1,
-        "analysis_protocol_version": "h1-nps-two-distance-v2.0",
+        "analysis_protocol_version": "h1-nps-two-distance-v2.1",
         "analysis_git_commit": analysis_commit,
         "training_protocol_version": "h1-v1.0",
         "actor_parameterization": "nps",
@@ -251,8 +243,7 @@ def main():
         "matched_frozen_training_config_sha256": frozen_sha256,
         "reference_protocol": "baseline_free_mc_return_train_matched_gae",
         "fisher_ridge_absolute": args.fisher_ridge_absolute,
-        "delta_dec": args.delta_dec,
-        "delta_bell": args.delta_bell,
+        "interpretation": "descriptive seed-paired trends without hard pass/fail",
         "anchors": args.anchors,
         "continuations": args.continuations,
         "bellman_heads": args.bellman_heads,

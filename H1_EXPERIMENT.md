@@ -4,7 +4,7 @@ This is the only active H1 analysis protocol in this repository. It uses
 non-parameter-sharing (NPS) actors and treats LN-MSE and Linear CKA as
 co-primary alignment-distance strata.
 The training checkpoints retain their `h1-v1.0` metadata; the new downstream
-measurement/analysis protocol is `h1-nps-two-distance-v2.0`.
+measurement/analysis protocol is `h1-nps-two-distance-v2.1`.
 
 ## Fixed matrix
 
@@ -57,7 +57,7 @@ rollout-boundary bootstrap:
 g_critic_i = mean(s_i,t * A_GAE_i,t)
 ```
 
-With a single preregistered absolute ridge `xi` shared by every task,
+With a single fixed absolute numerical ridge `xi` shared by every task,
 condition, distance, seed, and checkpoint:
 
 ```
@@ -93,19 +93,24 @@ The performance measurement is undiscounted episode return from those same 512
 held-out stochastic episodes. Thus performance and all three representation
 criteria use one frozen-checkpoint data protocol.
 
-## Required preregistration values
+## Fixed numerical setting and interpretation
 
-The values fixed before recomputation are:
+`FISHER_RIDGE_ABSOLUTE=0.001` is a numerical-stability setting used uniformly
+in every Fisher solve. It is not an H1 acceptance threshold.
+Conceptual tolerances `delta_A` and `delta_C` may describe functionally
+acceptable loss of actor or critic information in the theory, but this
+analysis does not turn them into numerical pass/fail cutoffs.
 
-- `FISHER_RIDGE_ABSOLUTE=0.001`: the fixed absolute Fisher ridge `xi`
-- `DELTA_DEC=0.05`: decision non-inferiority tolerance
-- `DELTA_BELL=0.005`: Bellman non-inferiority tolerance
+The prior v2.0 recomputation used `DELTA_DEC=0.05` and `DELTA_BELL=0.005` in a
+binary signature table. Those values remain historical metadata for that run;
+they are not used in the v2.1 mechanism interpretation.
 
-The launcher requires all three explicitly and writes them to
-`recompute_manifest.json` before processing and `analysis_protocol.json` in
-the final analysis. It never guesses them or tunes them from return.
+The measurement definitions are unchanged from the ongoing v2.0 recomputation.
+Let it finish before pulling this code on the server. Afterward, reuse its
+canonical latent, decision, and Bellman summaries and regenerate only the
+analysis and figures in a new directory:
 
-## Recompute from the existing collections
+## Reanalyze the completed measurements
 
 ```bash
 cd ~/JaxMARL
@@ -115,86 +120,71 @@ unset LD_LIBRARY_PATH
 
 export MSE_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs/reduced_nps_4condition"
 export CKA_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs/cka_distance_robustness"
-export H1_ANALYSIS_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs/nps_mse_cka_h1"
-mkdir -p "$H1_ANALYSIS_ROOT"
+export H1_TRENDS_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs/nps_mse_cka_h1_trends_v2p1"
 
-export FISHER_RIDGE_ABSOLUTE=0.001
-export DELTA_DEC=0.05
-export DELTA_BELL=0.005
-
-python scripts/run_h1_nps_diagnostics.py \
+python scripts/analyze_h1_mechanisms.py \
   --mse-root "$MSE_ROOT" \
   --cka-root "$CKA_ROOT" \
-  --analysis-root "$H1_ANALYSIS_ROOT" \
-  --fisher-ridge-absolute "$FISHER_RIDGE_ABSOLUTE" \
-  --delta-dec "$DELTA_DEC" \
-  --delta-bell "$DELTA_BELL" \
-  --gpus 0,1,2,3 \
-  --dry-run
+  --output-root "$H1_TRENDS_ROOT" \
+  --fisher-ridge-absolute 0.001
 
-nohup python -u scripts/run_h1_nps_diagnostics.py \
-  --mse-root "$MSE_ROOT" \
-  --cka-root "$CKA_ROOT" \
-  --analysis-root "$H1_ANALYSIS_ROOT" \
-  --fisher-ridge-absolute "$FISHER_RIDGE_ABSOLUTE" \
-  --delta-dec "$DELTA_DEC" \
-  --delta-bell "$DELTA_BELL" \
-  --gpus 0,1,2,3 \
-  > "$H1_ANALYSIS_ROOT/pipeline.stdout" 2>&1 &
+python scripts/plot_h1_mechanisms.py \
+  --analysis-root "$H1_TRENDS_ROOT"
 ```
 
-The pipeline never recollects trajectories. It skips a completed canonical
-stage by its output marker and runs the four selected GPUs in parallel.
-Before any processing, it also verifies both roots have identical frozen
-optimization configs and records their shared digest in the recompute manifest.
+This is analysis-only: it does not rerun training, collect, latent, decision,
+or Bellman diagnostics. It rejects incomplete canonical summaries and Fisher
+ridge mismatches rather than silently mixing protocols. For a fresh dataset
+with incomplete downstream markers, use `run_h1_nps_diagnostics.py` with the
+same roots, ridge, and a fresh analysis directory; its four-card launcher
+remains resumable and no longer accepts decision/Bellman tolerances.
 
-Monitor:
+For a separate full downstream recomputation, monitor its stage markers:
 
 ```bash
-tail -f "$H1_ANALYSIS_ROOT/pipeline.stdout"
-
-watch -n 10 '
-for ROOT in "'$MSE_ROOT'" "'$CKA_ROOT'"; do
+for ROOT in "$MSE_ROOT" "$CKA_ROOT"; do
   echo "===== $ROOT ====="
   printf "latent:   "; find "$ROOT/diagnostics_raw" -name latent_summary.json | wc -l
   printf "decision: "; find "$ROOT/diagnostics_raw" -name decision_summary.json | wc -l
   printf "bellman:  "; find "$ROOT/diagnostics_raw" -name bellman_summary.json | wc -l
 done
-nvidia-smi
-'
 ```
 
 Expected selected totals are `192/192/192` for LN-MSE and `128/128/128` for
 Linear CKA. LN-MSE may contain extra raw `joint` collections, but canonical
 markers for those runs are neither required nor generated.
 
-## Outputs and decision rule
+## Outputs and claim–evidence interpretation
 
 The combined analysis directory contains:
 
-- `analysis_protocol.json`: frozen scope, ridge, tolerances, roots, and seed unit
-- `recompute_manifest.json`: locked downstream settings for resumable processing
+- `analysis_protocol.json`: scope, fixed ridge, roots, and seed unit
 - `checkpoint_metrics.csv`: all four absolute measurements per seed/checkpoint
-  plus nested `M,2M,4M` reference-direction and distortion convergence audits
-- `curve_summary.csv`: seed mean, SD, SE, and 95% seed-bootstrap CI
-- `paired_effects.csv`: within-seed alignment-minus-`none` differences
-- `h1_signature.csv`: checkpoint-level confirmatory signature
+  plus nested `M,2M,4M` MC-convergence and decision-probe quality diagnostics
+- `curve_summary.csv`: seed mean, SD, SE, and descriptive 95% seed-bootstrap CI
+- `paired_effects.csv`: within-seed alignment-minus-`none` differences, without
+  condition pass/fail labels
+- `decision_probe_audit.csv`: Kendall tau, pairwise accuracy, top-1 agreement,
+  and test-anchor count for every seed/checkpoint
 - `seed_return_auc.csv` and `return_auc_paired_summary.csv`
 - `temporal_precedence_points.csv` and `temporal_precedence_summary.csv`
-- `figures/*.png` and `figures/*.pdf`: one four-panel figure per task/distance
+- `figures/*.png` and `figures/*.pdf`: absolute and paired curves showing each
+  seed plus mean/interval, and a separate decision-probe validity figure
 
 The statistical unit is always the training seed. Episodes and agent-time
 samples are never treated as independent experimental replicates.
 
-For a condition whose return improves over paired `none`, H1 requires:
+For a performance-improving alignment, inspect whether its seed-paired
+`epsilon_Lat` difference is usually negative at the same checkpoints and
+whether `epsilon_Dec` and `epsilon_Bell` lack clear, sustained worsening.
+This is a mechanism trend, not a binary non-inferiority trial or a causal
+proof. A gain without latent improvement cannot be explained by H1; a latent
+gain accompanied by persistent actor-decision or critic-Bellman degradation
+cannot support the phrase “without sacrificing.”
 
-```
-Delta epsilon_Lat < 0
-upper_CI(Delta epsilon_Dec) <= DELTA_DEC
-upper_CI(Delta epsilon_Bell) <= DELTA_BELL
-```
-
-`h1_signature.csv` records both mean-direction and stricter 95%-CI versions.
-Failure of a low-performing alignment is not itself evidence against H1; the
-test is whether a performance-improving condition exhibits the complete
-three-metric signature.
+Measurement validity is separate from trend direction. Random action ordering
+has expected Kendall tau `0`, pairwise accuracy `0.5`, and hence
+`epsilon_Dec=1`. If the decision probe stays near those levels, an unchanged
+`epsilon_Dec` does not establish preserved decision sufficiency. The validity
+figures show these reference lines; top-1 agreement is reported descriptively
+because its random baseline depends on the number of legal actions.

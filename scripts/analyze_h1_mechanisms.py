@@ -29,6 +29,11 @@ CHECKPOINT_STEPS = (
     10_000_000,
 )
 METRICS = ("heldout_return", "epsilon_lat", "epsilon_dec", "epsilon_bell")
+DECISION_AUDIT_METRICS = (
+    "decision_kendall_tau",
+    "decision_pairwise_accuracy",
+    "decision_top1_agreement",
+)
 
 
 def read_json(path):
@@ -127,6 +132,9 @@ def load_root(root, expected_distance, expected_conditions, ridge_absolute):
             ("epsilon_lat", latent["epsilon_lat"]),
             ("epsilon_dec", decision["epsilon_dec"]),
             ("epsilon_bell", bellman["epsilon_bell"]),
+            ("decision Kendall tau", decision["kendall_tau"]),
+            ("decision pairwise accuracy", decision["pairwise_accuracy"]),
+            ("decision top-1 agreement", decision["top1_agreement"]),
         ):
             if not math.isfinite(float(value)):
                 raise RuntimeError(f"Non-finite {label} in {directory}")
@@ -169,6 +177,12 @@ def load_root(root, expected_distance, expected_conditions, ridge_absolute):
                 "epsilon_lat": float(latent["epsilon_lat"]),
                 "epsilon_dec": float(decision["epsilon_dec"]),
                 "epsilon_bell": float(bellman["epsilon_bell"]),
+                "decision_kendall_tau": float(decision["kendall_tau"]),
+                "decision_pairwise_accuracy": float(decision["pairwise_accuracy"]),
+                "decision_top1_agreement": float(decision["top1_agreement"]),
+                "decision_num_test_anchor_agents": int(
+                    decision["num_test_anchor_agents"]
+                ),
                 "fisher_ridge_absolute": ridge_absolute,
                 "reference_protocol": REFERENCE_PROTOCOL,
                 "protocol_version": metadata["protocol_version"],
@@ -255,7 +269,7 @@ def validate_and_reuse_baseline(mse_rows, cka_rows):
 def curve_summary(rows, rng, repetitions):
     grouped = defaultdict(list)
     for row in rows:
-        for metric in METRICS:
+        for metric in (*METRICS, *DECISION_AUDIT_METRICS):
             grouped[
                 (
                     row["task"],
@@ -320,77 +334,6 @@ def paired_effects(rows, rng, repetitions):
                                 "seeds": ";".join(map(str, SEEDS)),
                             }
                         )
-    return output
-
-
-def h1_signatures(effects, delta_dec, delta_bell):
-    lookup = {
-        (
-            row["task"],
-            row["align_distance"],
-            row["condition"],
-            row["nominal_step"],
-            row["metric"],
-        ): row
-        for row in effects
-    }
-    output = []
-    for task in TASKS:
-        for distance in DISTANCES:
-            for condition in ("a_to_c", "c_to_a"):
-                for step in CHECKPOINT_STEPS:
-                    metrics = {
-                        metric: lookup[(task, distance, condition, step, metric)]
-                        for metric in METRICS
-                    }
-                    return_gain = metrics["heldout_return"]
-                    latent = metrics["epsilon_lat"]
-                    decision = metrics["epsilon_dec"]
-                    bellman = metrics["epsilon_bell"]
-                    mean_gain = return_gain["paired_mean_difference"] > 0
-                    strict_gain = return_gain["paired_ci95_low"] > 0
-                    mean_latent = latent["paired_mean_difference"] < 0
-                    strict_latent = latent["paired_ci95_high"] < 0
-                    decision_preserved = decision["paired_ci95_high"] <= delta_dec
-                    bellman_preserved = bellman["paired_ci95_high"] <= delta_bell
-                    output.append(
-                        {
-                            "task": task,
-                            "actor_parameterization": "nps",
-                            "align_distance": distance,
-                            "condition": condition,
-                            "baseline": "none",
-                            "nominal_step": step,
-                            "delta_return_mean": return_gain["paired_mean_difference"],
-                            "delta_epsilon_lat_mean": latent["paired_mean_difference"],
-                            "delta_epsilon_dec_mean": decision[
-                                "paired_mean_difference"
-                            ],
-                            "delta_epsilon_bell_mean": bellman[
-                                "paired_mean_difference"
-                            ],
-                            "return_mean_improved": mean_gain,
-                            "return_ci95_improved": strict_gain,
-                            "epsilon_lat_mean_reduced": mean_latent,
-                            "epsilon_lat_ci95_reduced": strict_latent,
-                            "delta_dec_tolerance": delta_dec,
-                            "epsilon_dec_noninferior": decision_preserved,
-                            "delta_bell_tolerance": delta_bell,
-                            "epsilon_bell_noninferior": bellman_preserved,
-                            "mean_signature_if_return_improved": (
-                                mean_latent and decision_preserved and bellman_preserved
-                                if mean_gain
-                                else "not_triggered"
-                            ),
-                            "strict_ci_signature_if_return_improved": (
-                                strict_latent
-                                and decision_preserved
-                                and bellman_preserved
-                                if strict_gain
-                                else "not_triggered"
-                            ),
-                        }
-                    )
     return output
 
 
@@ -537,15 +480,11 @@ def main():
     parser.add_argument("--cka-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--fisher-ridge-absolute", type=float, required=True)
-    parser.add_argument("--delta-dec", type=float, required=True)
-    parser.add_argument("--delta-bell", type=float, required=True)
     parser.add_argument("--bootstrap-seed", type=int, default=20260915)
     parser.add_argument("--bootstrap-repetitions", type=int, default=10_000)
     args = parser.parse_args()
     if args.fisher_ridge_absolute <= 0:
         parser.error("--fisher-ridge-absolute must be positive")
-    if args.delta_dec < 0 or args.delta_bell < 0:
-        parser.error("non-inferiority tolerances must be non-negative")
     if args.bootstrap_repetitions < 1:
         parser.error("--bootstrap-repetitions must be positive")
 
@@ -555,7 +494,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     protocol = {
         "schema_version": 1,
-        "analysis_protocol_version": "h1-nps-two-distance-v2.0",
+        "analysis_protocol_version": "h1-nps-two-distance-v2.1",
         "training_protocol_version": "h1-v1.0",
         "scope": "NPS only; LN-MSE and Linear CKA are co-primary distance strata",
         "mse_root": str(mse_root),
@@ -566,8 +505,14 @@ def main():
         "checkpoint_steps": CHECKPOINT_STEPS,
         "reference_protocol": REFERENCE_PROTOCOL,
         "fisher_ridge_absolute": args.fisher_ridge_absolute,
-        "delta_dec": args.delta_dec,
-        "delta_bell": args.delta_bell,
+        "interpretation": (
+            "descriptive seed-paired trends; no tolerance-based or CI-based "
+            "condition pass/fail"
+        ),
+        "decision_validity_audit": (
+            "Kendall tau and pairwise accuracy are shown against random "
+            "ordering expectations of 0 and 0.5"
+        ),
         "performance_source": "same 512 held-out stochastic diagnostic rollouts",
         "statistical_unit": "training seed",
         "baseline_reuse": "the same LN-MSE none run is reused for Linear CKA",
@@ -589,7 +534,6 @@ def main():
     rng = np.random.default_rng(args.bootstrap_seed)
     curves = curve_summary(rows, rng, args.bootstrap_repetitions)
     effects = paired_effects(rows, rng, args.bootstrap_repetitions)
-    signatures = h1_signatures(effects, args.delta_dec, args.delta_bell)
     seed_auc, auc_summary = auc_analysis(rows, rng, args.bootstrap_repetitions)
     temporal_points, temporal_summary = temporal_precedence(
         rows, rng, args.bootstrap_repetitions
@@ -598,7 +542,26 @@ def main():
     write_csv(output / "checkpoint_metrics.csv", rows)
     write_csv(output / "curve_summary.csv", curves)
     write_csv(output / "paired_effects.csv", effects)
-    write_csv(output / "h1_signature.csv", signatures)
+    write_csv(
+        output / "decision_probe_audit.csv",
+        [
+            {
+                key: row[key]
+                for key in (
+                    "task",
+                    "align_distance",
+                    "condition",
+                    "seed",
+                    "nominal_step",
+                    "decision_kendall_tau",
+                    "decision_pairwise_accuracy",
+                    "decision_top1_agreement",
+                    "decision_num_test_anchor_agents",
+                )
+            }
+            for row in rows
+        ],
+    )
     write_csv(output / "seed_return_auc.csv", seed_auc)
     write_csv(output / "return_auc_paired_summary.csv", auc_summary)
     write_csv(output / "temporal_precedence_points.csv", temporal_points)

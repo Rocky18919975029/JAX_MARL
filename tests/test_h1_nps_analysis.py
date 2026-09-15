@@ -1,10 +1,15 @@
 import numpy as np
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from scripts.analyze_h1_mechanisms import (
-    h1_signatures,
+    curve_summary,
     paired_effects,
     validate_and_reuse_baseline,
 )
+from scripts.plot_h1_mechanisms import draw_paired_panel, draw_raw_panel
 
 
 def fixture_rows():
@@ -35,21 +40,27 @@ def fixture_rows():
                                 "epsilon_lat": -float(aligned),
                                 "epsilon_dec": 0.005 * float(aligned),
                                 "epsilon_bell": 0.01 * float(aligned),
+                                "decision_kendall_tau": 0.25,
+                                "decision_pairwise_accuracy": 0.625,
+                                "decision_top1_agreement": 0.4,
                             }
                         )
     return rows
 
 
-def test_seed_paired_effects_and_signature_use_absolute_errors():
+def test_seed_paired_effects_are_descriptive_without_pass_fail():
     effects = paired_effects(fixture_rows(), np.random.default_rng(7), 100)
     assert len(effects) == 2 * 2 * 2 * 8 * 4
     assert {row["n_paired_seeds"] for row in effects} == {4}
     assert {row["seeds"] for row in effects} == {"1;2;3;4"}
-    signatures = h1_signatures(effects, delta_dec=0.01, delta_bell=0.02)
-    assert len(signatures) == 2 * 2 * 2 * 8
-    assert all(row["epsilon_dec_noninferior"] for row in signatures)
-    assert all(row["epsilon_bell_noninferior"] for row in signatures)
-    assert all(row["mean_signature_if_return_improved"] is True for row in signatures)
+    assert all("noninferior" not in row for row in effects)
+    assert all("signature" not in row for row in effects)
+    summary = curve_summary(fixture_rows(), np.random.default_rng(8), 100)
+    assert len(summary) == 2 * 2 * 3 * 8 * 7
+    assert {row["metric"] for row in summary} >= {
+        "decision_kendall_tau",
+        "decision_pairwise_accuracy",
+    }
 
 
 def test_cka_reuses_baseline_without_new_seed_replicates():
@@ -71,3 +82,27 @@ def test_cka_reuses_baseline_without_new_seed_replicates():
     assert len(combined) == 384
     assert len(reused) == 64
     assert all(row["align_distance"] == "linear_cka" for row in reused)
+
+
+def test_figures_overlay_four_seeds_and_show_decision_chance_reference():
+    rows = [
+        row for row in fixture_rows()
+        if row["task"] == "10m_vs_11m" and row["align_distance"] == "ln_mse"
+    ]
+    summaries = curve_summary(rows, np.random.default_rng(9), 100)
+    effects = paired_effects(fixture_rows(), np.random.default_rng(10), 100)
+    selected_effects = [
+        row for row in effects
+        if row["task"] == "10m_vs_11m" and row["align_distance"] == "ln_mse"
+    ]
+    figure, axis = plt.subplots()
+    draw_raw_panel(axis, summaries, rows, "decision_pairwise_accuracy", chance=0.5)
+    assert len(axis.lines) == 1 + 3 * (4 + 1)
+    assert float(axis.lines[0].get_ydata()[0]) == 0.5
+    plt.close(figure)
+
+    figure, axis = plt.subplots()
+    draw_paired_panel(axis, selected_effects, rows, "epsilon_lat")
+    assert len(axis.lines) == 1 + 2 * (4 + 1)
+    assert float(axis.lines[0].get_ydata()[0]) == 0.0
+    plt.close(figure)

@@ -15,8 +15,6 @@ def test_canonical_pipeline_reuses_collection_and_has_no_legacy_phases(tmp_path)
         gpus="0,1,2,3",
         max_runs_per_gpu=1,
         fisher_ridge_absolute=1e-3,
-        delta_dec=0.02,
-        delta_bell=0.05,
         anchors=256,
         continuations=32,
         bellman_heads=32,
@@ -36,6 +34,8 @@ def test_canonical_pipeline_reuses_collection_and_has_no_legacy_phases(tmp_path)
     command_text = "\n".join(" ".join(phase.command) for phase in phases)
     assert "--stages collect" not in command_text
     assert "deterministic" not in command_text
+    assert "--delta-dec" not in command_text
+    assert "--delta-bell" not in command_text
     assert str(Path(args.mse_root).resolve()) in command_text
     assert str(Path(args.cka_root).resolve()) in command_text
 
