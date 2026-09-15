@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--anchors", type=int, default=256)
     parser.add_argument("--continuations", type=int, default=32)
     parser.add_argument("--bellman-heads", type=int, default=32)
+    parser.add_argument("--fisher-ridge-absolute", type=float)
     args = parser.parse_args()
     stages = tuple(item.strip() for item in args.stages.split(",") if item.strip())
     unknown = set(stages) - {"collect", "latent", "decision", "bellman"}
@@ -66,10 +67,9 @@ def main():
             f"Diagnostic rollout missing: {output / 'metadata.json'}"
         )
 
-    if (
-        "latent" in stages
-        and not (output / "latent_distortion_mc_summary.json").is_file()
-    ):
+    if "latent" in stages and not (output / "latent_summary.json").is_file():
+        if args.fisher_ridge_absolute is None:
+            raise ValueError("The latent stage requires --fisher-ridge-absolute")
         run(
             [
                 sys.executable,
@@ -77,9 +77,9 @@ def main():
                 "--diagnostics-dir",
                 str(output),
                 "--output-csv",
-                str(output / "compatibility_mc_metrics.csv"),
-                "--reference-seed",
-                str(30_000 + diagnostic_seed),
+                str(output / "latent_metrics.csv"),
+                "--fisher-ridge-absolute",
+                str(args.fisher_ridge_absolute),
             ]
         )
     if "decision" in stages and not (output / "decision_summary.json").is_file():

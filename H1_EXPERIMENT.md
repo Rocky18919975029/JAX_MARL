@@ -1,47 +1,111 @@
-# H1 SMAX confirmatory experiment
+# H1 NPS representation-interaction experiment
 
-This repository implements the execution protocol in
-`H1_SMAX_EXPERIMENT_EXECUTION_MANUAL.md` on top of the existing matched MAPPO
-code.  The full distance-robustness matrix contains 200 LN-MSE runs (five
-alignment modes) plus 80 linear-CKA runs (the two directional modes), across
-two maps, PS/NPS actors, and seeds 101--110.  The distance-free `none` baseline
-is trained only in the LN-MSE matrix and reused, for 280 runs total.  Before that larger confirmatory study, the first
-formal stage is a locked reduced matrix: both maps, NPS only, the `none`
-baseline plus `c_to_a`, `a_to_c`, and `joint`, with seeds 1--4 (32 runs).
+This is the only active H1 analysis protocol in this repository. It uses
+non-parameter-sharing (NPS) actors and treats LN-MSE and Linear CKA as
+co-primary alignment-distance strata.
+The training checkpoints retain their `h1-v1.0` metadata; the new downstream
+measurement/analysis protocol is `h1-nps-two-distance-v2.0`.
 
-## What is implemented
+## Fixed matrix
 
-- Parameter-free per-sample LayerNorm followed by either coordinate-wise MSE
-  or agent-grouped linear CKA. CKA centers along each agent's
-  time-by-environment sample batch and compares relational geometry, avoiding
-  cross-agent basis mixing for independent actors.
-- Unchanged `a_to_c`, `c_to_a`, reciprocal, and joint stop-gradient routing
-  across both distances. Legacy shuffled controls remain testable but are
-  excluded from the 280-run distance-robustness matrix.
-- Return-independent gradient-scale calibration that probes LN-MSE and CKA on
-  the same initial rollout/minibatches and locks one global CKA coefficient.
-- Separate RL, cross-loss, total-gradient, clipping, parameter-update,
-  advantage, alive-fraction, training-return, and rollout-win diagnostics.
-- Initial, nominal 500k-step, and final checkpoints carrying exact actual
-  environment step, nominal step, Git commit, and protocol version.
-- Frozen-config and software-manifest tooling; resumable four-GPU launchers;
-  completion/failure manifests.
-- Paired-seed deterministic checkpoint evaluation and unsmoothed performance
-  AUC/bootstrap analysis.
-- Complete stochastic diagnostic rollout shards, actor latent score vectors,
-  baseline-free full-return Monte Carlo/Fisher distortion, a cross-fitted
-  state-baseline sensitivity analysis, counterfactual SMAX action branching
-  with common random numbers, and empirical Bellman-closure probes.
+- Tasks: `10m_vs_11m`, `smacv2_10_units`
+- Actor parameterization: NPS only
+- Conditions in each distance stratum: `none`, `a_to_c`, `c_to_a`
+- Training seeds: `1,2,3,4`
+- Alignment coefficient: the coefficient already frozen for each distance
+- Checkpoints: `0, 0.5M, 1M, 2M, 4M, 6M, 8M, 10M` environment steps
 
-The diagnostic scripts intentionally run after training and never mutate model
-or optimizer state.
+The `none` policy is independent of alignment distance. The exact same NPS
+LN-MSE `none` runs and held-out data are therefore reused as the Linear CKA
+baseline. They are not retrained and are not counted as new experimental
+replicates. `joint`, `reciprocal`, parameter-sharing, shuffled controls, and
+deterministic post-hoc evaluation are outside this H1 analysis.
+There are 40 unique trained runs (24 LN-MSE + 16 CKA), displayed as 48
+distance-stratified condition cells because the 8 `none` runs appear as the
+same comparator in both distance strata—not as independent observations.
+The Linear CKA coefficient was fixed by the earlier return-independent pilot
+gradient-scale calibration (pooled across PS/NPS pilot cells); it is not
+reselected for this NPS subset. The analyzer verifies LN-MSE uses `0.1` and
+all selected CKA runs use one identical coefficient.
 
-## One-time protocol preparation
+The existing held-out collection is sufficient:
 
-On the GPU server, the project checkout lives on a space-constrained disk.  All
-experiment outputs must therefore live under the data disk.  The canonical H1
-output root is `/home/data/zeshenghong/JaxMARL/h1_smax_runs`; the path inside
-the checkout is only a convenience symlink to that directory.  Prepare it once:
+- LN-MSE root: 192 selected checkpoints (the 64 `joint` checkpoints are ignored)
+- Linear CKA root: 128 selected checkpoints
+- Each checkpoint: 512 complete, independently sampled stochastic episodes
+
+## Canonical measurements
+
+For agent `i`, let
+
+```
+s_i,t = grad_{z^A_i,t} log pi_i(a_i,t | z^A_i,t)
+```
+
+The reference gradient uses raw complete Monte Carlo return-to-go and no
+baseline or bootstrap:
+
+```
+g_ref_i = mean(s_i,t * G_t)
+```
+
+The critic-induced gradient uses raw, unnormalized GAE reconstructed with the
+checkpoint's training `GAMMA`, `GAE_LAMBDA`, `NUM_STEPS`, termination mask, and
+rollout-boundary bootstrap:
+
+```
+g_critic_i = mean(s_i,t * A_GAE_i,t)
+```
+
+With a single preregistered absolute ridge `xi` shared by every task,
+condition, distance, seed, and checkpoint:
+
+```
+epsilon_Lat = sum_i (g_ref_i - g_critic_i)^T
+                    (F_i + xi I)^-1
+                    (g_ref_i - g_critic_i)
+F_i = mean(s_i,t s_i,t^T)
+```
+
+There is no relative latent-distortion statistic in H1. Nested `M,2M,4M`
+episode subsets are saved only as a Monte Carlo convergence audit.
+
+Actor decision sufficiency fits one independent probe per agent on
+episode-disjoint data and reports
+
+```
+epsilon_Dec = 1 - mean KendallTau(
+    counterfactual action values,
+    probe-predicted action values
+)
+```
+
+Lower is better. Critic Bellman compatibility uses a fixed bank of value heads,
+episode-disjoint decoder fitting, and reports the untruncated worst held-out
+latent residual:
+
+```
+epsilon_Bell = max_m E_test[(g_m(z_t^C) - y_m,t)^2]
+y_m,t = r_t + gamma * (1 - done_t) * f_m(z_t+1^C)
+```
+
+The performance measurement is undiscounted episode return from those same 512
+held-out stochastic episodes. Thus performance and all three representation
+criteria use one frozen-checkpoint data protocol.
+
+## Required preregistration values
+
+Before recomputation, choose and record these without looking at the new result:
+
+- `FISHER_RIDGE_ABSOLUTE`: the fixed `xi > 0`
+- `DELTA_DEC >= 0`: decision non-inferiority tolerance
+- `DELTA_BELL >= 0`: Bellman non-inferiority tolerance
+
+The launcher requires all three explicitly and writes them to
+`recompute_manifest.json` before processing and `analysis_protocol.json` in
+the final analysis. It never guesses them or tunes them from return.
+
+## Recompute from the existing collections
 
 ```bash
 cd ~/JaxMARL
@@ -49,430 +113,89 @@ git pull --ff-only
 conda activate jaxmarl
 unset LD_LIBRARY_PATH
 
-export H1_DATA_ROOT="/home/data/zeshenghong/JaxMARL"
-export H1_RUN_ROOT="$H1_DATA_ROOT/h1_smax_runs"
-export H1_PROJECT_LINK="$HOME/JaxMARL/h1_smax_runs"
+export MSE_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs/reduced_nps_4condition"
+export CKA_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs/cka_distance_robustness"
+export H1_ANALYSIS_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs/nps_mse_cka_h1"
+mkdir -p "$H1_ANALYSIS_ROOT"
 
-mkdir -p "$H1_DATA_ROOT"
+# Fill these with the values fixed before inspecting the recomputed metrics.
+export FISHER_RIDGE_ABSOLUTE="<xi>"
+export DELTA_DEC="<delta_A>"
+export DELTA_BELL="<delta_C>"
 
-if [ -L "$H1_PROJECT_LINK" ]; then
-  test "$H1_PROJECT_LINK" -ef "$H1_RUN_ROOT" || {
-    echo "Existing symlink points somewhere else: $H1_PROJECT_LINK"
-    exit 1
-  }
-elif [ -e "$H1_PROJECT_LINK" ]; then
-  test ! -e "$H1_RUN_ROOT" || {
-    echo "Both project and data-disk output directories exist; merge manually."
-    exit 1
-  }
-  mv "$H1_PROJECT_LINK" "$H1_RUN_ROOT"
-  ln -s "$H1_RUN_ROOT" "$H1_PROJECT_LINK"
-else
-  mkdir -p "$H1_RUN_ROOT"
-  ln -s "$H1_RUN_ROOT" "$H1_PROJECT_LINK"
-fi
-
-test "$H1_PROJECT_LINK" -ef "$H1_RUN_ROOT"
-echo "Resolved output root: $(readlink -f "$H1_PROJECT_LINK")"
-df -h "$H1_RUN_ROOT"
-```
-
-The `mv` branch preserves an existing protocol-test or smoke-test directory by
-moving it to the data disk before creating the link.  It deliberately stops if
-both locations already exist, because silently merging two experiment trees is
-unsafe.  In every new shell, export `H1_RUN_ROOT` again.  The launcher resolves
-symlinks and puts checkpoints, stdout logs, status files, W&B local
-data/cache/artifact staging, and Hydra run metadata below this data-disk root.
-The printed canonical path may begin with `/mnt/sda` when `/home/data` itself is
-a mount alias; `test -ef` verifies directory identity without relying on the
-spelling of those two equivalent paths.
-
-Freeze the exact W&B pilot baseline config that generated the pilot curves.
-The source may be a JSON export or W&B's local `files/config.yaml`:
-
-```bash
-python scripts/h1_protocol.py freeze \
-  --source /absolute/path/to/pilot/config.yaml \
-  --run-root "$H1_RUN_ROOT"
-```
-
-If the pilot artifact is unavailable, the documented second-priority fallback
-is the repository YAML.  Its legacy default has `MATCHED_COMPARISON=false`, so
-the required protocol change must be explicit and is recorded in
-`deviations.md`:
-
-```bash
-python scripts/h1_protocol.py freeze \
-  --source baselines/MAPPO/config/mappo_homogenous_rnn_smax.yaml \
-  --override MATCHED_COMPARISON=true \
-  --run-root "$H1_RUN_ROOT"
-```
-
-Capture the machine state and execute the acceptance tests:
-
-```bash
-python scripts/h1_protocol.py manifest --run-root "$H1_RUN_ROOT"
-
-CUDA_VISIBLE_DEVICES=0 \
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
-python scripts/run_h1_protocol_tests.py --run-root "$H1_RUN_ROOT"
-```
-
-The tests create:
-
-```text
-protocol/tests/shuffled_target_audit.json
-protocol/tests/alignment_gradient_audit.json
-protocol/tests/latent_distortion_audit.json
-protocol/tests/matched_initialization_audit.json
-```
-
-Do not start confirmatory training unless both report `pass` and the frozen
-Git commit matches the checked-out commit.
-
-## Reduced first formal stage (32 runs)
-
-This profile deliberately contains no PS actors, reciprocal, or shuffled
-controls.  The `none` condition supplies the seed-paired NPS baseline for all
-three selected alignment modes.
-Use a separate root and W&B project so it cannot be mixed with a later full
-confirmatory matrix:
-
-```bash
-export H1_REDUCED_ROOT="$H1_RUN_ROOT/reduced_nps_4condition"
-
-python scripts/h1_protocol.py freeze \
-  --source baselines/MAPPO/config/mappo_homogenous_rnn_smax.yaml \
-  --override MATCHED_COMPARISON=true \
-  --run-root "$H1_REDUCED_ROOT"
-
-python scripts/h1_protocol.py manifest --run-root "$H1_REDUCED_ROOT"
-
-CUDA_VISIBLE_DEVICES=0 \
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
-python scripts/run_h1_protocol_tests.py --run-root "$H1_REDUCED_ROOT"
-```
-
-Preview the exact 32-run matrix before launching:
-
-```bash
-python scripts/run_h1_smax_confirmatory.py \
-  --matrix-profile reduced-nps-4condition \
-  --run-root "$H1_REDUCED_ROOT" \
-  --maps 10m_vs_11m,smacv2_10_units \
-  --actor-variants nps \
-  --conditions none,c_to_a,a_to_c,joint \
-  --seeds 1-4 \
+python scripts/run_h1_nps_diagnostics.py \
+  --mse-root "$MSE_ROOT" \
+  --cka-root "$CKA_ROOT" \
+  --analysis-root "$H1_ANALYSIS_ROOT" \
+  --fisher-ridge-absolute "$FISHER_RIDGE_ABSOLUTE" \
+  --delta-dec "$DELTA_DEC" \
+  --delta-bell "$DELTA_BELL" \
   --gpus 0,1,2,3 \
-  --max-runs-per-gpu 5 \
   --dry-run
-```
 
-Then launch it online in W&B.  Twenty runs start immediately (five per GPU),
-and the remaining twelve start as capacity becomes available:
-
-```bash
-nohup python scripts/run_h1_smax_confirmatory.py \
-  --matrix-profile reduced-nps-4condition \
-  --run-root "$H1_REDUCED_ROOT" \
-  --maps 10m_vs_11m,smacv2_10_units \
-  --actor-variants nps \
-  --conditions none,c_to_a,a_to_c,joint \
-  --seeds 1-4 \
+nohup python -u scripts/run_h1_nps_diagnostics.py \
+  --mse-root "$MSE_ROOT" \
+  --cka-root "$CKA_ROOT" \
+  --analysis-root "$H1_ANALYSIS_ROOT" \
+  --fisher-ridge-absolute "$FISHER_RIDGE_ABSOLUTE" \
+  --delta-dec "$DELTA_DEC" \
+  --delta-bell "$DELTA_BELL" \
   --gpus 0,1,2,3 \
-  --max-runs-per-gpu 5 \
-  > "$H1_REDUCED_ROOT/training.stdout" 2>&1 &
+  > "$H1_ANALYSIS_ROOT/pipeline.stdout" 2>&1 &
 ```
 
-The profile rejects any different seed, actor, condition, or map selection.
-Runs are named `H1-reduced-{map}-nps-{condition}-lam0p1-seed{seed}` in the
-`h1-smax-reduced-nps-4condition` W&B project.  Each
-`H1-reduced-{map}-nps-{condition}-lam0p1` W&B group contains exactly the four
-seeds for one task/condition pair, so grouping a chart by `Group` produces eight
-mean curves rather than averaging different alignment modes together.
+The pipeline never recollects trajectories. It skips a completed canonical
+stage by its output marker and runs the four selected GPUs in parallel.
+Before any processing, it also verifies both roots have identical frozen
+optimization configs and records their shared digest in the recompute manifest.
 
-The paired linear-CKA robustness run uses the same two maps, NPS actor,
-frozen training configuration, and seeds 1--4 as the reduced LN-MSE run. The
-locked `reduced-nps-cka` profile contains only `c_to_a_cka` and `a_to_c_cka`
-(16 runs total); the distance-free `none` runs are reused.
-
-### CKA checkpoint diagnostics on the GPU server
-
-After the 16 CKA training runs finish, run the same four-stage diagnostic
-protocol on their 128 preregistered checkpoints. The orchestrator validates the
-two maps, NPS actor, two CKA directions, seeds 1--4, and every checkpoint
-before writing anything. It uses 512 rollout episodes per checkpoint, 256
-counterfactual anchors with 32 continuations, and 32 Bellman heads. Collection
-uses two workers per GPU; latent, decision, Bellman, and deterministic evaluation
-use one worker per GPU. Completed stage markers and evaluation JSON files are
-skipped when the same command is run again; a partially interrupted rollout is
-recollected into its checkpoint directory.
-
-Run these commands **on the server after pulling this repository**. All output
-remains on the data disk; `$HOME/JaxMARL/h1_smax_runs` is only a symlink to it.
+Monitor:
 
 ```bash
-cd "$HOME/JaxMARL"
-git pull --ff-only
-conda activate jaxmarl
-unset LD_LIBRARY_PATH
+tail -f "$H1_ANALYSIS_ROOT/pipeline.stdout"
 
-CKA_RUN_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/cka_distance_robustness
-python scripts/run_h1_cka_diagnostics.py --run-root "$CKA_RUN_ROOT" --dry-run
-
-nohup python -u scripts/run_h1_cka_diagnostics.py \
-  --run-root "$CKA_RUN_ROOT" \
-  --gpus 0,1,2,3 \
-  --collect-per-gpu 2 \
-  > "$CKA_RUN_ROOT/diagnostics_pipeline.stdout" 2>&1 < /dev/null &
-echo "CKA diagnostics manager PID: $!"
+watch -n 10 '
+for ROOT in "'$MSE_ROOT'" "'$CKA_ROOT'"; do
+  echo "===== $ROOT ====="
+  printf "latent:   "; find "$ROOT/diagnostics_raw" -name latent_summary.json | wc -l
+  printf "decision: "; find "$ROOT/diagnostics_raw" -name decision_summary.json | wc -l
+  printf "bellman:  "; find "$ROOT/diagnostics_raw" -name bellman_summary.json | wc -l
+done
+nvidia-smi
+'
 ```
 
-Monitor `tail -f "$CKA_RUN_ROOT/diagnostics_pipeline.stdout"` or
-`tail -f "$CKA_RUN_ROOT/logs/diagnostics/launcher.log"`. The final pipeline
-also evaluates the 128 checkpoints deterministically (256 episodes each),
-merges per-checkpoint diagnostics, and writes
-`analysis/mechanism_curve_summary.csv` plus figures. Because `none` is reused
-from the LN-MSE matrix rather than rerun here, CKA-only paired-baseline tables
-are intentionally empty; cross-distance paired comparisons should join on
-task, NPS, seed, and checkpoint step with the reduced LN-MSE analysis tables.
+Expected selected totals are `192/192/192` for LN-MSE and `128/128/128` for
+Linear CKA. LN-MSE may contain extra raw `joint` collections, but canonical
+markers for those runs are neither required nor generated.
 
-## Full confirmatory training (deferred)
+## Outputs and decision rule
 
-First calibrate the single CKA coefficient.  Seed 9001 is a pilot seed and is
-not one of the confirmatory seeds.  Each of the eight cells computes both
-distance gradients on the exact same initial parameters and rollout.  `LR=0`
-holds parameters fixed across the frozen-config minibatches.  The global
-coefficient matches the pooled RMS cross/RL gradient ratio of LN-MSE at 0.1;
-returns are neither read nor written into the selection rule.
+The combined analysis directory contains:
 
-```bash
-export CKA_CALIBRATION_ROOT="$H1_RUN_ROOT/cka_gradient_calibration"
+- `analysis_protocol.json`: frozen scope, ridge, tolerances, roots, and seed unit
+- `recompute_manifest.json`: locked downstream settings for resumable processing
+- `checkpoint_metrics.csv`: all four absolute measurements per seed/checkpoint
+  plus nested `M,2M,4M` reference-direction and distortion convergence audits
+- `curve_summary.csv`: seed mean, SD, SE, and 95% seed-bootstrap CI
+- `paired_effects.csv`: within-seed alignment-minus-`none` differences
+- `h1_signature.csv`: checkpoint-level confirmatory signature
+- `seed_return_auc.csv` and `return_auc_paired_summary.csv`
+- `temporal_precedence_points.csv` and `temporal_precedence_summary.csv`
+- `figures/*.png` and `figures/*.pdf`: one four-panel figure per task/distance
 
-python scripts/calibrate_h1_cka.py \
-  --frozen-config "$H1_RUN_ROOT/protocol/frozen_training_config.json" \
-  --output-root "$CKA_CALIBRATION_ROOT" \
-  --pilot-seed 9001 \
-  --gpus 0,1,2,3
+The statistical unit is always the training seed. Episodes and agent-time
+samples are never treated as independent experimental replicates.
 
-export CKA_CALIBRATION="$CKA_CALIBRATION_ROOT/cka_gradient_calibration.json"
-python -m json.tool "$CKA_CALIBRATION"
+For a condition whose return improves over paired `none`, H1 requires:
+
+```
+Delta epsilon_Lat < 0
+upper_CI(Delta epsilon_Dec) <= DELTA_DEC
+upper_CI(Delta epsilon_Bell) <= DELTA_BELL
 ```
 
-Phase 1 runs seeds 101--102.  Five concurrent runs per 24 GB GPU matches the
-capacity previously validated on the four RTX 4090 server; lower it if another
-process uses memory.
-
-```bash
-nohup python scripts/run_h1_smax_confirmatory.py \
-  --run-root "$H1_RUN_ROOT" \
-  --cka-calibration "$CKA_CALIBRATION" \
-  --seeds 101-102 \
-  --gpus 0,1,2,3 \
-  --max-runs-per-gpu 5 \
-  > "$H1_RUN_ROOT/phase1.stdout" 2>&1 &
-```
-
-After checking all phase-1 status files, checkpoints, W&B groups, and a small
-evaluation/diagnostic smoke test, launch the locked second phase:
-
-```bash
-nohup python scripts/run_h1_smax_confirmatory.py \
-  --run-root "$H1_RUN_ROOT" \
-  --cka-calibration "$CKA_CALIBRATION" \
-  --seeds 103-110 \
-  --gpus 0,1,2,3 \
-  --max-runs-per-gpu 5 \
-  > "$H1_RUN_ROOT/phase2.stdout" 2>&1 &
-```
-
-Monitor without attaching to child processes:
-
-```bash
-tail -f "$H1_RUN_ROOT/launcher.log"
-watch -n 2 nvidia-smi
-```
-
-LN-MSE runs are named
-`H1-{map}-{ps_or_nps}-{condition}-lam0p1-seed{seed}`. CKA conditions are named
-`a_to_c_cka` / `c_to_a_cka` and record the calibrated coefficient in both the
-run name and W&B config. The launcher is
-resumable: a rerun skips status records already marked `completed` and never
-silently substitutes a seed.
-
-## Deterministic performance evaluation
-
-After all selected training runs finish:
-
-For the reduced stage, use `H1_REDUCED_ROOT` in place of `H1_RUN_ROOT` in all
-evaluation, diagnostic, merge, analysis, and plotting commands below.  Its
-four seeds remain the independent statistical units.
-
-```bash
-nohup python scripts/eval_h1_checkpoints.py \
-  --run-root "$H1_RUN_ROOT" \
-  --gpus 0,1,2,3 \
-  --max-runs-per-gpu 1 \
-  --episodes 256 \
-  --num-envs 128 \
-  > "$H1_RUN_ROOT/evaluation.stdout" 2>&1 &
-```
-
-This evaluates `initial`, 500k, 1M, 2M, 4M, 6M, 8M, and `final` using paired
-evaluation seeds.  Aggregate the raw JSON files with:
-
-```bash
-python scripts/analyze_h1_performance.py --run-root "$H1_RUN_ROOT"
-```
-
-The resulting CSV files and unsmoothed PNG/PDF figures live under `analysis/`.
-Bootstrap and shaded intervals use training seeds as the independent units.
-
-For dense visualization at every saved 500k checkpoint, rerun the resumable
-launcher with `--all-checkpoints`. Existing preregistered JSON files are kept
-and only the additional checkpoints are evaluated. The performance plots use
-all available points, while confirmatory AUC and endpoint statistics retain the
-frozen preregistered checkpoint grid.
-
-```bash
-nohup python scripts/eval_h1_checkpoints.py \
-  --run-root "$H1_REDUCED_ROOT" \
-  --gpus 0,1,2,3 \
-  --max-runs-per-gpu 5 \
-  --episodes 256 \
-  --num-envs 128 \
-  --all-checkpoints \
-  > "$H1_REDUCED_ROOT/evaluation_dense.stdout" 2>&1 &
-```
-
-## Mechanism diagnostics
-
-The full preregistered mechanism suite is computationally and storage
-intensive: it collects 512 complete stochastic episodes per checkpoint, runs
-32 continuations for every candidate action at 256 anchor states, and fits 32
-Bellman source heads.  Smoke-test one run/checkpoint first:
-
-The primary latent reference is now
-`u * complete_discounted_mc_return`: it uses neither a fitted baseline nor a
-bootstrap target. The same 512 independent complete episodes are evaluated on
-nested 128/256/512-episode prefixes. Per-agent and aggregate gradient-direction,
-`epsilon_lat`, and `r_lat` convergence are saved to
-`mc_reference_convergence.csv`. A five-fold episode-disjoint state baseline is
-still evaluated on the identical full sample pool, but only under
-`cross_fitted_state_baseline_sensitivity` in
-`latent_distortion_mc_summary.json`; it is not the headline result. Existing
-legacy `latent_distortion_summary.json`, `compatibility_metrics.csv`, and
-`reference_advantages.npz` files are retained for provenance and are never
-silently treated as the new protocol.
-
-```bash
-python scripts/run_h1_diagnostics.py \
-  --run-root "$H1_REDUCED_ROOT" \
-  --run-name-glob 'H1-reduced-10m_vs_11m-nps-none-lam0p1-seed1' \
-  --checkpoint-name-glob final \
-  --gpus 0 \
-  --output-tree diagnostics_smoke \
-  --stages collect,latent,decision,bellman \
-  --episodes 16 \
-  --batch-size 4 \
-  --anchors 6 \
-  --continuations 2 \
-  --bellman-heads 2 \
-  --allow-missing
-```
-
-The smoke output is isolated under `diagnostics_smoke/`; the formal run uses
-the default `diagnostics_raw/` tree. Run the formal suite with:
-
-```bash
-nohup python scripts/run_h1_diagnostics.py \
-  --run-root "$H1_RUN_ROOT" \
-  --gpus 0,1,2,3 \
-  --max-runs-per-gpu 1 \
-  --episodes 512 \
-  --batch-size 64 \
-  --anchors 256 \
-  --continuations 32 \
-  --bellman-heads 32 \
-  > "$H1_RUN_ROOT/diagnostics.stdout" 2>&1 &
-```
-
-The diagnostic launcher deliberately runs frozen-policy rollouts and
-counterfactual environment branches with `JAX_ENABLE_X64=false`, matching the
-float32 training/checkpoint dtype. Fisher and bootstrap/statistical operations
-that require additional precision explicitly promote their inputs to NumPy
-float64 inside the corresponding analysis scripts.
-
-For better hardware utilization, the exact same formal protocol can be run in
-four resumable phases. Collection can use two workers per GPU; CPU-heavy latent
-analysis and the GPU-heavy decision/Bellman stages use one worker per GPU. The
-launcher automatically caps BLAS threads across active worker slots, caches
-ridge-independent Fisher statistics, batches all agents in each counterfactual
-anchor, and trains Bellman heads in multi-update device blocks. These are
-execution optimizations only: episode, anchor, continuation, head, seed, and
-checkpoint budgets are unchanged.
-
-```bash
-python scripts/run_h1_diagnostics.py --run-root "$H1_REDUCED_ROOT" \
-  --gpus 0,1,2,3 --max-runs-per-gpu 2 --output-tree diagnostics_raw \
-  --stages collect --episodes 512 --batch-size 64
-
-python scripts/run_h1_diagnostics.py --run-root "$H1_REDUCED_ROOT" \
-  --gpus 0,1,2,3 --max-runs-per-gpu 1 --output-tree diagnostics_raw \
-  --stages latent
-
-python scripts/run_h1_diagnostics.py --run-root "$H1_REDUCED_ROOT" \
-  --gpus 0,1,2,3 --max-runs-per-gpu 1 --output-tree diagnostics_raw \
-  --stages decision --anchors 256 --continuations 32
-
-python scripts/run_h1_diagnostics.py --run-root "$H1_REDUCED_ROOT" \
-  --gpus 0,1,2,3 --max-runs-per-gpu 1 --output-tree diagnostics_raw \
-  --stages bellman --bellman-heads 32
-```
-
-Stages can be scheduled separately with, for example,
-`--stages collect,latent`.  Merge immutable per-checkpoint CSV files after all
-workers finish:
-
-```bash
-python scripts/merge_h1_diagnostics.py --run-root "$H1_RUN_ROOT"
-python scripts/analyze_h1_mechanisms.py --run-root "$H1_RUN_ROOT"
-python scripts/plot_h1_mechanisms.py --run-root "$H1_RUN_ROOT"
-```
-
-Raw arrays remain under `diagnostics_raw/`; merged tables and the diagnostic
-completion manifest are under `diagnostics_summary/`. The new primary files are
-`compatibility_mc_metrics.csv`, `mc_reference_convergence.csv`,
-`latent_distortion_mc_summary.json`, and `reference_signals_mc.npz`. The
-control-variate comparison is also exported separately as
-`compatibility_crossfit_sensitivity_metrics.csv`.
-
-For an existing `diagnostics_raw/` tree that already contains the 512 complete
-rollouts, recompute only the new latent reference; collection, decision, and
-Bellman stages are reused unchanged:
-
-```bash
-python scripts/run_h1_diagnostics.py \
-  --run-root "$H1_REDUCED_ROOT" \
-  --gpus 0,1,2,3 \
-  --max-runs-per-gpu 1 \
-  --output-tree diagnostics_raw \
-  --stages latent
-python scripts/merge_h1_diagnostics.py --run-root "$H1_REDUCED_ROOT"
-python scripts/analyze_h1_mechanisms.py --run-root "$H1_REDUCED_ROOT"
-python scripts/plot_h1_mechanisms.py --run-root "$H1_REDUCED_ROOT"
-```
-
-## Important interpretation details
-
-- `returns` and `win_rate` logged during training are rollout metrics, not the
-  formal deterministic evaluation curves.
-- `smacv2_10_units` here is the SMACv2-style task implemented in SMAX, not the
-  original PySC2 SMACv2 environment.
-- `c_to_a` means critic target to actor recipient; `a_to_c` means actor target
-  to critic recipient.
-- The actual number of environment transitions is quantized by
-  `NUM_ENVS * NUM_STEPS`.  Checkpoint directories use the preregistered nominal
-  boundary, while `metadata.json` records the exact update-complete step.
-- W&B smoothing is for viewing only.  All reported statistics are regenerated
-  from local per-episode evaluation JSON and per-seed diagnostic files.
+`h1_signature.csv` records both mean-direction and stricter 95%-CI versions.
+Failure of a low-performing alignment is not itself evidence against H1; the
+test is whether a performance-improving condition exhibits the complete
+three-metric signature.

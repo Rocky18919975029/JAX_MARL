@@ -66,41 +66,22 @@ def action_score(actor_params, latent, available_actions, action):
     )(latent)
 
 
-def compute_advantages_and_returns(arrays, gamma, gae_lambda):
+def compute_complete_mc_returns(arrays, gamma):
     rewards = arrays["reward"]
-    values = arrays["value"]
     global_done = arrays["global_done"]
     active = arrays["active"]
-    episodes, steps, agents = rewards.shape
-    advantages = np.zeros_like(values, dtype=np.float32)
-    mc_returns = np.zeros_like(values, dtype=np.float32)
+    episodes, steps, _ = rewards.shape
+    mc_returns = np.zeros_like(rewards, dtype=np.float32)
     for episode in range(episodes):
-        gae = np.zeros((agents,), dtype=np.float64)
-        next_value = np.zeros((agents,), dtype=np.float64)
         future_return = 0.0
         for timestep in range(steps - 1, -1, -1):
             if not active[episode, timestep]:
                 continue
             terminal = float(global_done[episode, timestep])
             reward = rewards[episode, timestep].astype(np.float64)
-            delta = (
-                reward
-                + gamma * next_value * (1.0 - terminal)
-                - values[episode, timestep]
-            )
-            gae = delta + gamma * gae_lambda * (1.0 - terminal) * gae
-            advantages[episode, timestep] = gae
-            next_value = values[episode, timestep]
             future_return = float(reward[0]) + gamma * (1.0 - terminal) * future_return
             mc_returns[episode, timestep] = future_return
-    valid = np.broadcast_to(active[..., None], advantages.shape)
-    mean = float(advantages[valid].mean())
-    std = float(advantages[valid].std())
-    normalized = (advantages - mean) / (std + 1e-8)
-    arrays["gae_raw"] = advantages
-    arrays["gae_normalized_diagnostic_batch"] = normalized.astype(np.float32)
     arrays["mc_return"] = mc_returns
-    return {"advantage_mean": mean, "advantage_std": std}
 
 
 def make_collector(config, checkpoint, batch_size):
@@ -345,9 +326,7 @@ def main():
         arrays["diagnostic_episode_id"] = np.arange(
             episodes_written, episodes_written + keep, dtype=np.int32
         )
-        advantage_stats = compute_advantages_and_returns(
-            arrays, float(config["GAMMA"]), float(config["GAE_LAMBDA"])
-        )
+        compute_complete_mc_returns(arrays, float(config["GAMMA"]))
         shard_path = output / f"episodes_{shard_index:04d}.npz"
         np.savez_compressed(shard_path, **arrays)
         shard_metadata.append(
@@ -355,7 +334,6 @@ def main():
                 "path": shard_path.name,
                 "first_episode_id": episodes_written,
                 "episodes": keep,
-                **advantage_stats,
             }
         )
         episodes_written += keep
@@ -384,12 +362,11 @@ def main():
         "align_distance": config.get("ALIGN_DISTANCE", "ln_mse"),
         "matrix_profile": config.get("MATRIX_PROFILE", ""),
         "alignment_coef": config["ALIGNMENT_COEF"],
+        "gamma": float(config["GAMMA"]),
+        "gae_lambda": float(config["GAE_LAMBDA"]),
+        "training_rollout_steps": int(config["NUM_STEPS"]),
         "protocol_version": config.get("PROTOCOL_VERSION", ""),
         "git_commit": config.get("GIT_COMMIT", ""),
-        "advantage_normalization_note": (
-            "gae_normalized_diagnostic_batch uses all active diagnostic samples; "
-            "it is not the historical training minibatch normalization"
-        ),
         "axis_convention": {
             "trajectory_arrays": "episode,timestep,agent,...",
             "environment_state_arrays": "episode,timestep,unit,...",

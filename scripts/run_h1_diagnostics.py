@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # Imported as scripts.run_h1_diagnostics in tests.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STAGE_MARKERS = {
     "collect": "metadata.json",
-    "latent": "latent_distortion_mc_summary.json",
+    "latent": "latent_summary.json",
     "decision": "decision_summary.json",
     "bellman": "bellman_summary.json",
 }
@@ -72,11 +72,21 @@ def main():
     parser.add_argument("--output-tree", default="diagnostics_raw")
     parser.add_argument("--run-name-glob", default="H1-*")
     parser.add_argument("--checkpoint-name-glob", default="*")
+    parser.add_argument(
+        "--conditions",
+        help="Comma-separated EXPERIMENT_CONDITION values to include",
+    )
+    parser.add_argument("--align-distance", choices=("ln_mse", "linear_cka"))
     parser.add_argument("--episodes", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--anchors", type=int, default=256)
     parser.add_argument("--continuations", type=int, default=32)
     parser.add_argument("--bellman-heads", type=int, default=32)
+    parser.add_argument(
+        "--fisher-ridge-absolute",
+        type=float,
+        help="Pre-fixed absolute xi in F + xi I; required for the latent stage",
+    )
     parser.add_argument(
         "--cpu-threads-per-worker",
         type=int,
@@ -99,18 +109,40 @@ def main():
     unknown = set(stages) - set(STAGE_MARKERS)
     if unknown:
         raise ValueError(f"Unknown stages: {sorted(unknown)}")
+    if "latent" in stages and (
+        args.fisher_ridge_absolute is None or args.fisher_ridge_absolute <= 0
+    ):
+        raise ValueError("The latent stage requires a positive --fisher-ridge-absolute")
     tasks, missing = discover_tasks(run_root)
     if missing and not args.allow_missing:
         raise RuntimeError(
             f"{len(missing)} preregistered checkpoints are missing; finish training "
             "or pass --allow-missing for a partial diagnostic batch"
         )
-    tasks = [
-        task
-        for task in tasks
-        if fnmatch.fnmatch(task.run_name, args.run_name_glob)
-        and fnmatch.fnmatch(task.checkpoint_dir.name, args.checkpoint_name_glob)
-    ]
+    conditions = (
+        {item.strip() for item in args.conditions.split(",") if item.strip()}
+        if args.conditions
+        else None
+    )
+    filtered = []
+    for task in tasks:
+        if not fnmatch.fnmatch(
+            task.run_name, args.run_name_glob
+        ) or not fnmatch.fnmatch(task.checkpoint_dir.name, args.checkpoint_name_glob):
+            continue
+        config = json.loads(
+            (task.run_dir / "initial" / "config.json").read_text(encoding="utf-8")
+        )
+        condition = config.get("EXPERIMENT_CONDITION", config.get("ALIGN_MODE"))
+        distance = config.get("ALIGN_DISTANCE", "ln_mse")
+        if config.get("ACTOR_PARAMETER_SHARING"):
+            continue
+        if conditions is not None and condition not in conditions:
+            continue
+        if args.align_distance is not None and distance != args.align_distance:
+            continue
+        filtered.append(task)
+    tasks = filtered
     selected = []
     stage_label = "-".join(stages)
     for task in tasks:
@@ -189,6 +221,13 @@ def main():
                     "--bellman-heads",
                     str(args.bellman_heads),
                 ]
+                if "latent" in stages:
+                    command.extend(
+                        [
+                            "--fisher-ridge-absolute",
+                            str(args.fisher_ridge_absolute),
+                        ]
+                    )
                 environment = worker_environment(os.environ, gpu, cpu_threads)
                 started = dt.datetime.now(dt.timezone.utc).isoformat()
                 process = subprocess.Popen(

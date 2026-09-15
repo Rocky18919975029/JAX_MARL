@@ -79,8 +79,9 @@ ALIGN_MODE=c_to_a ALIGN_TARGET_SHUFFLE=true
 
 Targets are cyclically deranged within each agent's alive environment-by-time
 pool once per PPO update. The same permutation is reused by every minibatch and
-epoch, and its RNG substream does not alter rollout/action sampling. See
-`H1_EXPERIMENT.md` for the locked 280-run protocol and post-hoc diagnostics.
+epoch, and its RNG substream does not alter rollout/action sampling. These
+historical controls are outside the current NPS-only H1 protocol documented in
+`H1_EXPERIMENT.md`.
 
 ## Checkpoints and post-training evaluation
 

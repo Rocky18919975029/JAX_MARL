@@ -22,26 +22,12 @@ except ModuleNotFoundError:  # Imported as scripts.run_h1_smax_confirmatory in t
 
 
 MAPS = ("10m_vs_11m", "smacv2_10_units")
-ACTOR_VARIANTS = (("ps", True), ("nps", False))
-LN_MSE_CONDITIONS = (
-    "none",
-    "a_to_c",
-    "c_to_a",
-    "reciprocal",
-    "joint",
-)
+ACTOR_VARIANTS = (("nps", False),)
+LN_MSE_CONDITIONS = ("none", "a_to_c", "c_to_a")
 CKA_CONDITIONS = ("a_to_c_cka", "c_to_a_cka")
 CONDITIONS = LN_MSE_CONDITIONS + CKA_CONDITIONS
-CONFIRMATORY_SEEDS = tuple(range(101, 111))
-REDUCED_SEEDS = (1, 2, 3, 4)
-REDUCED_ACTOR_VARIANTS = ("nps",)
-REDUCED_CONDITIONS = ("none", "c_to_a", "a_to_c", "joint")
-REDUCED_CKA_CONDITIONS = ("c_to_a_cka", "a_to_c_cka")
-MATRIX_PROFILES = (
-    "confirmatory",
-    "reduced-nps-4condition",
-    "reduced-nps-cka",
-)
+SEEDS = (1, 2, 3, 4)
+MATRIX_PROFILES = ("nps-ln-mse", "nps-linear-cka")
 
 
 @dataclass(frozen=True)
@@ -63,23 +49,14 @@ class Task:
         return "linear_cka" if self.condition.endswith("_cka") else "ln_mse"
 
     @property
-    def shuffled(self):
-        return False
-
-    @property
     def lambda_label(self):
         value = f"{self.alignment_coef:.10g}".replace("-", "m").replace(".", "p")
         return f"lam{value}"
 
     @property
     def run_name(self):
-        prefix = (
-            "H1-reduced"
-            if self.matrix_profile.startswith("reduced-nps-")
-            else "H1"
-        )
         return (
-            f"{prefix}-{self.map_name}-{self.actor_label}-{self.condition}-"
+            f"H1-nps-{self.map_name}-{self.condition}-"
             f"{self.lambda_label}-seed{self.seed}"
         )
 
@@ -112,25 +89,15 @@ def parse_seeds(value):
 
 
 def validate_matrix_profile(args):
-    if args.matrix_profile == "confirmatory":
-        invalid = sorted(set(args.seeds) - set(CONFIRMATORY_SEEDS))
-        if invalid:
-            raise ValueError(
-                "The confirmatory profile only accepts seeds 101-110; " f"got {invalid}"
-            )
-        return
-
     conditions = (
-        REDUCED_CKA_CONDITIONS
-        if args.matrix_profile == "reduced-nps-cka"
-        else REDUCED_CONDITIONS
+        CKA_CONDITIONS if args.matrix_profile == "nps-linear-cka" else LN_MSE_CONDITIONS
     )
-    run_count = 16 if args.matrix_profile == "reduced-nps-cka" else 32
+    run_count = 16 if args.matrix_profile == "nps-linear-cka" else 24
     expected = {
         "maps": MAPS,
-        "actor variants": REDUCED_ACTOR_VARIANTS,
+        "actor variants": ("nps",),
         "conditions": conditions,
-        "seeds": REDUCED_SEEDS,
+        "seeds": SEEDS,
     }
     actual = {
         "maps": args.maps,
@@ -146,8 +113,7 @@ def validate_matrix_profile(args):
     if mismatches:
         raise ValueError(
             f"The {args.matrix_profile} profile is locked to exactly "
-            f"{run_count} runs:\n"
-            + "\n".join(mismatches)
+            f"{run_count} runs:\n" + "\n".join(mismatches)
         )
 
 
@@ -212,7 +178,7 @@ def build_command(args, frozen, task, commit):
             "ALIGN_GRADIENT_CALIBRATION=false",
             "ALIGN_TARGET_SHUFFLE=false",
             "ALIGN_TARGET_SHUFFLE_SCOPE=same_agent_env_time",
-            f"ALIGN_SHUFFLE_SEED_OFFSET={args.shuffle_seed_offset}",
+            "ALIGN_SHUFFLE_SEED_OFFSET=700000",
             f"EXPERIMENT_CONDITION={task.condition}",
             f"MATRIX_PROFILE={args.matrix_profile}",
             f"PROTOCOL_VERSION={PROTOCOL_VERSION}",
@@ -275,12 +241,12 @@ def main():
         help="defaults to RUN_ROOT/protocol/frozen_training_config.json",
     )
     parser.add_argument(
-        "--matrix-profile", choices=MATRIX_PROFILES, default="confirmatory"
+        "--matrix-profile", choices=MATRIX_PROFILES, default="nps-ln-mse"
     )
     parser.add_argument("--project", default=None)
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--max-runs-per-gpu", type=int, default=5)
-    parser.add_argument("--seeds", type=parse_seeds, default=(101, 102))
+    parser.add_argument("--seeds", type=parse_seeds, default=SEEDS)
     parser.add_argument(
         "--maps",
         type=lambda value: parse_csv(value, MAPS),
@@ -289,12 +255,12 @@ def main():
     parser.add_argument(
         "--actor-variants",
         type=lambda value: parse_csv(value, dict(ACTOR_VARIANTS)),
-        default=tuple(dict(ACTOR_VARIANTS)),
+        default=("nps",),
     )
     parser.add_argument(
         "--conditions",
         type=lambda value: parse_csv(value, CONDITIONS),
-        default=CONDITIONS,
+        default=None,
     )
     parser.add_argument(
         "--cka-calibration",
@@ -304,20 +270,21 @@ def main():
             "condition is selected"
         ),
     )
-    parser.add_argument("--shuffle-seed-offset", type=int, default=700000)
     parser.add_argument("--upload-checkpoints", action="store_true")
     parser.add_argument("--allow-git-mismatch", action="store_true")
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--rerun-successful", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.conditions is None:
+        args.conditions = (
+            CKA_CONDITIONS
+            if args.matrix_profile == "nps-linear-cka"
+            else LN_MSE_CONDITIONS
+        )
     validate_matrix_profile(args)
     if args.project is None:
-        args.project = (
-            "h1-smax-reduced-nps-4condition"
-            if args.matrix_profile.startswith("reduced-nps-")
-            else "h1-smax-confirmatory"
-        )
+        args.project = f"h1-smax-{args.matrix_profile}"
 
     args.run_root = args.run_root.expanduser().resolve()
     frozen_path = args.frozen_config or (
@@ -368,8 +335,8 @@ def main():
         raise ValueError("--gpus must select at least one GPU")
     tasks = task_matrix(args)
     expected_profile_sizes = {
-        "reduced-nps-4condition": 32,
-        "reduced-nps-cka": 16,
+        "nps-ln-mse": 24,
+        "nps-linear-cka": 16,
     }
     expected_size = expected_profile_sizes.get(args.matrix_profile)
     if expected_size is not None and len(tasks) != expected_size:
@@ -458,17 +425,11 @@ def main():
                         "WANDB_ARTIFACT_DIR": str(wandb_artifact_dir),
                         "WANDB_NAME": task.run_name,
                         "WANDB_RUN_GROUP": (
-                            f"{'H1-reduced' if args.matrix_profile.startswith('reduced-nps-') else 'H1'}-"
-                            f"{task.map_name}-{task.actor_label}-{task.condition}-"
-                            f"{task.lambda_label}"
+                            f"H1-nps-{task.map_name}-{task.condition}-{task.lambda_label}"
                         ),
                         "WANDB_TAGS": ",".join(
                             (
-                                (
-                                    "h1-reduced"
-                                    if args.matrix_profile.startswith("reduced-nps-")
-                                    else "h1-confirmatory"
-                                ),
+                                args.matrix_profile,
                                 "smax",
                                 task.map_name,
                                 task.actor_label,
@@ -521,7 +482,6 @@ def main():
                 "condition": task.condition,
                 "align_mode": task.align_mode,
                 "align_distance": task.align_distance,
-                "shuffled": task.shuffled,
                 "alignment_coef": task.alignment_coef,
                 "seed": task.seed,
                 "gpu": gpu,

@@ -23,20 +23,13 @@ from tqdm.auto import tqdm
 from baselines.MAPPO.eval_mappo_rnn_smax import resolve_checkpoint
 from jaxmarl.wrappers.baselines import load_params
 
+try:
+    from h1_diagnostic_data import BELLMAN_ARRAYS, load_diagnostics
+except ModuleNotFoundError:
+    from scripts.h1_diagnostic_data import BELLMAN_ARRAYS, load_diagnostics
+
 
 HEAD_OPTIMIZER = optax.adam(3e-4)
-
-
-def load_diagnostics(directory):
-    directory = directory.expanduser().resolve()
-    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
-    arrays = {}
-    for shard in metadata["shards"]:
-        with np.load(directory / shard["path"]) as data:
-            for name in data.files:
-                arrays.setdefault(name, []).append(np.asarray(data[name]))
-    arrays = {name: np.concatenate(parts, axis=0) for name, parts in arrays.items()}
-    return metadata, arrays
 
 
 def initialize_head(key, input_dim, hidden_dim):
@@ -179,15 +172,6 @@ def episode_split(episode_count, seed):
     return assignment
 
 
-def explained_variance(prediction, target):
-    variance = np.var(target)
-    return (
-        float(1.0 - np.var(target - prediction) / variance)
-        if variance > 0
-        else math.nan
-    )
-
-
 def write_csv(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     # A checkpoint retry can follow a successful CSV write but failed summary
@@ -211,7 +195,9 @@ def main():
     args = parser.parse_args()
     if args.heads < 1 or args.steps < 1:
         raise ValueError("--heads and --steps must be positive")
-    metadata, arrays = load_diagnostics(args.diagnostics_dir)
+    metadata, arrays = load_diagnostics(args.diagnostics_dir, BELLMAN_ARRAYS)
+    if metadata["actor_parameter_sharing"]:
+        raise ValueError("The canonical H1 analysis is restricted to NPS checkpoints")
     checkpoint_dir, model_path, config_path = resolve_checkpoint(args.checkpoint)
     config = json.loads(config_path.read_text(encoding="utf-8"))
     checkpoint = load_params(model_path)
@@ -225,21 +211,15 @@ def main():
     z_current = arrays["critic_latent"]
     z_next = np.zeros_like(z_current)
     z_next[:, :-1] = z_current[:, 1:]
-    state_current = arrays["world_state"]
     reward = arrays["reward"]
     terminal = np.broadcast_to(arrays["global_done"][..., None], alive.shape)
     mc_return = arrays["mc_return"]
-    gae = arrays["gae_raw"]
-    stored_value = arrays["value"]
 
     z = z_current[valid].astype(np.float32)
     next_z = z_next[valid].astype(np.float32)
-    state = state_current[valid].astype(np.float32)
     rewards = reward[valid].astype(np.float32)
     terminals = terminal[valid].astype(np.float32)
     mc_targets = mc_return[valid].astype(np.float32)
-    raw_gae = gae[valid].astype(np.float32)
-    value_targets = stored_value[valid].astype(np.float32)
     sample_episode = episode_grid[valid]
     split = assignment[sample_episode]
     train_indices = np.flatnonzero(split == 0)
@@ -276,9 +256,21 @@ def main():
             )
         )
 
+    common = {
+        "run_id": metadata.get("run_id"),
+        "run_name": metadata["run_name"],
+        "task": metadata["map_name"],
+        "actor_parameterization": "nps",
+        "condition": metadata["condition"],
+        "align_distance": metadata.get("align_distance", "ln_mse"),
+        "seed": metadata["training_seed"],
+        "checkpoint_step": metadata.get("checkpoint_env_step"),
+        "checkpoint_nominal_step": metadata.get("checkpoint_nominal_env_step"),
+        "protocol_version": metadata["protocol_version"],
+        "git_commit": metadata["git_commit"],
+    }
     rows = []
     residuals = []
-    state_residuals = []
     for head_id, source_model in enumerate(
         tqdm(source_models, desc="Bellman images", unit="head")
     ):
@@ -299,80 +291,30 @@ def main():
             args.batch_size,
             args.patience,
         )
-        state_model = fit_head(
-            state,
-            bellman_target,
-            train_indices,
-            validation_indices,
-            2 * int(config["GRU_HIDDEN_DIM"]),
-            args.seed + 3000 + head_id,
-            args.steps,
-            args.batch_size,
-            args.patience,
-        )
         latent_prediction = scaled_predict(target_model, z[test_indices])
-        state_prediction = scaled_predict(state_model, state[test_indices])
         target_test = bellman_target[test_indices]
         residual = float(np.mean(np.square(latent_prediction - target_test)))
-        state_residual = float(np.mean(np.square(state_prediction - target_test)))
+        if not math.isfinite(residual):
+            raise RuntimeError(f"Non-finite Bellman error for source head {head_id}")
         residuals.append(residual)
-        state_residuals.append(state_residual)
         rows.append(
             {
-                "run_id": metadata.get("run_id"),
-                "run_name": metadata["run_name"],
-                "task": metadata["map_name"],
-                "actor_parameterization": (
-                    "ps" if metadata["actor_parameter_sharing"] else "nps"
-                ),
-                "align_mode": metadata["condition"],
-                "shuffled": metadata["condition"].endswith("_shuffled"),
-                "seed": metadata["training_seed"],
-                "checkpoint_step": metadata.get("checkpoint_env_step"),
+                **common,
                 "source_head_id": head_id,
                 "source_output_std": source_scales[-1],
                 "bellman_residual": residual,
-                "full_state_residual": state_residual,
-                "excess_residual": max(residual - state_residual, 0.0),
-                "value_mc_mse": float(
-                    np.mean(
-                        np.square(
-                            value_targets[test_indices] - mc_targets[test_indices]
-                        )
-                    )
-                ),
-                "td_residual": float(
-                    np.mean(
-                        np.square(
-                            value_targets[test_indices] - bellman_target[test_indices]
-                        )
-                    )
-                ),
-                "explained_variance": explained_variance(
-                    value_targets[test_indices], mc_targets[test_indices]
-                ),
-                "gae_mc_correlation": float(
-                    np.corrcoef(raw_gae[test_indices], mc_targets[test_indices])[0, 1]
-                ),
                 "num_test_samples": len(test_indices),
-                "protocol_version": metadata["protocol_version"],
-                "git_commit": metadata["git_commit"],
             }
         )
     write_csv(args.output_csv.expanduser().resolve(), rows)
     residuals_array = np.asarray(residuals)
-    state_residuals_array = np.asarray(state_residuals)
     summary = {
-        "schema_version": 1,
-        "run_id": metadata.get("run_id"),
-        "run_name": metadata["run_name"],
-        "checkpoint_step": metadata.get("checkpoint_env_step"),
+        "schema_version": 2,
+        **common,
+        "definition": "max_m E_test[(g_m(z_t^C) - y_m,t)^2]",
         "epsilon_bell": float(residuals_array.max()),
         "epsilon_bell_median": float(np.median(residuals_array)),
         "epsilon_bell_p90": float(np.quantile(residuals_array, 0.9)),
-        "epsilon_bell_excess": float(
-            np.maximum(residuals_array - state_residuals_array, 0.0).max()
-        ),
         "source_head_output_scales": source_scales,
         "heads": args.heads,
         "episode_disjoint_split": True,

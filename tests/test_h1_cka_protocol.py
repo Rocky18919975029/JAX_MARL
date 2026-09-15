@@ -7,41 +7,13 @@ from scripts.calibrate_h1_cka import pooled_rms_coefficient
 from scripts import run_h1_smax_confirmatory as launcher
 
 
-def test_full_matrix_replaces_shuffled_controls_with_cka_runs():
-    args = SimpleNamespace(
-        matrix_profile="confirmatory",
-        maps=launcher.MAPS,
-        actor_variants=tuple(dict(launcher.ACTOR_VARIANTS)),
-        conditions=launcher.CONDITIONS,
-        seeds=launcher.CONFIRMATORY_SEEDS,
-        cka_alignment_coef=0.037,
-    )
-    tasks = launcher.task_matrix(args)
-
-    assert len(tasks) == 280
-    assert sum(task.align_distance == "ln_mse" for task in tasks) == 200
-    assert sum(task.align_distance == "linear_cka" for task in tasks) == 80
-    assert not any(task.shuffled for task in tasks)
-    assert {
-        task.condition for task in tasks if task.align_distance == "linear_cka"
-    } == {
-        "a_to_c_cka",
-        "c_to_a_cka",
-    }
-    assert all(
-        task.alignment_coef == pytest.approx(0.037)
-        for task in tasks
-        if task.align_distance == "linear_cka"
-    )
-
-
 def reduced_cka_args(**overrides):
     values = {
-        "matrix_profile": "reduced-nps-cka",
+        "matrix_profile": "nps-linear-cka",
         "maps": launcher.MAPS,
-        "actor_variants": launcher.REDUCED_ACTOR_VARIANTS,
-        "conditions": launcher.REDUCED_CKA_CONDITIONS,
-        "seeds": launcher.REDUCED_SEEDS,
+        "actor_variants": ("nps",),
+        "conditions": launcher.CKA_CONDITIONS,
+        "seeds": launcher.SEEDS,
         "cka_alignment_coef": 0.037,
     }
     values.update(overrides)
@@ -57,12 +29,10 @@ def test_reduced_cka_matrix_exactly_pairs_prior_nps_seeds():
     assert {task.map_name for task in tasks} == set(launcher.MAPS)
     assert {task.actor_label for task in tasks} == {"nps"}
     assert {task.sharing for task in tasks} == {False}
-    assert {task.condition for task in tasks} == set(
-        launcher.REDUCED_CKA_CONDITIONS
-    )
+    assert {task.condition for task in tasks} == set(launcher.CKA_CONDITIONS)
     assert {task.seed for task in tasks} == {1, 2, 3, 4}
     assert all(task.align_distance == "linear_cka" for task in tasks)
-    assert all(task.run_name.startswith("H1-reduced-") for task in tasks)
+    assert all(task.run_name.startswith("H1-nps-") for task in tasks)
 
 
 @pytest.mark.parametrize(

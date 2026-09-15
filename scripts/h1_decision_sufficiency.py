@@ -33,17 +33,10 @@ from jaxmarl.environments.smax.heuristic_enemy_smax_env import State as EnemySta
 from jaxmarl.environments.smax.smax_env import State as SMAXState
 from jaxmarl.wrappers.baselines import load_params
 
-
-def load_diagnostics(directory):
-    directory = directory.expanduser().resolve()
-    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
-    arrays = {}
-    for shard in metadata["shards"]:
-        with np.load(directory / shard["path"]) as data:
-            for name in data.files:
-                arrays.setdefault(name, []).append(np.asarray(data[name]))
-    arrays = {name: np.concatenate(parts, axis=0) for name, parts in arrays.items()}
-    return metadata, arrays
+try:
+    from h1_diagnostic_data import DECISION_ARRAYS, load_diagnostics
+except ModuleNotFoundError:
+    from scripts.h1_diagnostic_data import DECISION_ARRAYS, load_diagnostics
 
 
 def reconstruct_state(arrays, episode, timestep):
@@ -257,63 +250,137 @@ def probe_predict(params, inputs):
     return (hidden @ params["w2"] + params["b2"]).squeeze(-1)
 
 
-def train_probe(inputs, targets, split, hidden_dim, seed, steps, patience, batch_size):
-    train = split == 0
-    validation = split == 1
-    target_mean = float(targets[train].mean())
-    target_std = float(targets[train].std() + 1e-8)
-    normalized_targets = (targets - target_mean) / target_std
-    params = initialize_probe(jax.random.PRNGKey(seed), inputs.shape[1], hidden_dim)
+def train_independent_probes(
+    inputs_by_agent,
+    targets_by_agent,
+    split_by_agent,
+    hidden_dim,
+    seed,
+    steps,
+    patience,
+    batch_size,
+):
+    """Fit one probe per agent in a single vmapped optimizer loop."""
+
+    num_agents = len(inputs_by_agent)
+    input_dim = inputs_by_agent[0].shape[1]
+    train_indices = [np.flatnonzero(split == 0) for split in split_by_agent]
+    validation_indices = [np.flatnonzero(split == 1) for split in split_by_agent]
+    if any(not len(indices) for indices in train_indices + validation_indices):
+        raise RuntimeError("Every agent requires non-empty train and validation splits")
+    means = np.asarray(
+        [
+            targets[indices].mean()
+            for targets, indices in zip(targets_by_agent, train_indices)
+        ],
+        dtype=np.float32,
+    )
+    scales = np.asarray(
+        [
+            targets[indices].std() + 1e-8
+            for targets, indices in zip(targets_by_agent, train_indices)
+        ],
+        dtype=np.float32,
+    )
+    normalized_targets = [
+        (targets - mean) / scale
+        for targets, mean, scale in zip(targets_by_agent, means, scales)
+    ]
+    keys = jax.random.split(jax.random.PRNGKey(seed), num_agents)
+    params = jax.vmap(lambda key: initialize_probe(key, input_dim, hidden_dim))(keys)
     optimizer = optax.adam(3e-4)
     optimizer_state = optimizer.init(params)
 
     @jax.jit
     def update(params, optimizer_state, x, y):
-        loss, grads = jax.value_and_grad(
-            lambda values: jnp.mean(jnp.square(probe_predict(values, x) - y))
-        )(params)
+        def loss_one(values, agent_x, agent_y):
+            return jnp.mean(jnp.square(probe_predict(values, agent_x) - agent_y))
+
+        losses, grads = jax.vmap(jax.value_and_grad(loss_one))(params, x, y)
         updates, optimizer_state = optimizer.update(grads, optimizer_state, params)
-        return optax.apply_updates(params, updates), optimizer_state, loss
+        return optax.apply_updates(params, updates), optimizer_state, losses
+
+    validation_size = max(len(indices) for indices in validation_indices)
+    validation_inputs = np.zeros(
+        (num_agents, validation_size, input_dim), dtype=np.float32
+    )
+    validation_targets = np.zeros((num_agents, validation_size), dtype=np.float32)
+    validation_mask = np.zeros((num_agents, validation_size), dtype=np.float32)
+    for agent, indices in enumerate(validation_indices):
+        count = len(indices)
+        validation_inputs[agent, :count] = inputs_by_agent[agent][indices]
+        validation_targets[agent, :count] = normalized_targets[agent][indices]
+        validation_mask[agent, :count] = 1.0
 
     best_params = params
-    best_validation = math.inf
-    stale = 0
-    history = []
-    rng = np.random.default_rng(seed)
-    train_indices = np.flatnonzero(train)
+    best_validation = np.full(num_agents, np.inf)
+    stale = np.zeros(num_agents, dtype=np.int32)
+    history = {str(agent): [] for agent in range(num_agents)}
+    rngs = [np.random.default_rng(seed + agent) for agent in range(num_agents)]
+    minibatch_size = min(batch_size, max(map(len, train_indices)))
     for step in range(steps):
-        minibatch = rng.choice(
-            train_indices,
-            size=min(batch_size, len(train_indices)),
-            replace=len(train_indices) < batch_size,
+        minibatches = [
+            rng.choice(
+                indices,
+                size=minibatch_size,
+                replace=len(indices) < minibatch_size,
+            )
+            for rng, indices in zip(rngs, train_indices)
+        ]
+        x = np.stack(
+            [inputs[indices] for inputs, indices in zip(inputs_by_agent, minibatches)]
         )
-        params, optimizer_state, train_loss = update(
+        y = np.stack(
+            [
+                targets[indices]
+                for targets, indices in zip(normalized_targets, minibatches)
+            ]
+        )
+        params, optimizer_state, train_losses = update(
             params,
             optimizer_state,
-            jnp.asarray(inputs[minibatch]),
-            jnp.asarray(normalized_targets[minibatch]),
+            jnp.asarray(x),
+            jnp.asarray(y),
         )
         if step % 20 == 0 or step == steps - 1:
-            prediction = np.asarray(
-                probe_predict(params, jnp.asarray(inputs[validation]))
+            validation_prediction = np.asarray(
+                jax.vmap(probe_predict)(params, jnp.asarray(validation_inputs))
             )
-            validation_loss = float(
-                np.mean(np.square(prediction - normalized_targets[validation]))
+            validation_losses = np.sum(
+                np.square(validation_prediction - validation_targets) * validation_mask,
+                axis=1,
+            ) / np.sum(validation_mask, axis=1)
+            improved = validation_losses < best_validation - 1e-7
+            best_params = jax.tree.map(
+                lambda best, current: jnp.where(
+                    jnp.asarray(improved).reshape(
+                        (num_agents,) + (1,) * (current.ndim - 1)
+                    ),
+                    current,
+                    best,
+                ),
+                best_params,
+                params,
             )
-            history.append((step, float(train_loss), validation_loss))
-            if validation_loss < best_validation - 1e-7:
-                best_validation = validation_loss
-                best_params = params
-                stale = 0
-            else:
-                stale += 20
-                if stale >= patience:
-                    break
-    prediction = (
-        np.asarray(probe_predict(best_params, jnp.asarray(inputs))) * target_std
-        + target_mean
-    )
-    return prediction, history
+            best_validation = np.minimum(best_validation, validation_losses)
+            stale = np.where(improved, 0, stale + 20)
+            for agent in range(num_agents):
+                history[str(agent)].append(
+                    (
+                        step,
+                        float(train_losses[agent]),
+                        float(validation_losses[agent]),
+                    )
+                )
+            if np.all(stale >= patience):
+                break
+
+    predictions = []
+    for agent, inputs in enumerate(inputs_by_agent):
+        agent_params = jax.tree.map(lambda value: value[agent], best_params)
+        prediction = np.asarray(probe_predict(agent_params, jnp.asarray(inputs)))
+        predictions.append(prediction * scales[agent] + means[agent])
+    return predictions, history
 
 
 def ordering_metrics(rows, predictions, tie_tolerance):
@@ -370,7 +437,7 @@ def ordering_metrics(rows, predictions, tie_tolerance):
         "top1_agreement": nanmean(top1),
         "q_mse": nanmean(errors),
         "num_test_anchor_agents": len(grouped),
-        "num_test_anchor_states": len(grouped),
+        "num_test_anchor_states": len({anchor for anchor, _ in grouped}),
     }
     agent_metrics = []
     for agent, values in sorted(by_agent.items()):
@@ -409,7 +476,9 @@ def main():
     parser.add_argument("--probe-patience", type=int, default=200)
     parser.add_argument("--probe-batch-size", type=int, default=2048)
     args = parser.parse_args()
-    metadata, arrays = load_diagnostics(args.diagnostics_dir)
+    metadata, arrays = load_diagnostics(args.diagnostics_dir, DECISION_ARRAYS)
+    if metadata["actor_parameter_sharing"]:
+        raise ValueError("The canonical H1 analysis is restricted to NPS checkpoints")
     checkpoint_dir, model_path, config_path = resolve_checkpoint(args.checkpoint)
     config = json.loads(config_path.read_text(encoding="utf-8"))
     checkpoint = load_params(model_path)
@@ -482,48 +551,56 @@ def main():
 
     latents = np.stack([row.pop("latent") for row in rows]).astype(np.float32)
     actions = np.asarray([row["action"] for row in rows])
-    inputs = np.concatenate(
-        (latents, np.eye(action_dim, dtype=np.float32)[actions]), axis=1
-    )
     targets = np.asarray([row["q_value"] for row in rows], dtype=np.float32)
     split = np.asarray([row["split"] for row in rows], dtype=np.int32)
-    predictions, history = train_probe(
-        inputs,
-        targets,
-        split,
+    row_agents = np.asarray([row["agent_id"] for row in rows], dtype=np.int32)
+    inputs_by_agent = []
+    targets_by_agent = []
+    splits_by_agent = []
+    indices_by_agent = []
+    for agent in range(env.num_agents):
+        indices = np.flatnonzero(row_agents == agent)
+        if not len(indices):
+            raise RuntimeError(f"No decision-probe samples for agent {agent}")
+        agent_split = split[indices]
+        if not all(np.any(agent_split == item) for item in range(3)):
+            raise RuntimeError(f"Agent {agent} is missing a probe data split")
+        agent_actions = actions[indices]
+        agent_inputs = np.concatenate(
+            (
+                latents[indices],
+                np.eye(action_dim, dtype=np.float32)[agent_actions],
+            ),
+            axis=1,
+        )
+        indices_by_agent.append(indices)
+        inputs_by_agent.append(agent_inputs)
+        targets_by_agent.append(targets[indices])
+        splits_by_agent.append(agent_split)
+    predictions_by_agent, probe_history = train_independent_probes(
+        inputs_by_agent,
+        targets_by_agent,
+        splits_by_agent,
         int(config["GRU_HIDDEN_DIM"]),
         args.seed + 1,
         args.probe_steps,
         args.probe_patience,
         args.probe_batch_size,
     )
+    predictions = np.empty_like(targets)
+    for indices, agent_predictions in zip(indices_by_agent, predictions_by_agent):
+        predictions[indices] = agent_predictions
     return_scale = max(float(np.std(targets)), 1.0)
     aggregate, agent_metrics = ordering_metrics(rows, predictions, 1e-3 * return_scale)
-
-    train = split == 0
-    action_means = np.asarray(
-        [
-            (
-                targets[train & (actions == action)].mean()
-                if np.any(train & (actions == action))
-                else targets[train].mean()
-            )
-            for action in range(action_dim)
-        ]
-    )
-    baseline_predictions = action_means[actions]
-    baseline_aggregate, _ = ordering_metrics(
-        rows, baseline_predictions, 1e-3 * return_scale
-    )
+    if not math.isfinite(aggregate["epsilon_dec"]):
+        raise RuntimeError("Held-out actions contain no measurable non-tied rankings")
     common = {
         "run_id": metadata.get("run_id"),
         "run_name": metadata["run_name"],
         "task": metadata["map_name"],
-        "actor_parameterization": (
-            "ps" if metadata["actor_parameter_sharing"] else "nps"
-        ),
-        "align_mode": metadata["condition"],
-        "shuffled": metadata["condition"].endswith("_shuffled"),
+        "actor_parameterization": "nps",
+        "condition": metadata["condition"],
+        "align_distance": metadata.get("align_distance", "ln_mse"),
         "seed": metadata["training_seed"],
         "checkpoint_step": metadata.get("checkpoint_env_step"),
         "num_anchor_states": len(anchors),
@@ -535,7 +612,6 @@ def main():
         {
             **common,
             "agent_id": "all",
-            "unit_type": "all",
             **aggregate,
         }
     ]
@@ -544,28 +620,9 @@ def main():
             {
                 **common,
                 "agent_id": agent_metric.pop("agent_id"),
-                "unit_type": "all",
                 **agent_metric,
                 "epsilon_dec": 1.0 - agent_metric["kendall_tau"],
                 "num_test_anchor_agents": 1,
-            }
-        )
-    for unit_type in sorted(set(row["unit_type"] for row in rows)):
-        indices = [
-            index for index, row in enumerate(rows) if row["unit_type"] == unit_type
-        ]
-        type_rows = [rows[index] for index in indices]
-        type_predictions = predictions[indices]
-        type_aggregate, _ = ordering_metrics(
-            type_rows, type_predictions, 1e-3 * return_scale
-        )
-        output_rows.append(
-            {
-                **common,
-                "agent_id": "all",
-                "unit_type": unit_type,
-                **type_aggregate,
-                "num_test_anchor_states": type_aggregate["num_test_anchor_agents"],
             }
         )
     write_csv(args.output_csv.expanduser().resolve(), output_rows)
@@ -584,11 +641,11 @@ def main():
         unit_type=np.asarray([row["unit_type"] for row in rows]),
     )
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         **common,
         **aggregate,
-        "action_only_baseline": baseline_aggregate,
-        "probe_history": history,
+        "probe_scope": "one_independent_probe_per_agent",
+        "probe_history_by_agent": probe_history,
         "episode_disjoint_split": True,
     }
     (output_dir / "decision_summary.json").write_text(
