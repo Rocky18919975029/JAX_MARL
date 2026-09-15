@@ -110,6 +110,10 @@ pre-commit install
 
 <h2 name="start" id="start">Quick Start 🚀 </h2>
 
+The repository-specific HARL/MA-MuJoCo `Humanoid-v2-17x1` representation
+alignment protocol is documented in
+[`experiments/harl_mamujoco/README.md`](experiments/harl_mamujoco/README.md).
+
 We take inspiration from the [PettingZoo](https://github.com/Farama-Foundation/PettingZoo) and [Gymnax](https://github.com/RobertTLange/gymnax) interfaces. You can try out training an agent in our [Colab notebook](https://colab.research.google.com/github/FLAIROx/JaxMARL/blob/main/jaxmarl/tutorials/JaxMARL_Walkthrough.ipynb). Further introduction scripts can be found [here](https://github.com/FLAIROx/JaxMARL/tree/main/jaxmarl/tutorials).
 
 ### Basic JaxMARL API  Usage 🖥️
