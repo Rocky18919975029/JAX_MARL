@@ -196,6 +196,47 @@ frozen training configuration, and seeds 1--4 as the reduced LN-MSE run. The
 locked `reduced-nps-cka` profile contains only `c_to_a_cka` and `a_to_c_cka`
 (16 runs total); the distance-free `none` runs are reused.
 
+### CKA checkpoint diagnostics on the GPU server
+
+After the 16 CKA training runs finish, run the same four-stage diagnostic
+protocol on their 128 preregistered checkpoints. The orchestrator validates the
+two maps, NPS actor, two CKA directions, seeds 1--4, and every checkpoint
+before writing anything. It uses 512 rollout episodes per checkpoint, 256
+counterfactual anchors with 32 continuations, and 32 Bellman heads. Collection
+uses two workers per GPU; latent, decision, Bellman, and deterministic evaluation
+use one worker per GPU. Completed stage markers and evaluation JSON files are
+skipped when the same command is run again; a partially interrupted rollout is
+recollected into its checkpoint directory.
+
+Run these commands **on the server after pulling this repository**. All output
+remains on the data disk; `$HOME/JaxMARL/h1_smax_runs` is only a symlink to it.
+
+```bash
+cd "$HOME/JaxMARL"
+git pull --ff-only
+conda activate jaxmarl
+unset LD_LIBRARY_PATH
+
+CKA_RUN_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/cka_distance_robustness
+python scripts/run_h1_cka_diagnostics.py --run-root "$CKA_RUN_ROOT" --dry-run
+
+nohup python -u scripts/run_h1_cka_diagnostics.py \
+  --run-root "$CKA_RUN_ROOT" \
+  --gpus 0,1,2,3 \
+  --collect-per-gpu 2 \
+  > "$CKA_RUN_ROOT/diagnostics_pipeline.stdout" 2>&1 < /dev/null &
+echo "CKA diagnostics manager PID: $!"
+```
+
+Monitor `tail -f "$CKA_RUN_ROOT/diagnostics_pipeline.stdout"` or
+`tail -f "$CKA_RUN_ROOT/logs/diagnostics/launcher.log"`. The final pipeline
+also evaluates the 128 checkpoints deterministically (256 episodes each),
+merges per-checkpoint diagnostics, and writes
+`analysis/mechanism_curve_summary.csv` plus figures. Because `none` is reused
+from the LN-MSE matrix rather than rerun here, CKA-only paired-baseline tables
+are intentionally empty; cross-distance paired comparisons should join on
+task, NPS, seed, and checkpoint step with the reduced LN-MSE analysis tables.
+
 ## Full confirmatory training (deferred)
 
 First calibrate the single CKA coefficient.  Seed 9001 is a pilot seed and is

@@ -178,13 +178,13 @@ def fisher_metrics(scores, reference_advantage, critic_advantage, ridge_multipli
     )
 
 
-def append_csv(path, rows):
+def write_csv(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as file:
+    # This is a per-checkpoint file. Replacing it prevents duplicate rows if a
+    # previous attempt wrote the CSV but stopped before its summary marker.
+    with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        if not exists:
-            writer.writeheader()
+        writer.writeheader()
         writer.writerows(rows)
 
 
@@ -340,7 +340,7 @@ def main():
         reference_baseline=baseline,
         reference_advantage=reference_advantage,
     )
-    append_csv(args.output_csv.expanduser().resolve(), rows)
+    write_csv(args.output_csv.expanduser().resolve(), rows)
     print(json.dumps(aggregate, indent=2, sort_keys=True))
 
 

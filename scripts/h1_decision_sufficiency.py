@@ -387,13 +387,13 @@ def ordering_metrics(rows, predictions, tie_tolerance):
     return aggregate, agent_metrics
 
 
-def append_csv(path, rows):
+def write_csv(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as file:
+    # The worker writes one file per checkpoint. A retry must replace, not
+    # append, rows left by an interrupted attempt.
+    with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        if not exists:
-            writer.writeheader()
+        writer.writeheader()
         writer.writerows(rows)
 
 
@@ -568,7 +568,7 @@ def main():
                 "num_test_anchor_states": type_aggregate["num_test_anchor_agents"],
             }
         )
-    append_csv(args.output_csv.expanduser().resolve(), output_rows)
+    write_csv(args.output_csv.expanduser().resolve(), output_rows)
 
     output_dir = args.diagnostics_dir.expanduser().resolve()
     np.savez_compressed(

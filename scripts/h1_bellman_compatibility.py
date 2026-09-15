@@ -188,13 +188,13 @@ def explained_variance(prediction, target):
     )
 
 
-def append_csv(path, rows):
+def write_csv(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as file:
+    # A checkpoint retry can follow a successful CSV write but failed summary
+    # write, so keep this per-checkpoint table idempotent.
+    with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        if not exists:
-            writer.writeheader()
+        writer.writeheader()
         writer.writerows(rows)
 
 
@@ -359,7 +359,7 @@ def main():
                 "git_commit": metadata["git_commit"],
             }
         )
-    append_csv(args.output_csv.expanduser().resolve(), rows)
+    write_csv(args.output_csv.expanduser().resolve(), rows)
     residuals_array = np.asarray(residuals)
     state_residuals_array = np.asarray(state_residuals)
     summary = {
