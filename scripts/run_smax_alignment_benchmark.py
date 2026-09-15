@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extend the matched SMAX PS/NPS LN-MSE/CKA matrix from 4 to 10 seeds."""
+"""Run the matched four-seed alignment matrix on benchmark SMAX tasks."""
 
 from __future__ import annotations
 
@@ -19,13 +19,16 @@ from pathlib import Path
 try:
     from h1_protocol import FROZEN_KEYS, repository_root
     from run_h1_smax_confirmatory import load_cka_calibration, parse_seeds
-except ModuleNotFoundError:  # Imported as scripts.run_smax_alignment_10seed.
+except ModuleNotFoundError:  # Imported as scripts.run_smax_alignment_benchmark.
     from scripts.h1_protocol import FROZEN_KEYS, repository_root
     from scripts.run_h1_smax_confirmatory import load_cka_calibration, parse_seeds
 
 
-PROTOCOL_VERSION = "smax-alignment-10seed-v1.0"
-MAPS = ("10m_vs_11m", "smacv2_10_units")
+PROTOCOL_VERSION = "smax-alignment-benchmark-4seed-v1.0"
+BENCHMARK_MAPS = ("2s3z", "3s5z_vs_3s6z", "smacv2_10_units", "6h_vs_8z")
+# smacv2_10_units already belongs to the completed H1 matrix. This launcher
+# defaults to the other maps explicitly listed by run_minimal_baseline_set.yaml.
+DEFAULT_MAPS = tuple(name for name in BENCHMARK_MAPS if name != "smacv2_10_units")
 ACTOR_VARIANTS = {"ps": True, "nps": False}
 DISTANCES = ("ln_mse", "linear_cka")
 ALIGN_MODES = ("none", "c_to_a", "a_to_c", "joint")
@@ -64,7 +67,7 @@ class Task:
     @property
     def run_name(self):
         return (
-            f"SMAX10-{self.map_name}-{self.actor_label}-{self.condition}-"
+            f"SMAXB4-{self.map_name}-{self.actor_label}-{self.condition}-"
             f"{self.lambda_label}-seed{self.seed}"
         )
 
@@ -136,7 +139,7 @@ def load_frozen_config(path):
     if missing:
         raise ValueError(f"Frozen config is missing: {', '.join(missing)}")
     if frozen["MATCHED_COMPARISON"] is not True:
-        raise ValueError("The extension requires MATCHED_COMPARISON=true")
+        raise ValueError("The benchmark matrix requires MATCHED_COMPARISON=true")
     if float(frozen["ALIGNMENT_COEF"]) != 0.1:
         raise ValueError("The LN-MSE reference coefficient must be 0.1")
     digest = hashlib.sha256(
@@ -295,7 +298,15 @@ def main():
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--frozen-config", type=Path, required=True)
     parser.add_argument("--cka-calibration", type=Path, required=True)
-    parser.add_argument("--maps", type=lambda value: parse_csv(value, MAPS), default=MAPS)
+    parser.add_argument(
+        "--maps",
+        type=lambda value: parse_csv(value, BENCHMARK_MAPS),
+        default=DEFAULT_MAPS,
+        help=(
+            "Defaults to the three benchmark maps not already in the H1 matrix: "
+            "2s3z,3s5z_vs_3s6z,6h_vs_8z."
+        ),
+    )
     parser.add_argument(
         "--actor-variants",
         type=lambda value: parse_csv(value, ACTOR_VARIANTS),
@@ -304,8 +315,8 @@ def main():
     parser.add_argument(
         "--seeds",
         type=parse_seeds,
-        default=tuple(range(1, 11)),
-        help="Defaults to 1-10; exact completed checkpoints can be reused.",
+        default=tuple(range(1, 5)),
+        help="Defaults to the matched training seeds 1-4.",
     )
     parser.add_argument(
         "--reuse-root",
@@ -319,7 +330,7 @@ def main():
     )
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--max-runs-per-gpu", type=int, default=5)
-    parser.add_argument("--project", default="jaxmarl-smax-alignment-10seed")
+    parser.add_argument("--project", default="jaxmarl-smax-alignment-benchmark-4seed")
     parser.add_argument("--upload-checkpoints", action="store_true")
     parser.add_argument("--rerun-successful", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -373,6 +384,7 @@ def main():
     manifest = {
         "schema_version": 1,
         "protocol_version": PROTOCOL_VERSION,
+        "benchmark_suite_config": "baselines/run_minimal_baseline_set.yaml",
         "git_commit": commit,
         "frozen_config": str(frozen_path),
         "frozen_config_sha256": frozen_digest,
@@ -472,7 +484,7 @@ def main():
                         "WANDB_ARTIFACT_DIR": str(directories["wandb_artifacts"]),
                         "WANDB_NAME": task.run_name,
                         "WANDB_RUN_GROUP": (
-                            f"SMAX10-{task.map_name}-{task.actor_label}-"
+                            f"SMAXB4-{task.map_name}-{task.actor_label}-"
                             f"{task.condition}-{task.lambda_label}"
                         ),
                         "WANDB_TAGS": ",".join(
