@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Plot seed-paired held-out return and legacy latent distortion curves.
+"""Plot seed-paired return and the three legacy H1 diagnostic curves.
 
 This script is intentionally limited to already collected NPS SMAX benchmark
 diagnostics.  For each training seed and checkpoint it subtracts the single
 distance-free ``none`` run from an aligned run before aggregating over seeds.
-The legacy latent metric is read verbatim from ``latent_summary.json``; no
-diagnostic is recomputed here.
+The metrics are read verbatim from the existing latent, decision, and Bellman
+summaries; no diagnostic is recomputed here.
 """
 
 from __future__ import annotations
@@ -39,6 +39,16 @@ METRICS = (
     (
         "epsilon_lat",
         r"Legacy latent distortion $\epsilon_{Lat}$",
+        "Lower is better",
+    ),
+    (
+        "epsilon_dec",
+        r"Actor decision error $\epsilon_{Dec}$",
+        "Lower is better",
+    ),
+    (
+        "epsilon_bell",
+        r"Critic Bellman error $\epsilon_{Bell}$",
         "Lower is better",
     ),
 )
@@ -95,11 +105,18 @@ def discover_rows(run_root: Path, map_name: str, actor_variant: str):
         actual_variant = "ps" if sharing else "nps"
         if actual_variant != actor_variant:
             continue
-        latent_path = directory / "latent_summary.json"
-        if not latent_path.is_file():
-            incomplete.append(str(directory))
+        summary_paths = {
+            "latent": directory / "latent_summary.json",
+            "decision": directory / "decision_summary.json",
+            "bellman": directory / "bellman_summary.json",
+        }
+        missing = [name for name, path in summary_paths.items() if not path.is_file()]
+        if missing:
+            incomplete.append(f"{directory}: {','.join(missing)}")
             continue
-        latent = read_json(latent_path)
+        latent = read_json(summary_paths["latent"])
+        decision = read_json(summary_paths["decision"])
+        bellman = read_json(summary_paths["bellman"])
         distance = str(metadata.get("align_distance", "ln_mse"))
         if condition == "none":
             distance = "distance_free"
@@ -116,17 +133,19 @@ def discover_rows(run_root: Path, map_name: str, actor_variant: str):
             "nominal_step": step,
             "heldout_return": float(latent["heldout_episode_return_mean"]),
             "epsilon_lat": float(latent["epsilon_lat"]),
+            "epsilon_dec": float(decision["epsilon_dec"]),
+            "epsilon_bell": float(bellman["epsilon_bell"]),
             "reference_protocol": str(latent.get("reference_protocol", "")),
             "fisher_ridge_absolute": float(latent["fisher_ridge_absolute"]),
             "diagnostics_dir": str(directory),
         }
-        for metric in ("heldout_return", "epsilon_lat"):
+        for metric, _, _ in METRICS:
             if not math.isfinite(row[metric]):
                 raise RuntimeError(f"Non-finite {metric} in {directory}")
         rows.append(row)
     if incomplete:
         raise RuntimeError(
-            f"{len(incomplete)} selected checkpoints have no latent_summary.json; "
+            f"{len(incomplete)} selected checkpoints lack required summaries; "
             f"first missing: {incomplete[0]}"
         )
     if not rows:
@@ -211,12 +230,18 @@ def paired_tables(rows, seeds, steps):
                             "nominal_step": step,
                             "delta_heldout_return": target["heldout_return"]
                             - control["heldout_return"],
-                            "delta_epsilon_lat": target["epsilon_lat"]
-                            - control["epsilon_lat"],
-                            "aligned_heldout_return": target["heldout_return"],
-                            "baseline_heldout_return": control["heldout_return"],
-                            "aligned_epsilon_lat": target["epsilon_lat"],
-                            "baseline_epsilon_lat": control["epsilon_lat"],
+                            **{
+                                f"delta_{metric}": target[metric] - control[metric]
+                                for metric, _, _ in METRICS
+                            },
+                            **{
+                                f"aligned_{metric}": target[metric]
+                                for metric, _, _ in METRICS
+                            },
+                            **{
+                                f"baseline_{metric}": control[metric]
+                                for metric, _, _ in METRICS
+                            },
                             "fisher_ridge_absolute": target[
                                 "fisher_ridge_absolute"
                             ],
@@ -225,7 +250,7 @@ def paired_tables(rows, seeds, steps):
                     )
     grouped = defaultdict(list)
     for row in seed_rows:
-        for metric in ("heldout_return", "epsilon_lat"):
+        for metric, _, _ in METRICS:
             grouped[
                 (
                     row["task"],
@@ -266,8 +291,8 @@ def plot_distance(output_dir, map_name, actor_variant, distance, seed_rows, summ
     selected_summaries = [
         row for row in summaries if row["align_distance"] == distance
     ]
-    figure, axes = plt.subplots(1, 2, figsize=(13.2, 4.8), sharex=True)
-    for axis, (metric, title, direction) in zip(axes, METRICS):
+    figure, axes = plt.subplots(2, 2, figsize=(13.2, 9.0), sharex=True)
+    for axis, (metric, title, direction) in zip(axes.flat, METRICS):
         axis.axhline(0.0, color="#555555", linestyle="--", linewidth=1)
         for condition in ALIGNED_CONDITIONS:
             condition_rows = sorted(
@@ -321,7 +346,7 @@ def plot_distance(output_dir, map_name, actor_variant, distance, seed_rows, summ
         axis.set_ylabel(f"Seed-paired difference ({direction})")
         axis.ticklabel_format(style="sci", axis="x", scilimits=(0, 0))
         axis.grid(alpha=0.25)
-    handles, labels = axes[0].get_legend_handles_labels()
+    handles, labels = axes.flat[0].get_legend_handles_labels()
     figure.suptitle(
         f"SMAX {map_name} — {actor_variant.upper()} — "
         f"{DISTANCE_LABELS[distance]} — seed-paired legacy diagnostics",
@@ -337,7 +362,7 @@ def plot_distance(output_dir, map_name, actor_variant, distance, seed_rows, summ
         ncol=len(ALIGNED_CONDITIONS),
         frameon=True,
     )
-    figure.tight_layout(rect=(0.02, 0.02, 0.98, 0.82), w_pad=2.2)
+    figure.tight_layout(rect=(0.02, 0.02, 0.98, 0.88), w_pad=2.2, h_pad=2.0)
     stem = output_dir / f"smaxb4-{map_name}-{actor_variant}-{distance}-seed-paired"
     figure.savefig(stem.with_suffix(".png"), dpi=250, bbox_inches="tight")
     figure.savefig(stem.with_suffix(".pdf"), bbox_inches="tight")
@@ -392,7 +417,12 @@ def main():
         "seeds": seeds,
         "checkpoint_steps": steps,
         "aggregation": "within-seed alignment-minus-none, then mean-and-stderr",
-        "latent_metric": "legacy epsilon_lat read from latent_summary.json",
+        "metrics": {
+            "heldout_return": "latent_summary.json",
+            "epsilon_lat": "legacy value from latent_summary.json",
+            "epsilon_dec": "decision_summary.json",
+            "epsilon_bell": "bellman_summary.json",
+        },
         "none_baseline": "single distance-free run reused in both distance panels",
         "figures": [str(stem.with_suffix(".png")) for stem in stems],
     }

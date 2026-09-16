@@ -35,8 +35,12 @@ def make_checkpoint(root, condition, distance, seed, step, return_value, epsilon
         "fisher_ridge_absolute": 0.001,
         "reference_protocol": "baseline_free_mc_return_train_matched_gae",
     }
+    decision = {"epsilon_dec": 0.4 - 0.01 * return_value}
+    bellman = {"epsilon_bell": 0.2 - 0.01 * return_value}
     (directory / "metadata.json").write_text(json.dumps(metadata))
     (directory / "latent_summary.json").write_text(json.dumps(latent))
+    (directory / "decision_summary.json").write_text(json.dumps(decision))
+    (directory / "bellman_summary.json").write_text(json.dumps(bellman))
 
 
 def synthetic_matrix(tmp_path):
@@ -72,6 +76,8 @@ def test_seed_paired_tables_and_figures(tmp_path):
     )
     assert selected["delta_heldout_return"] == pytest.approx(0.11)
     assert selected["delta_epsilon_lat"] == pytest.approx(-0.02)
+    assert selected["delta_epsilon_dec"] == pytest.approx(-0.0011)
+    assert selected["delta_epsilon_bell"] == pytest.approx(-0.0011)
     summary = next(
         row
         for row in summaries
@@ -99,5 +105,5 @@ def test_missing_condition_is_rejected(tmp_path):
     synthetic_matrix(tmp_path)
     for path in tmp_path.glob("diagnostics_raw/*joint_cka*/*/latent_summary.json"):
         path.unlink()
-    with pytest.raises(RuntimeError, match="have no latent_summary"):
+    with pytest.raises(RuntimeError, match="lack required summaries"):
         discover_rows(tmp_path, "3s5z_vs_3s6z", "nps")
