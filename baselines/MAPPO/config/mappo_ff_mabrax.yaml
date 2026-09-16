@@ -19,6 +19,26 @@
 "ANNEAL_LR": true
 "DEVICE": 0
 
+# Matched actor--critic representation experiment
+"ACTOR_PARAMETER_SHARING": true
+"MATCHED_COMPARISON": true
+"ALIGN_MODE": "none"
+"ALIGN_DISTANCE": "ln_mse"
+"ALIGN_DISTANCE_EPS": 1.0e-8
+"ALIGNMENT_COEF": 0.1
+"ALIGN_GRADIENT_CALIBRATION": false
+"EXPERIMENT_CONDITION": ""
+"MATRIX_PROFILE": ""
+"PROTOCOL_VERSION": "mabrax-alignment-v1.0"
+"GIT_COMMIT": ""
+"METRICS_JSONL": ""
+
+# Evaluation-ready checkpoints
+"SAVE_CHECKPOINTS": false
+"CHECKPOINT_INTERVAL_TIMESTEPS": 5000000
+"CHECKPOINT_DIR": "checkpoints/MAPPO/mabrax"
+"WANDB_UPLOAD_CHECKPOINTS": false
+
 # W&B
 "ENTITY": ""
 "PROJECT": "jaxmarl-mabrax-mappo"

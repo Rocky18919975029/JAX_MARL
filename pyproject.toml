@@ -63,7 +63,7 @@ dev = [
   "pre-commit",
 ]
 mabrax = [
-  "brax>=0.10.3",
+  "brax>=0.14.2,<0.15",
 ]
 
 [project.urls]
