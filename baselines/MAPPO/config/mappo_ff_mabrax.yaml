@@ -1,0 +1,27 @@
+# HalfCheetah values follow Table 7 of the JaxMARL paper.
+"LR": 0.0006
+"NUM_ENVS": 64
+"NUM_STEPS": 300
+"TOTAL_TIMESTEPS": 100000000
+"UPDATE_EPOCHS": 4
+"NUM_MINIBATCHES": 4
+"GAMMA": 0.99
+"GAE_LAMBDA": 1.0
+"CLIP_EPS": 0.2
+"ENT_COEF": 0.0045
+"VF_COEF": 0.14
+"MAX_GRAD_NORM": 0.5
+"ACTIVATION": "tanh"
+"HIDDEN_SIZE": 64
+"SEED": 1
+"ENV_NAME": "halfcheetah_6x1"
+"ENV_KWARGS": {}
+"ANNEAL_LR": true
+"DEVICE": 0
+
+# W&B
+"ENTITY": ""
+"PROJECT": "jaxmarl-mabrax-mappo"
+"WANDB_MODE": "online"
+"WANDB_NAME": null
+"WANDB_GROUP": "MAPPO-FF-halfcheetah_6x1"
