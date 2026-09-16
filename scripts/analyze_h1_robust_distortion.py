@@ -49,6 +49,12 @@ METRICS = (
         "Lower is better",
     ),
 )
+SUPPLEMENTARY_METRICS = (
+    "optimal_nonnegative_critic_scale",
+    "reference_natural_norm_sq",
+    "critic_natural_norm_sq",
+    "reference_critic_natural_inner",
+)
 
 
 def read_json(path):
@@ -131,6 +137,10 @@ def load_checkpoint_rows(metrics_root):
                         name: float(metric[name])
                         for name, _, _ in METRICS
                         if name != "heldout_return"
+                    },
+                    **{
+                        name: float(metric[name])
+                        for name in SUPPLEMENTARY_METRICS
                     },
                     "robust_distortion_protocol": summary["robust_distortion_protocol"],
                     "phase_protocol": summary["phase_protocol"],
@@ -273,6 +283,11 @@ def matching_ridge(value, target):
     return math.isclose(float(value), float(target), rel_tol=1e-12, abs_tol=1e-15)
 
 
+def number_token(value):
+    """Return a filename-safe, human-readable token for a numeric value."""
+    return f"{float(value):g}".replace("-", "m").replace(".", "p")
+
+
 def conditions_in_order(rows):
     observed = {row["condition"] for row in rows}
     ordered = [item for item in CONDITION_ORDER if item in observed]
@@ -309,6 +324,12 @@ def plot_temporal(
         and matching_ridge(row["fisher_ridge_absolute"], ridge)
     ]
     conditions = conditions_in_order(selected_seed)
+    if not selected_seed or not selected_summary:
+        raise RuntimeError(
+            "No paired rows selected for "
+            f"task={task}, distance={distance}, aggregation={aggregation}, "
+            f"ridge={ridge:g}, budget={budget_label}"
+        )
     figure, axes = plt.subplots(3, 2, figsize=(13.2, 12.0), sharex=True)
     for axis, (metric, title, direction) in zip(axes.flat, METRICS):
         axis.axhline(0.0, color="#555555", linestyle="--", linewidth=1)
@@ -375,7 +396,8 @@ def plot_temporal(
     )
     figure.tight_layout(rect=(0.02, 0.02, 0.98, 0.95), h_pad=2.0, w_pad=2.0)
     stem = figures / (
-        f"robust-{task}-{distance}-{aggregation}-ridge{ridge:g}-{budget_label}-paired"
+        f"robust-{task}-{distance}-{aggregation}-ridge{number_token(ridge)}-"
+        f"{budget_label}-paired"
     )
     figure.savefig(stem.with_suffix(".png"), dpi=250, bbox_inches="tight")
     figure.savefig(stem.with_suffix(".pdf"), bbox_inches="tight")
@@ -387,7 +409,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metrics-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--plot-ridge", type=float, default=0.001)
+    parser.add_argument(
+        "--plot-ridge",
+        type=float,
+        default=None,
+        help="Plot one Fisher ridge. Omit to plot every computed ridge.",
+    )
     parser.add_argument("--plot-budget-label", default="4M", choices=("M", "2M", "4M"))
     return parser.parse_args()
 
@@ -420,23 +447,45 @@ def main():
     strata = sorted(
         {(row["task"], row["align_distance"], row["aggregation"]) for row in seed_rows}
     )
+    available_ridges = sorted(
+        {
+            float(row["fisher_ridge_absolute"])
+            for row in seed_rows
+            if row["episode_budget_label"] == args.plot_budget_label
+        }
+    )
+    if args.plot_ridge is None:
+        plot_ridges = available_ridges
+    else:
+        matching = [
+            ridge
+            for ridge in available_ridges
+            if matching_ridge(ridge, args.plot_ridge)
+        ]
+        if not matching:
+            raise RuntimeError(
+                f"Requested plot ridge {args.plot_ridge:g} is unavailable; "
+                f"available={available_ridges}"
+            )
+        plot_ridges = matching
     stems = [
         plot_temporal(
             figures,
             task,
             distance,
             aggregation,
-            args.plot_ridge,
+            ridge,
             args.plot_budget_label,
             seed_rows,
             summary_rows,
         )
+        for ridge in plot_ridges
         for task, distance, aggregation in strata
     ]
     manifest = {
         "schema_version": 1,
         "metrics_root": str(metrics_root),
-        "plot_ridge": args.plot_ridge,
+        "plot_ridges": plot_ridges,
         "plot_budget_label": args.plot_budget_label,
         "seed_pairing": "alignment minus none within task, seed, checkpoint, aggregation, budget, and ridge",
         "uncertainty": "mean plus/minus standard error across training seeds",

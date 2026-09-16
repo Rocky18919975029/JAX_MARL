@@ -308,15 +308,19 @@ nohup python scripts/run_h1_robust_distortion.py \
   > "$ROBUST_ROOT/pipeline.stdout" 2>&1 &
 ```
 
-After every checkpoint finishes, generate tables and the primary-ridge plots:
+After every checkpoint finishes, generate tables and one figure set for every
+computed Fisher ridge:
 
 ```bash
 python scripts/analyze_h1_robust_distortion.py \
   --metrics-root "$ROBUST_ROOT" \
   --output-root "$ROBUST_ROOT/analysis" \
-  --plot-ridge 0.001 \
   --plot-budget-label 4M
 ```
+
+Pass `--plot-ridge 0.001` only when a single primary-ridge figure set is
+desired.  Ridge values use filename-safe tokens (`0.001` becomes `0p001`) so
+the decimal is not confused with a file extension.
 
 `checkpoint_metrics.csv` retains every ridge and episode budget.
 `m_2m_4m_convergence.csv` and `fisher_ridge_sweep.csv` expose the two

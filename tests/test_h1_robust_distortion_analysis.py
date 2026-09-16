@@ -7,6 +7,7 @@ matplotlib.use("Agg")
 
 from scripts.analyze_h1_robust_distortion import (
     load_checkpoint_rows,
+    number_token,
     paired_rows,
     plot_temporal,
     summarize_paired,
@@ -33,6 +34,10 @@ def write_summary(root, condition, distance, seed, step, aligned):
                         "epsilon_lat_phase_matched": 0.3 - 0.1 * aligned,
                         "fisher_natural_gradient_cosine": 0.5 + 0.1 * aligned,
                         "epsilon_lat_optimal_scale": 0.2 - 0.05 * aligned,
+                        "optimal_nonnegative_critic_scale": 1.0,
+                        "reference_natural_norm_sq": 0.8,
+                        "critic_natural_norm_sq": 0.7,
+                        "reference_critic_natural_inner": 0.6,
                     }
                 )
     payload = {
@@ -92,3 +97,10 @@ def test_robust_analysis_pairs_baseline_and_plots(tmp_path):
     )
     assert stem.with_suffix(".png").is_file()
     assert stem.with_suffix(".pdf").is_file()
+    assert "ridge0p001" in stem.name
+
+
+def test_number_token_preserves_decimal_ridge():
+    assert number_token(0.001) == "0p001"
+    assert number_token(0.0001) == "0p0001"
+    assert number_token(1.0) == "1"
