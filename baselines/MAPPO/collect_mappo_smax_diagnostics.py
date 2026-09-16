@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import subprocess
 import sys
 from pathlib import Path
 
@@ -32,6 +34,24 @@ from jaxmarl.wrappers.baselines import load_params
 
 
 SCHEMA_VERSION = 2
+
+
+def collector_provenance():
+    script_path = Path(__file__).resolve()
+    try:
+        commit = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        commit = None
+    return {
+        "collector_git_commit": commit,
+        "collector_script_sha256": hashlib.sha256(script_path.read_bytes()).hexdigest(),
+    }
 
 
 def parse_args():
@@ -344,6 +364,7 @@ def main():
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "collector": "collect_mappo_smax_diagnostics.py",
+        **collector_provenance(),
         "checkpoint": str(checkpoint_dir),
         "checkpoint_env_step": config.get("CHECKPOINT_ENV_STEP"),
         "checkpoint_nominal_env_step": config.get("CHECKPOINT_NOMINAL_ENV_STEP"),
