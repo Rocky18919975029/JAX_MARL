@@ -73,6 +73,20 @@ def main():
     parser.add_argument("--run-name-glob", default="H1-*")
     parser.add_argument("--checkpoint-name-glob", default="*")
     parser.add_argument(
+        "--protocol-versions",
+        default="h1-v1.0",
+        help="Comma-separated checkpoint PROTOCOL_VERSION values",
+    )
+    parser.add_argument(
+        "--maps",
+        help="Optional comma-separated MAP_NAME values",
+    )
+    parser.add_argument(
+        "--actor-variants",
+        default="nps",
+        help="Comma-separated ps/nps variants; defaults to the original NPS scope",
+    )
+    parser.add_argument(
         "--conditions",
         help="Comma-separated EXPERIMENT_CONDITION values to include",
     )
@@ -94,6 +108,7 @@ def main():
         help="BLAS threads per worker; 0 divides detected CPUs across worker slots",
     )
     parser.add_argument("--allow-missing", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     run_root = args.run_root.expanduser().resolve()
     gpu_ids = tuple(item.strip() for item in args.gpus.split(",") if item.strip())
@@ -113,7 +128,33 @@ def main():
         args.fisher_ridge_absolute is None or args.fisher_ridge_absolute <= 0
     ):
         raise ValueError("The latent stage requires a positive --fisher-ridge-absolute")
-    tasks, missing = discover_tasks(run_root)
+    protocol_versions = tuple(
+        item.strip() for item in args.protocol_versions.split(",") if item.strip()
+    )
+    map_names = (
+        tuple(item.strip() for item in args.maps.split(",") if item.strip())
+        if args.maps
+        else None
+    )
+    actor_variants = tuple(
+        item.strip() for item in args.actor_variants.split(",") if item.strip()
+    )
+    if not protocol_versions:
+        raise ValueError("Select at least one protocol version")
+    if not actor_variants or set(actor_variants) - {"ps", "nps"}:
+        raise ValueError("--actor-variants must contain ps and/or nps")
+    if "ps" in actor_variants and set(stages) - {"collect"}:
+        raise ValueError(
+            "PS benchmark checkpoints currently support collection only; "
+            "the canonical H1 latent/decision/Bellman stages are NPS-specific"
+        )
+    tasks, missing = discover_tasks(
+        run_root,
+        protocol_versions=protocol_versions,
+        run_name_glob=args.run_name_glob,
+        map_names=map_names,
+        actor_variants=actor_variants,
+    )
     if missing and not args.allow_missing:
         raise RuntimeError(
             f"{len(missing)} preregistered checkpoints are missing; finish training "
@@ -135,8 +176,6 @@ def main():
         )
         condition = config.get("EXPERIMENT_CONDITION", config.get("ALIGN_MODE"))
         distance = config.get("ALIGN_DISTANCE", "ln_mse")
-        if config.get("ACTOR_PARAMETER_SHARING"):
-            continue
         if conditions is not None and condition not in conditions:
             continue
         if args.align_distance is not None and distance != args.align_distance:
@@ -150,6 +189,11 @@ def main():
         complete = all((output / STAGE_MARKERS[stage]).is_file() for stage in stages)
         if not complete:
             selected.append((task, output))
+    if args.dry_run:
+        print(f"discovered={len(tasks)} pending={len(selected)} missing={len(missing)}")
+        for task, output in selected:
+            print(f"{task.run_name}/{task.checkpoint_dir.name} -> {output}")
+        return
     pending = {gpu: deque() for gpu in gpu_ids}
     for index, item in enumerate(selected):
         pending[gpu_ids[index % len(gpu_ids)]].append(item)

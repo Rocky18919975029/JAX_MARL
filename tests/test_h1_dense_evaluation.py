@@ -31,3 +31,41 @@ def test_all_checkpoint_discovery_preserves_preregistered_tasks(tmp_path):
         "step_000002500000",
     }
     assert [task.checkpoint_index for task in dense[-2:]] == [8, 9]
+
+
+def test_discovery_filters_benchmark_before_missing_checkpoint_validation(tmp_path):
+    selected = tmp_path / "checkpoints" / "project" / "selected-id"
+    unrelated = tmp_path / "checkpoints" / "project" / "unrelated-id"
+    for directory, run_name, map_name, sharing in (
+        (selected, "SMAXB4-3s5z_vs_3s6z-nps-none-seed1", "3s5z_vs_3s6z", False),
+        (unrelated, "SMAXB4-6h_vs_8z-ps-none-seed1", "6h_vs_8z", True),
+    ):
+        make_checkpoint(directory / "initial")
+        (directory / "initial" / "config.json").write_text(
+            json.dumps(
+                {
+                    "PROTOCOL_VERSION": "smax-alignment-benchmark-4seed-v1.0",
+                    "MAP_NAME": map_name,
+                    "ACTOR_PARAMETER_SHARING": sharing,
+                    "SEED": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (directory / "initial" / "metadata.json").write_text(
+            json.dumps({"wandb_run_name": run_name}), encoding="utf-8"
+        )
+    for name, _ in CHECKPOINT_SPECS[1:]:
+        make_checkpoint(selected / name)
+
+    tasks, missing = discover_tasks(
+        tmp_path,
+        protocol_versions=("smax-alignment-benchmark-4seed-v1.0",),
+        run_name_glob="SMAXB4-3s5z_vs_3s6z-nps-*",
+        map_names=("3s5z_vs_3s6z",),
+        actor_variants=("nps",),
+    )
+
+    assert not missing
+    assert len(tasks) == len(CHECKPOINT_SPECS)
+    assert {task.run_name for task in tasks} == {"SMAXB4-3s5z_vs_3s6z-nps-none-seed1"}

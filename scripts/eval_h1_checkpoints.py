@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
 import json
 import os
 import signal
@@ -75,7 +76,24 @@ def append_jsonl(path, payload):
         file.flush()
 
 
-def discover_tasks(run_root, include_all=False):
+def discover_tasks(
+    run_root,
+    include_all=False,
+    protocol_versions=("h1-v1.0",),
+    run_name_glob="*",
+    map_names=None,
+    actor_variants=None,
+):
+    """Discover checkpoint tasks after filtering runs, before checking steps.
+
+    Filtering before checkpoint validation is important when one output root
+    contains several experiment matrices that may finish at different times.
+    Defaults preserve the original H1-only discovery behavior.
+    """
+
+    protocol_versions = set(protocol_versions)
+    map_names = set(map_names) if map_names is not None else None
+    actor_variants = set(actor_variants) if actor_variants is not None else None
     checkpoint_root = run_root / "checkpoints"
     run_dirs = sorted(
         path.parent.parent
@@ -89,7 +107,7 @@ def discover_tasks(run_root, include_all=False):
             missing.append(f"{run_dir}: initial/config.json")
             continue
         config = json.loads(initial_config.read_text(encoding="utf-8"))
-        if config.get("PROTOCOL_VERSION") != "h1-v1.0":
+        if config.get("PROTOCOL_VERSION") not in protocol_versions:
             continue
         run_name = config.get("WANDB_NAME") or run_dir.name.rsplit("-", 1)[0]
         # WANDB_NAME lives in the environment rather than Hydra config, so the
@@ -98,6 +116,13 @@ def discover_tasks(run_root, include_all=False):
         if metadata_path.is_file():
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             run_name = metadata.get("wandb_run_name") or run_name
+        actor_variant = "ps" if config.get("ACTOR_PARAMETER_SHARING") else "nps"
+        if not fnmatch.fnmatch(run_name, run_name_glob):
+            continue
+        if map_names is not None and config.get("MAP_NAME") not in map_names:
+            continue
+        if actor_variants is not None and actor_variant not in actor_variants:
+            continue
         training_seed = int(config["SEED"])
         output_dir = run_root / "evaluation" / run_name
         for checkpoint_index, (directory_name, nominal_step) in enumerate(
