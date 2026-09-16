@@ -9,7 +9,11 @@ from scripts.analyze_h1_mechanisms import (
     paired_effects,
     validate_and_reuse_baseline,
 )
-from scripts.plot_h1_mechanisms import draw_paired_panel, draw_raw_panel
+from scripts.plot_h1_mechanisms import (
+    draw_paired_panel,
+    draw_raw_panel,
+    finish_figure,
+)
 
 
 def fixture_rows():
@@ -86,13 +90,15 @@ def test_cka_reuses_baseline_without_new_seed_replicates():
 
 def test_figures_overlay_four_seeds_and_show_decision_chance_reference():
     rows = [
-        row for row in fixture_rows()
+        row
+        for row in fixture_rows()
         if row["task"] == "10m_vs_11m" and row["align_distance"] == "ln_mse"
     ]
     summaries = curve_summary(rows, np.random.default_rng(9), 100)
     effects = paired_effects(fixture_rows(), np.random.default_rng(10), 100)
     selected_effects = [
-        row for row in effects
+        row
+        for row in effects
         if row["task"] == "10m_vs_11m" and row["align_distance"] == "ln_mse"
     ]
     figure, axis = plt.subplots()
@@ -105,4 +111,30 @@ def test_figures_overlay_four_seeds_and_show_decision_chance_reference():
     draw_paired_panel(axis, selected_effects, rows, "epsilon_lat")
     assert len(axis.lines) == 1 + 2 * (4 + 1)
     assert float(axis.lines[0].get_ydata()[0]) == 0.0
+    plt.close(figure)
+
+
+def test_shared_legend_has_a_dedicated_right_column():
+    rows = [
+        row
+        for row in fixture_rows()
+        if row["task"] == "10m_vs_11m" and row["align_distance"] == "ln_mse"
+    ]
+    summaries = curve_summary(rows, np.random.default_rng(11), 100)
+    figure, axes = plt.subplots(2, 2, figsize=(13.5, 8))
+    for axis, metric in zip(
+        axes.flat,
+        ("heldout_return", "epsilon_lat", "epsilon_dec", "epsilon_bell"),
+    ):
+        draw_raw_panel(axis, summaries, rows, metric)
+    legend = finish_figure(figure, axes, "Layout test")
+
+    figure.canvas.draw()
+    assert max(axis.get_position().x1 for axis in axes.flat) <= 0.82
+    assert legend.get_title().get_text() == "Alignment condition"
+    assert [text.get_text() for text in legend.get_texts()] == [
+        "none",
+        "A → C",
+        "C → A",
+    ]
     plt.close(figure)
