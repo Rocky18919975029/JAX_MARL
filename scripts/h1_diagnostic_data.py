@@ -23,6 +23,7 @@ TYPE_CONDITIONING_ARRAYS = LATENT_ARRAYS + (
     "critic_latent",
     "state_unit_types",
 )
+ROBUST_DISTORTION_ARRAYS = LATENT_ARRAYS + ("state_unit_types",)
 DECISION_ARRAYS = (
     "active",
     "alive",

@@ -248,3 +248,79 @@ The audit writes `tables/checkpoint_type_conditioning.csv`,
 `tables/paired_curve_summary.csv`, and one absolute/paired figure per
 task-distance combination under `figures/`.  The distance-free `none` rows are
 reused exactly in the Linear CKA stratum rather than retrained or recomputed.
+
+## Robust latent-distortion sensitivity analysis
+
+The robust analysis reuses the existing complete held-out episode shards and
+does not train or collect again.  It reports four complementary quantities:
+
+```
+epsilon_lat_raw
+epsilon_lat_phase_matched
+fisher_natural_gradient_cosine
+epsilon_lat_optimal_scale
+```
+
+`epsilon_lat_raw` reproduces the historical complete-episode GAE comparison.
+The collector did not record the original training-rollout phase for an
+independently reset held-out episode, so exact phase recovery is impossible.
+`epsilon_lat_phase_matched` instead marginalizes each episode uniformly over
+all possible starting phases of the fixed training `NUM_STEPS` horizon.  At a
+rollout boundary it retains the one-step critic bootstrap and cuts only the
+recursive GAE term.
+
+The Fisher-natural cosine uses the same block-diagonal regularized Fisher
+metric as distortion.  The scale-corrected metric chooses one global
+nonnegative scale per checkpoint/aggregation:
+
+```
+alpha* = max(0, <g_critic, g_MC>_F / <g_critic, g_critic>_F)
+epsilon_scale = ||g_MC - alpha* g_critic||_F^2
+```
+
+Every metric is recomputed for nested `M`, `2M`, and `4M` episode sets, for a
+fixed Fisher ridge sweep, and for both slot-pooled and slot-by-type grouping.
+The latter is weighted as `sum_i sum_k p(k|i) metric(i,k)` and never combines
+the coordinate systems of different NPS actors.
+
+Run the resumable offline recomputation:
+
+```bash
+cd ~/JaxMARL
+conda activate jaxmarl
+unset LD_LIBRARY_PATH
+
+export H1_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs"
+export MSE_ROOT="$H1_ROOT/reduced_nps_4condition"
+export CKA_ROOT="$H1_ROOT/cka_distance_robustness"
+export ROBUST_ROOT="$H1_ROOT/nps_robust_distortion_v1"
+
+mkdir -p "$ROBUST_ROOT"
+
+nohup python scripts/run_h1_robust_distortion.py \
+  --source-root "$MSE_ROOT" \
+  --source-root "$CKA_ROOT" \
+  --output-root "$ROBUST_ROOT" \
+  --run-name-glob 'H1-*' \
+  --maps 10m_vs_11m,smacv2_10_units \
+  --fisher-ridges 0.0001,0.0003,0.001,0.003,0.01 \
+  --workers 4 \
+  > "$ROBUST_ROOT/pipeline.stdout" 2>&1 &
+```
+
+After every checkpoint finishes, generate tables and the primary-ridge plots:
+
+```bash
+python scripts/analyze_h1_robust_distortion.py \
+  --metrics-root "$ROBUST_ROOT" \
+  --output-root "$ROBUST_ROOT/analysis" \
+  --plot-ridge 0.001 \
+  --plot-budget-label 4M
+```
+
+`checkpoint_metrics.csv` retains every ridge and episode budget.
+`m_2m_4m_convergence.csv` and `fisher_ridge_sweep.csv` expose the two
+sensitivity analyses directly.  The seed-paired tables and figures subtract
+the same task/seed/checkpoint `none` run before aggregating across training
+seeds.  The one distance-free baseline is reused in both LN-MSE and Linear CKA
+strata.
