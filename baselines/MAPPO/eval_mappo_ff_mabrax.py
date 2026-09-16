@@ -19,6 +19,7 @@ try:
         ActorFF,
         MABraxWorldStateWrapper,
         batchify_observations,
+        make_gaussian_policy,
         unbatchify_actions,
     )
 except ModuleNotFoundError:  # Direct execution from baselines/MAPPO.
@@ -26,6 +27,7 @@ except ModuleNotFoundError:  # Direct execution from baselines/MAPPO.
         ActorFF,
         MABraxWorldStateWrapper,
         batchify_observations,
+        make_gaussian_policy,
         unbatchify_actions,
     )
 from jaxmarl.wrappers.baselines import load_params
@@ -77,7 +79,10 @@ def main():
     parameter_axis = None if config["ACTOR_PARAMETER_SHARING"] else 0
 
     def apply_actor(params, observations):
-        return jax.vmap(actor.apply, in_axes=(parameter_axis, 0))(params, observations)
+        mean, log_std, latent = jax.vmap(actor.apply, in_axes=(parameter_axis, 0))(
+            params, observations
+        )
+        return make_gaussian_policy(mean, log_std), latent
 
     horizon = int(getattr(raw_env, "episode_length", 1000))
 

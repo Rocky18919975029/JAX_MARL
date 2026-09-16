@@ -230,7 +230,18 @@ class ActorFF(nn.Module):
             bias_init=constant(0.0),
         )(latent)
         log_std = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
-        return distrax.MultivariateNormalDiag(mean, jnp.exp(log_std)), latent
+        # Only arrays may cross the per-agent vmap boundary. Distrax bijectors
+        # cache derived shapes and can otherwise leak a BatchTracer on recent
+        # JAX versions. Explicit broadcasting also fixes the batch/event shape
+        # for six agents with one action dimension each.
+        log_std = jnp.broadcast_to(log_std, mean.shape)
+        return mean, log_std, latent
+
+
+def make_gaussian_policy(mean, log_std):
+    """Construct the continuous policy outside the per-agent network vmap."""
+
+    return distrax.MultivariateNormalDiag(mean, jnp.exp(log_std))
 
 
 class CriticFF(nn.Module):
@@ -428,9 +439,10 @@ def make_train(
 
         def apply_actor(params, observations):
             parameter_axis = None if config["ACTOR_PARAMETER_SHARING"] else 0
-            return jax.vmap(actor_network.apply, in_axes=(parameter_axis, 0))(
-                params, observations
-            )
+            mean, log_std, latent = jax.vmap(
+                actor_network.apply, in_axes=(parameter_axis, 0)
+            )(params, observations)
+            return make_gaussian_policy(mean, log_std), latent
 
         def actor_tree_norms(tree):
             if config["ACTOR_PARAMETER_SHARING"]:

@@ -19,6 +19,8 @@ def test_mappo_mabrax_is_continuous_and_centralized():
     source = SOURCE.read_text(encoding="utf-8")
     assert "distrax.MultivariateNormalDiag" in source
     assert "distrax.Categorical" not in source
+    assert "jnp.broadcast_to(log_std, mean.shape)" in source
+    assert "def make_gaussian_policy" in source
     assert "state.obs[None, :]" in source
     assert 'last_obs["world_state"]' in source
     assert "actor_network.apply" in source
