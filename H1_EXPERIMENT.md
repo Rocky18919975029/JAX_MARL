@@ -188,3 +188,63 @@ has expected Kendall tau `0`, pairwise accuracy `0.5`, and hence
 `epsilon_Dec` does not establish preserved decision sufficiency. The validity
 figures show these reference lines; top-1 agreement is reported descriptively
 because its random baseline depends on the number of legal actions.
+
+## Offline SMACv2 slot-by-type audit
+
+SMACv2 samples a unit type for each actor slot at episode reset.  The NPS
+actor module assigned to slot `i` is fixed, but the unit type occupying that
+slot changes across episodes.  The original diagnostic pooled all valid
+samples within slot before constructing its gradient mismatch and Fisher
+matrix.  The audit therefore reports both
+
+```
+epsilon_Lat_slot      = sum_i D_i
+epsilon_Lat_slot_type = sum_i sum_k p_i,k D_i,k
+```
+
+where `p_i,k` is the valid-sample frequency of type `k` inside slot `i`.
+It also computes held-out Linear CKA in the same two ways:
+
+```
+d_CKA_slot      = mean_i (1 - CKA_i)
+d_CKA_slot_type = mean_i sum_k p_i,k (1 - CKA_i,k)
+```
+
+Slots are never pooled, so independent actor encoders remain separate.  The
+calculation streams sufficient statistics from the existing episode shards;
+it does not recollect trajectories, alter checkpoints, or overwrite canonical
+H1 summaries.  `10m_vs_11m` is included as a mandatory one-type control: both
+versions of each metric must agree there to numerical precision.  When the
+canonical baseline-free MC latent summary is present, the new streaming
+slot-pooled result must also reproduce it before the audit can finish.
+
+Run the resumable offline audit with:
+
+```bash
+cd ~/JaxMARL
+conda activate jaxmarl
+unset LD_LIBRARY_PATH
+
+export H1_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs"
+export MSE_ROOT="$H1_ROOT/reduced_nps_4condition"
+export CKA_ROOT="$H1_ROOT/cka_distance_robustness"
+export TYPE_AUDIT_ROOT="$H1_ROOT/nps_slot_type_audit"
+mkdir -p "$TYPE_AUDIT_ROOT"
+
+nohup python scripts/run_h1_type_conditioning_audit.py \
+  --mse-root "$MSE_ROOT" \
+  --cka-root "$CKA_ROOT" \
+  --output-root "$TYPE_AUDIT_ROOT" \
+  --maps 10m_vs_11m,smacv2_10_units \
+  --seeds 1,2,3,4 \
+  --fisher-ridge-absolute 0.001 \
+  --workers 4 \
+  > "$TYPE_AUDIT_ROOT/pipeline.stdout" 2>&1 &
+```
+
+Completed checkpoint JSON files are cache markers and are skipped on restart.
+The audit writes `tables/checkpoint_type_conditioning.csv`,
+`tables/curve_summary.csv`, `tables/paired_seed_differences.csv`,
+`tables/paired_curve_summary.csv`, and one absolute/paired figure per
+task-distance combination under `figures/`.  The distance-free `none` rows are
+reused exactly in the Linear CKA stratum rather than retrained or recomputed.

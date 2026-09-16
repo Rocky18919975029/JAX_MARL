@@ -18,6 +18,11 @@ LATENT_ARRAYS = (
     "global_done",
     "actor_score",
 )
+TYPE_CONDITIONING_ARRAYS = LATENT_ARRAYS + (
+    "actor_latent",
+    "critic_latent",
+    "state_unit_types",
+)
 DECISION_ARRAYS = (
     "active",
     "alive",
