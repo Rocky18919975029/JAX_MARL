@@ -9,6 +9,7 @@ pytest.importorskip("optax")
 pytest.importorskip("wandb")
 
 from baselines.MAPPO.mappo_rnn_smax import (
+    directional_subspace_containment,
     latent_distance,
     linear_cka_distance,
     maybe_shuffle_targets_within_agent,
@@ -63,6 +64,60 @@ def test_grouped_linear_cka_is_the_mean_of_per_agent_distances():
         )
     )
     np.testing.assert_allclose(grouped, expected, atol=1e-6)
+
+
+def test_grouped_containment_is_directional_and_type_conditioned():
+    samples, agents, envs = 4, 2, 32
+    key = jax.random.PRNGKey(31)
+    source = jax.random.normal(key, (samples, agents * envs, 4))
+    target = source.at[..., 3].set(0.0)
+    mask = jnp.ones((samples, agents * envs), dtype=jnp.bool_)
+    unit_type = jnp.tile(
+        jnp.concatenate(
+            (jnp.zeros((envs // 2,)), jnp.ones((envs // 2,))), axis=0
+        ),
+        (samples, agents),
+    ).astype(jnp.int32)
+    distance = representation_distance(
+        source,
+        target,
+        mask,
+        distance_name="containment",
+        num_agent_groups=agents,
+        group_labels=unit_type,
+        num_label_groups=2,
+        min_group_samples=32,
+    )
+    reverse = representation_distance(
+        target,
+        source,
+        mask,
+        distance_name="containment",
+        num_agent_groups=agents,
+        group_labels=unit_type,
+        num_label_groups=2,
+        min_group_samples=32,
+    )
+    assert float(distance) > 0.15
+    assert float(reverse) < 5e-3
+
+
+def test_containment_requires_enough_samples_per_slot_type():
+    source = jax.random.normal(jax.random.PRNGKey(32), (2, 6, 4))
+    target = jax.random.normal(jax.random.PRNGKey(33), (2, 6, 4))
+    mask = jnp.ones((2, 6), dtype=jnp.bool_)
+    labels = jnp.zeros((2, 6), dtype=jnp.int32)
+    distance = representation_distance(
+        source,
+        target,
+        mask,
+        distance_name="containment",
+        num_agent_groups=3,
+        group_labels=labels,
+        num_label_groups=1,
+        min_group_samples=5,
+    )
+    assert float(distance) == 0.0
 
 
 def test_h1_shuffle_is_a_deterministic_alive_derangement():
@@ -158,6 +213,40 @@ def test_linear_cka_gradient_routing(mode, actor_nonzero, critic_nonzero):
             target,
             mask,
             distance_name="linear_cka",
+            num_agent_groups=3,
+        )
+
+    def loss(actor_value, critic_value):
+        if mode == "c_to_a":
+            return distance(actor_value, jax.lax.stop_gradient(critic_value))
+        if mode == "a_to_c":
+            return distance(critic_value, jax.lax.stop_gradient(actor_value))
+        return distance(actor_value, critic_value)
+
+    actor_grad, critic_grad = jax.grad(loss, argnums=(0, 1))(actor, critic)
+    assert (float(jnp.linalg.norm(actor_grad)) > 1e-9) is actor_nonzero
+    assert (float(jnp.linalg.norm(critic_grad)) > 1e-9) is critic_nonzero
+
+
+@pytest.mark.parametrize(
+    ("mode", "actor_nonzero", "critic_nonzero"),
+    [
+        ("c_to_a", True, False),
+        ("a_to_c", False, True),
+        ("joint", True, True),
+    ],
+)
+def test_containment_gradient_routing(mode, actor_nonzero, critic_nonzero):
+    actor = jax.random.normal(jax.random.PRNGKey(34), (3, 32, 8))
+    critic = jax.random.normal(jax.random.PRNGKey(35), (3, 32, 8))
+    mask = jnp.ones((3, 32), dtype=jnp.bool_)
+
+    def distance(source, target):
+        return representation_distance(
+            source,
+            target,
+            mask,
+            distance_name="containment",
             num_agent_groups=3,
         )
 

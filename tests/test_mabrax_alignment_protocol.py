@@ -22,6 +22,7 @@ def load_module(path, name):
 def test_alignment_distances_have_expected_invariances():
     jnp = pytest.importorskip("jax.numpy")
     from baselines.MAPPO.alignment_utils import (
+        directional_subspace_containment,
         layernorm_mse_distance,
         linear_cka_distance,
     )
@@ -36,6 +37,29 @@ def test_alignment_distances_have_expected_invariances():
     assert float(linear_cka_distance(source, source, mask)) < 1e-6
     assert float(layernorm_mse_distance(source, rotated, mask)) > 0.1
     assert float(linear_cka_distance(source, rotated, mask)) < 1e-5
+    assert float(directional_subspace_containment(source, rotated, mask)[0]) < 5e-3
+
+
+def test_containment_is_directional_and_masked():
+    jnp = pytest.importorskip("jax.numpy")
+    from baselines.MAPPO.alignment_utils import directional_subspace_containment
+
+    grid = jnp.linspace(-2.0, 2.0, 128)
+    full = jnp.stack((grid, grid**2, jnp.sin(grid)), axis=-1)
+    rank_two = full.at[:, 2].set(0.0)
+    mask = jnp.ones((128,))
+    contained = directional_subspace_containment(rank_two, full, mask)[0]
+    not_contained = directional_subspace_containment(full, rank_two, mask)[0]
+    assert float(contained) < 5e-3
+    assert float(not_contained) > 0.2
+
+    changed = full.at[-8:].set(1e6)
+    partial_mask = mask.at[-8:].set(0.0)
+    np.testing.assert_allclose(
+        directional_subspace_containment(full, rank_two, partial_mask)[0],
+        directional_subspace_containment(changed, rank_two, partial_mask)[0],
+        atol=1e-6,
+    )
 
 
 def test_representation_distance_never_pools_nps_agents():
@@ -66,6 +90,21 @@ def test_formal_matrix_is_56_unique_runs():
     assert len(tasks) == 56
     assert len({task.run_name for task in tasks}) == 56
     assert sum(task.mode == "none" for task in tasks) == 8
+
+
+def test_containment_can_be_selected_without_changing_default_matrix():
+    runner = load_module(RUNNER, "run_mabrax_alignment_dsc_test")
+    tasks = runner.task_matrix(
+        ("nps",),
+        (1, 2, 3, 4),
+        cka_coefficient=None,
+        distances=("containment",),
+        containment_coefficient=0.3,
+    )
+    assert len(tasks) == 16
+    aligned = [task for task in tasks if task.mode != "none"]
+    assert all(task.distance == "containment" for task in aligned)
+    assert all("_dsc-" in task.run_name for task in aligned)
 
 
 def test_calibration_uses_all_four_direction_recipient_cells():

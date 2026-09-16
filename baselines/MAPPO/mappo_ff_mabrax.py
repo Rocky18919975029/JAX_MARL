@@ -34,12 +34,14 @@ import jaxmarl
 
 try:
     from baselines.MAPPO.alignment_utils import (
+        representation_containment_statistics,
         representation_distance,
         tree_l2_norm,
         vmapped_optimizer,
     )
 except ModuleNotFoundError:  # Direct execution from baselines/MAPPO.
     from alignment_utils import (
+        representation_containment_statistics,
         representation_distance,
         tree_l2_norm,
         vmapped_optimizer,
@@ -144,6 +146,11 @@ def make_checkpoint_callback(config, run):
             "matched_comparison": config["MATCHED_COMPARISON"],
             "align_mode": config["ALIGN_MODE"],
             "align_distance": config["ALIGN_DISTANCE"],
+            "align_distance_epsilon": config["ALIGN_DISTANCE_EPS"],
+            "align_containment_ridge_ratio": config[
+                "ALIGN_CONTAINMENT_RIDGE_RATIO"
+            ],
+            "align_containment_epsilon": config["ALIGN_CONTAINMENT_EPS"],
             "alignment_coef": config["ALIGNMENT_COEF"],
             "condition": config["EXPERIMENT_CONDITION"],
             "matrix_profile": config.get("MATRIX_PROFILE", ""),
@@ -317,6 +324,8 @@ def unbatchify_actions(actions, agent_list, num_envs):
 
 def _validate_and_derive_config(config: Dict[str, Any], env) -> Dict[str, Any]:
     config = dict(config)
+    config.setdefault("ALIGN_CONTAINMENT_RIDGE_RATIO", 1e-3)
+    config.setdefault("ALIGN_CONTAINMENT_EPS", 1e-6)
     for field in (
         "NUM_ENVS",
         "NUM_STEPS",
@@ -333,12 +342,16 @@ def _validate_and_derive_config(config: Dict[str, Any], env) -> Dict[str, Any]:
         )
     if config["ALIGN_MODE"] not in {"none", "c_to_a", "a_to_c", "joint"}:
         raise ValueError("ALIGN_MODE must be none, c_to_a, a_to_c, or joint")
-    if config["ALIGN_DISTANCE"] not in {"ln_mse", "linear_cka"}:
-        raise ValueError("ALIGN_DISTANCE must be ln_mse or linear_cka")
+    if config["ALIGN_DISTANCE"] not in {"ln_mse", "linear_cka", "containment"}:
+        raise ValueError("ALIGN_DISTANCE must be ln_mse, linear_cka, or containment")
     if config["ALIGN_MODE"] == "none" and config["ALIGN_DISTANCE"] != "ln_mse":
         raise ValueError("The distance-free baseline must use ALIGN_DISTANCE=ln_mse")
     if float(config["ALIGN_DISTANCE_EPS"]) <= 0:
         raise ValueError("ALIGN_DISTANCE_EPS must be positive")
+    if float(config["ALIGN_CONTAINMENT_RIDGE_RATIO"]) < 0:
+        raise ValueError("ALIGN_CONTAINMENT_RIDGE_RATIO must be nonnegative")
+    if float(config["ALIGN_CONTAINMENT_EPS"]) <= 0:
+        raise ValueError("ALIGN_CONTAINMENT_EPS must be positive")
 
     action_dims = {env.action_space(agent).shape[0] for agent in env.agents}
     if len(action_dims) != 1:
@@ -652,36 +665,85 @@ def make_train(
                         kwargs = {
                             "agent_axis": 1,
                             "epsilon": config["ALIGN_DISTANCE_EPS"],
+                            "containment_ridge_ratio": config[
+                                "ALIGN_CONTAINMENT_RIDGE_RATIO"
+                            ],
+                            "containment_epsilon": config[
+                                "ALIGN_CONTAINMENT_EPS"
+                            ],
                         }
-                        c_to_a = representation_distance(
-                            actor_latent,
-                            jax.lax.stop_gradient(batch.critic_latent_old),
-                            batch.alignment_mask,
-                            distance_name,
-                            **kwargs,
-                        )
-                        a_to_c = representation_distance(
-                            critic_latent,
-                            jax.lax.stop_gradient(batch.actor_latent_old),
-                            batch.alignment_mask,
-                            distance_name,
-                            **kwargs,
-                        )
-                        joint = representation_distance(
-                            actor_latent,
-                            critic_latent,
-                            batch.alignment_mask,
-                            distance_name,
-                            **kwargs,
-                        )
-                        selected = jnp.zeros((), actor_latent.dtype)
-                        if config["ALIGN_MODE"] == "c_to_a":
-                            selected = c_to_a
-                        elif config["ALIGN_MODE"] == "a_to_c":
-                            selected = a_to_c
-                        elif config["ALIGN_MODE"] == "joint":
-                            selected = joint
-                        return selected, (c_to_a, a_to_c, joint)
+                        zero = jnp.zeros((), actor_latent.dtype)
+                        containment_stats = {
+                            "loss": zero,
+                            "similarity": zero,
+                            "source_effective_rank": zero,
+                            "valid_samples": zero,
+                            "valid_groups": zero,
+                        }
+                        if distance_name == "containment":
+                            if config["ALIGN_MODE"] == "a_to_c":
+                                containment_source = critic_latent
+                                containment_target = jax.lax.stop_gradient(
+                                    batch.actor_latent_old
+                                )
+                            elif config["ALIGN_MODE"] == "joint":
+                                containment_source = actor_latent
+                                containment_target = critic_latent
+                            else:
+                                containment_source = actor_latent
+                                containment_target = jax.lax.stop_gradient(
+                                    batch.critic_latent_old
+                                )
+                            containment_stats = representation_containment_statistics(
+                                containment_source,
+                                containment_target,
+                                batch.alignment_mask,
+                                agent_axis=1,
+                                ridge_ratio=config[
+                                    "ALIGN_CONTAINMENT_RIDGE_RATIO"
+                                ],
+                                epsilon=config["ALIGN_CONTAINMENT_EPS"],
+                            )
+                            selected = containment_stats["loss"]
+                            c_to_a = zero
+                            a_to_c = zero
+                            joint = zero
+                            if config["ALIGN_MODE"] == "c_to_a":
+                                c_to_a = selected
+                            elif config["ALIGN_MODE"] == "a_to_c":
+                                a_to_c = selected
+                            elif config["ALIGN_MODE"] == "joint":
+                                joint = selected
+                        else:
+                            c_to_a = representation_distance(
+                                actor_latent,
+                                jax.lax.stop_gradient(batch.critic_latent_old),
+                                batch.alignment_mask,
+                                distance_name,
+                                **kwargs,
+                            )
+                            a_to_c = representation_distance(
+                                critic_latent,
+                                jax.lax.stop_gradient(batch.actor_latent_old),
+                                batch.alignment_mask,
+                                distance_name,
+                                **kwargs,
+                            )
+                            joint = representation_distance(
+                                actor_latent,
+                                critic_latent,
+                                batch.alignment_mask,
+                                distance_name,
+                                **kwargs,
+                            )
+                            selected = zero
+                            if config["ALIGN_MODE"] == "c_to_a":
+                                selected = c_to_a
+                            elif config["ALIGN_MODE"] == "a_to_c":
+                                selected = a_to_c
+                            elif config["ALIGN_MODE"] == "joint":
+                                selected = joint
+                        return selected, (c_to_a, a_to_c, joint, containment_stats)
 
                     def total_loss(actor_params, critic_params):
                         base, rl_aux = rl_loss(actor_params, critic_params)
@@ -724,6 +786,7 @@ def make_train(
                         calibration = (
                             calibration_grads("ln_mse"),
                             calibration_grads("linear_cka"),
+                            calibration_grads("containment"),
                         )
 
                     if not config["ACTOR_PARAMETER_SHARING"]:
@@ -738,6 +801,7 @@ def make_train(
                             calibration = (
                                 (scale_actor(calibration[0][0]), calibration[0][1]),
                                 (scale_actor(calibration[1][0]), calibration[1][1]),
+                                (scale_actor(calibration[2][0]), calibration[2][1]),
                             )
 
                     actor_grad_norms = actor_tree_norms(actor_grads)
@@ -763,6 +827,16 @@ def make_train(
                         "alignment_c_to_a_distance": alignment_aux[0],
                         "alignment_a_to_c_distance": alignment_aux[1],
                         "alignment_current_joint_distance": alignment_aux[2],
+                        "containment_similarity": alignment_aux[3]["similarity"],
+                        "containment_source_effective_rank": alignment_aux[3][
+                            "source_effective_rank"
+                        ],
+                        "containment_valid_samples_mean": alignment_aux[3][
+                            "valid_samples"
+                        ],
+                        "containment_valid_agent_groups": alignment_aux[3][
+                            "valid_groups"
+                        ],
                         "actor_grad_norm_mean": actor_grad_norms.mean(),
                         "actor_rl_grad_norm_mean": actor_rl_norms.mean(),
                         "actor_cross_grad_norm_mean": actor_cross_norms.mean(),
@@ -778,8 +852,10 @@ def make_train(
                     if calibration is not None:
                         ln_actor = actor_tree_norms(calibration[0][0])
                         cka_actor = actor_tree_norms(calibration[1][0])
+                        containment_actor = actor_tree_norms(calibration[2][0])
                         ln_critic = tree_l2_norm(calibration[0][1])
                         cka_critic = tree_l2_norm(calibration[1][1])
+                        containment_critic = tree_l2_norm(calibration[2][1])
                         info.update(
                             {
                                 "calibration_ln_mse_actor_cross_to_rl_ratio": (
@@ -788,9 +864,15 @@ def make_train(
                                 "calibration_linear_cka_actor_cross_to_rl_ratio": (
                                     cka_actor / jnp.maximum(actor_rl_norms, 1e-12)
                                 ).mean(),
+                                "calibration_containment_actor_cross_to_rl_ratio": (
+                                    containment_actor
+                                    / jnp.maximum(actor_rl_norms, 1e-12)
+                                ).mean(),
                                 "calibration_ln_mse_critic_cross_to_rl_ratio": ln_critic
                                 / jnp.maximum(critic_rl_norm, 1e-12),
                                 "calibration_linear_cka_critic_cross_to_rl_ratio": cka_critic
+                                / jnp.maximum(critic_rl_norm, 1e-12),
+                                "calibration_containment_critic_cross_to_rl_ratio": containment_critic
                                 / jnp.maximum(critic_rl_norm, 1e-12),
                             }
                         )
@@ -908,6 +990,8 @@ def main(hydra_config):
     condition = config["ALIGN_MODE"]
     if config["ALIGN_DISTANCE"] == "linear_cka" and condition != "none":
         condition = f"{condition}_cka"
+    elif config["ALIGN_DISTANCE"] == "containment" and condition != "none":
+        condition = f"{condition}_dsc"
     if config.get("EXPERIMENT_CONDITION") not in ("", condition):
         raise ValueError("EXPERIMENT_CONDITION does not match alignment settings")
     config["EXPERIMENT_CONDITION"] = condition

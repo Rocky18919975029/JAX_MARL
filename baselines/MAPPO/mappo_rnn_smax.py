@@ -35,6 +35,10 @@ from omegaconf import OmegaConf
 
 import wandb
 from tqdm.auto import tqdm
+try:
+    from baselines.MAPPO.alignment_utils import directional_subspace_containment
+except ModuleNotFoundError:  # Direct execution from baselines/MAPPO.
+    from alignment_utils import directional_subspace_containment
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import JaxMARLWrapper, SMAXLogWrapper, save_params
 
@@ -140,6 +144,16 @@ def make_checkpoint_callback(config, run):
                 "align_mode": config["ALIGN_MODE"],
                 "align_distance": config["ALIGN_DISTANCE"],
                 "align_distance_eps": config["ALIGN_DISTANCE_EPS"],
+                "align_containment_ridge_ratio": config[
+                    "ALIGN_CONTAINMENT_RIDGE_RATIO"
+                ],
+                "align_containment_epsilon": config["ALIGN_CONTAINMENT_EPS"],
+                "align_containment_group_by_unit_type": config[
+                    "ALIGN_CONTAINMENT_GROUP_BY_UNIT_TYPE"
+                ],
+                "align_containment_min_group_samples": config[
+                    "ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES"
+                ],
                 "alignment_coef": config["ALIGNMENT_COEF"],
                 "align_target_shuffle": config["ALIGN_TARGET_SHUFFLE"],
                 "condition": config.get("EXPERIMENT_CONDITION", ""),
@@ -347,6 +361,7 @@ class Transition(NamedTuple):
     critic_latent_old: jnp.ndarray
     alive_mask: jnp.ndarray
     alignment_mask: jnp.ndarray
+    unit_type: jnp.ndarray
     info: jnp.ndarray
     avail_actions: jnp.ndarray
 
@@ -438,6 +453,12 @@ def representation_distance(
     distance_name="ln_mse",
     num_agent_groups=1,
     epsilon=1e-8,
+    containment_ridge_ratio=1e-3,
+    containment_epsilon=1e-6,
+    group_labels=None,
+    num_label_groups=0,
+    min_group_samples=2,
+    return_statistics=False,
 ):
     """Dispatch to the configured alignment distance.
 
@@ -447,8 +468,10 @@ def representation_distance(
     """
 
     if distance_name == "ln_mse":
+        if return_statistics:
+            raise ValueError("return_statistics is only supported for containment")
         return latent_distance(source, target, mask)
-    if distance_name != "linear_cka":
+    if distance_name not in {"linear_cka", "containment"}:
         raise ValueError(f"Unknown alignment distance: {distance_name!r}")
     if source.shape[-2] % num_agent_groups != 0:
         raise ValueError("The latent sample axis must be divisible by num_agent_groups")
@@ -467,6 +490,22 @@ def representation_distance(
     grouped_source = split_groups(source)
     grouped_target = split_groups(target)
     grouped_mask = split_groups(mask)
+    if distance_name == "containment":
+        statistics = grouped_containment_statistics(
+            grouped_source,
+            grouped_target,
+            grouped_mask,
+            ridge_ratio=containment_ridge_ratio,
+            epsilon=containment_epsilon,
+            group_labels=(
+                None if group_labels is None else split_groups(group_labels)
+            ),
+            num_label_groups=num_label_groups,
+            min_group_samples=min_group_samples,
+        )
+        return statistics if return_statistics else statistics["loss"]
+    if return_statistics:
+        raise ValueError("return_statistics is only supported for containment")
     distances = jax.vmap(linear_cka_distance, in_axes=(0, 0, 0, None))(
         grouped_source,
         grouped_target,
@@ -476,6 +515,59 @@ def representation_distance(
     valid_groups = grouped_mask.reshape((num_agent_groups, -1)).sum(axis=1) > 1
     valid_groups = valid_groups.astype(distances.dtype)
     return (distances * valid_groups).sum() / jnp.maximum(valid_groups.sum(), 1.0)
+
+
+def grouped_containment_statistics(
+    grouped_source,
+    grouped_target,
+    grouped_mask,
+    *,
+    ridge_ratio=1e-3,
+    epsilon=1e-6,
+    group_labels=None,
+    num_label_groups=0,
+    min_group_samples=2,
+):
+    """Compute DSC per slot, optionally splitting every slot by unit type."""
+
+    if group_labels is None:
+        loss, similarity, effective_rank, count = jax.vmap(
+            directional_subspace_containment,
+            in_axes=(0, 0, 0, None, None),
+        )(
+            grouped_source,
+            grouped_target,
+            grouped_mask,
+            ridge_ratio,
+            epsilon,
+        )
+    else:
+        if num_label_groups <= 0:
+            raise ValueError("num_label_groups must be positive with group_labels")
+        labels = jnp.arange(num_label_groups, dtype=group_labels.dtype)
+        typed_masks = grouped_mask[:, None, ...] & (
+            group_labels[:, None, ...] == labels[None, :, None, None]
+        )
+
+        def per_slot(source, target, masks):
+            return jax.vmap(
+                directional_subspace_containment,
+                in_axes=(None, None, 0, None, None),
+            )(source, target, masks, ridge_ratio, epsilon)
+
+        loss, similarity, effective_rank, count = jax.vmap(per_slot)(
+            grouped_source, grouped_target, typed_masks
+        )
+
+    valid = (count >= min_group_samples).astype(grouped_source.dtype)
+    denominator = jnp.maximum(valid.sum(), 1.0)
+    return {
+        "loss": (loss * valid).sum() / denominator,
+        "similarity": (similarity * valid).sum() / denominator,
+        "source_effective_rank": (effective_rank * valid).sum() / denominator,
+        "valid_samples": (count * valid).sum() / denominator,
+        "valid_groups": valid.sum(),
+    }
 
 
 def shuffle_targets_within_agent(
@@ -609,6 +701,14 @@ def make_train(
 ):
     config.setdefault("ALIGN_DISTANCE", "ln_mse")
     config.setdefault("ALIGN_DISTANCE_EPS", 1e-8)
+    config.setdefault("ALIGN_CONTAINMENT_RIDGE_RATIO", 1e-3)
+    config.setdefault("ALIGN_CONTAINMENT_EPS", 1e-6)
+    config.setdefault("ALIGN_CONTAINMENT_GROUP_BY_UNIT_TYPE", True)
+    config.setdefault("ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES", 64)
+    config.setdefault("ALIGN_CONTAINMENT_RIDGE_RATIO", 1e-3)
+    config.setdefault("ALIGN_CONTAINMENT_EPS", 1e-6)
+    config.setdefault("ALIGN_CONTAINMENT_GROUP_BY_UNIT_TYPE", True)
+    config.setdefault("ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES", 64)
     config.setdefault("ALIGN_GRADIENT_CALIBRATION", False)
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
@@ -625,7 +725,7 @@ def make_train(
             f"ALIGN_MODE must be one of {sorted(valid_align_modes)}, got "
             f"{config['ALIGN_MODE']!r}."
         )
-    valid_align_distances = {"ln_mse", "linear_cka"}
+    valid_align_distances = {"ln_mse", "linear_cka", "containment"}
     if config["ALIGN_DISTANCE"] not in valid_align_distances:
         raise ValueError(
             f"ALIGN_DISTANCE must be one of {sorted(valid_align_distances)}, got "
@@ -633,6 +733,12 @@ def make_train(
         )
     if float(config["ALIGN_DISTANCE_EPS"]) <= 0:
         raise ValueError("ALIGN_DISTANCE_EPS must be positive.")
+    if float(config["ALIGN_CONTAINMENT_RIDGE_RATIO"]) < 0:
+        raise ValueError("ALIGN_CONTAINMENT_RIDGE_RATIO must be nonnegative.")
+    if float(config["ALIGN_CONTAINMENT_EPS"]) <= 0:
+        raise ValueError("ALIGN_CONTAINMENT_EPS must be positive.")
+    if int(config["ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES"]) < 2:
+        raise ValueError("ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES must be at least 2.")
     if config["ALIGN_MODE"] != "none" and not config["MATCHED_COMPARISON"]:
         raise ValueError("Representation alignment requires MATCHED_COMPARISON=true.")
     if config["ALIGN_MODE"] == "none" and config["ALIGN_DISTANCE"] != "ln_mse":
@@ -654,7 +760,7 @@ def make_train(
         if config["ALIGN_DISTANCE"] != "ln_mse":
             raise ValueError(
                 "Shuffled controls belong to the LN-MSE protocol and cannot be "
-                "combined with ALIGN_DISTANCE=linear_cka."
+                "combined with a relational alignment distance."
             )
     if config["ALIGN_GRADIENT_CALIBRATION"]:
         if not config["MATCHED_COMPARISON"]:
@@ -899,6 +1005,14 @@ def make_train(
                     train_states[1].params, hstates[1], cr_in
                 )
 
+                # Unit type belongs to the pre-step observation/latent. Capture
+                # it before env.step can autoreset a completed SMACv2 episode.
+                ally_unit_types = (
+                    env_state.env_state.state.unit_types[:, : env.num_agents]
+                    .swapaxes(0, 1)
+                    .reshape((config["NUM_ACTORS"],))
+                )
+
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
@@ -921,6 +1035,7 @@ def make_train(
                     jax.lax.stop_gradient(critic_latent.squeeze(axis=0)),
                     alive_mask,
                     alive_mask,
+                    ally_unit_types,
                     info,
                     avail_actions,
                 )
@@ -1153,31 +1268,95 @@ def make_train(
                             )
                             critic_latent = critic_aux[1]
                             mask = traj_batch.alignment_mask
-                            c_to_a_loss = representation_distance(
-                                actor_latent,
-                                jax.lax.stop_gradient(traj_batch.critic_latent_old),
-                                mask,
-                                distance_name,
-                                env.num_agents,
-                                config["ALIGN_DISTANCE_EPS"],
-                            )
-                            a_to_c_loss = representation_distance(
-                                critic_latent,
-                                jax.lax.stop_gradient(traj_batch.actor_latent_old),
-                                mask,
-                                distance_name,
-                                env.num_agents,
-                                config["ALIGN_DISTANCE_EPS"],
-                            )
-                            joint_loss = representation_distance(
-                                actor_latent,
-                                critic_latent,
-                                mask,
-                                distance_name,
-                                env.num_agents,
-                                config["ALIGN_DISTANCE_EPS"],
-                            )
                             zero = jnp.zeros((), dtype=actor_latent.dtype)
+                            containment_statistics = {
+                                "similarity": zero,
+                                "source_effective_rank": zero,
+                                "valid_samples": zero,
+                                "valid_groups": zero,
+                            }
+                            distance_kwargs = {
+                                "distance_name": distance_name,
+                                "num_agent_groups": env.num_agents,
+                                "epsilon": config["ALIGN_DISTANCE_EPS"],
+                                "containment_ridge_ratio": config[
+                                    "ALIGN_CONTAINMENT_RIDGE_RATIO"
+                                ],
+                                "containment_epsilon": config[
+                                    "ALIGN_CONTAINMENT_EPS"
+                                ],
+                                "group_labels": (
+                                    traj_batch.unit_type
+                                    if config[
+                                        "ALIGN_CONTAINMENT_GROUP_BY_UNIT_TYPE"
+                                    ]
+                                    else None
+                                ),
+                                "num_label_groups": env.unit_type_bits,
+                                "min_group_samples": config[
+                                    "ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES"
+                                ],
+                            }
+                            if distance_name == "containment":
+                                c_to_a_loss = zero
+                                a_to_c_loss = zero
+                                joint_loss = zero
+                                if config["ALIGN_MODE"] in {"c_to_a", "reciprocal"}:
+                                    containment_statistics = representation_distance(
+                                        actor_latent,
+                                        jax.lax.stop_gradient(
+                                            traj_batch.critic_latent_old
+                                        ),
+                                        mask,
+                                        return_statistics=True,
+                                        **distance_kwargs,
+                                    )
+                                    c_to_a_loss = containment_statistics["loss"]
+                                if config["ALIGN_MODE"] in {"a_to_c", "reciprocal"}:
+                                    reverse_statistics = representation_distance(
+                                        critic_latent,
+                                        jax.lax.stop_gradient(
+                                            traj_batch.actor_latent_old
+                                        ),
+                                        mask,
+                                        return_statistics=True,
+                                        **distance_kwargs,
+                                    )
+                                    a_to_c_loss = reverse_statistics["loss"]
+                                    if config["ALIGN_MODE"] == "a_to_c":
+                                        containment_statistics = reverse_statistics
+                                if config["ALIGN_MODE"] == "joint":
+                                    containment_statistics = representation_distance(
+                                        actor_latent,
+                                        critic_latent,
+                                        mask,
+                                        return_statistics=True,
+                                        **distance_kwargs,
+                                    )
+                                    joint_loss = containment_statistics["loss"]
+                            else:
+                                c_to_a_loss = representation_distance(
+                                    actor_latent,
+                                    jax.lax.stop_gradient(
+                                        traj_batch.critic_latent_old
+                                    ),
+                                    mask,
+                                    **distance_kwargs,
+                                )
+                                a_to_c_loss = representation_distance(
+                                    critic_latent,
+                                    jax.lax.stop_gradient(
+                                        traj_batch.actor_latent_old
+                                    ),
+                                    mask,
+                                    **distance_kwargs,
+                                )
+                                joint_loss = representation_distance(
+                                    actor_latent,
+                                    critic_latent,
+                                    mask,
+                                    **distance_kwargs,
+                                )
                             actor_alignment = zero
                             critic_alignment = zero
                             joint_alignment = zero
@@ -1210,6 +1389,7 @@ def make_train(
                                 actor_alignment,
                                 critic_alignment,
                                 joint_alignment,
+                                containment_statistics,
                             )
 
                         (
@@ -1275,6 +1455,10 @@ def make_train(
                                 calibration_cka_actor_grads,
                                 calibration_cka_critic_grads,
                             ) = calibration_cross_grads("linear_cka")
+                            (
+                                calibration_containment_actor_grads,
+                                calibration_containment_critic_grads,
+                            ) = calibration_cross_grads("containment")
                         if not config["ACTOR_PARAMETER_SHARING"]:
                             actor_grads = jax.tree.map(
                                 lambda x: x * env.num_agents, actor_grads
@@ -1291,6 +1475,10 @@ def make_train(
                                 calibration_cka_actor_grads = jax.tree.map(
                                     lambda x: x * env.num_agents,
                                     calibration_cka_actor_grads,
+                                )
+                                calibration_containment_actor_grads = jax.tree.map(
+                                    lambda x: x * env.num_agents,
+                                    calibration_containment_actor_grads,
                                 )
                         actor_rl_grads = jax.tree.map(
                             lambda total, cross: total - cross,
@@ -1310,6 +1498,7 @@ def make_train(
                         actor_alignment_loss = matched_aux[7]
                         critic_alignment_loss = matched_aux[8]
                         joint_alignment_loss = matched_aux[9]
+                        containment_statistics = matched_aux[10]
                     elif config["ACTOR_PARAMETER_SHARING"]:
                         actor_loss, actor_grads = actor_grad_fn(
                             actor_train_state.params,
@@ -1333,6 +1522,12 @@ def make_train(
                         actor_alignment_loss = zero
                         critic_alignment_loss = zero
                         joint_alignment_loss = zero
+                        containment_statistics = {
+                            "similarity": zero,
+                            "source_effective_rank": zero,
+                            "valid_samples": zero,
+                            "valid_groups": zero,
+                        }
                         actor_cross_grads = jax.tree.map(jnp.zeros_like, actor_grads)
                         critic_cross_grads = jax.tree.map(jnp.zeros_like, critic_grads)
                         actor_rl_grads = actor_grads
@@ -1363,6 +1558,12 @@ def make_train(
                         actor_alignment_loss = zero
                         critic_alignment_loss = zero
                         joint_alignment_loss = zero
+                        containment_statistics = {
+                            "similarity": zero,
+                            "source_effective_rank": zero,
+                            "valid_samples": zero,
+                            "valid_groups": zero,
+                        }
                         actor_cross_grads = jax.tree.map(jnp.zeros_like, actor_grads)
                         critic_cross_grads = jax.tree.map(jnp.zeros_like, critic_grads)
                         actor_rl_grads = actor_grads
@@ -1391,6 +1592,12 @@ def make_train(
                         )
                         calibration_cka_critic_grad_norm = tree_l2_norm(
                             calibration_cka_critic_grads
+                        )
+                        calibration_containment_actor_grad_norms = actor_tree_norms(
+                            calibration_containment_actor_grads
+                        )
+                        calibration_containment_critic_grad_norm = tree_l2_norm(
+                            calibration_containment_critic_grads
                         )
 
                     old_actor_params = actor_train_state.params
@@ -1450,6 +1657,18 @@ def make_train(
                             + critic_alignment_loss
                             + joint_alignment_loss
                         ),
+                        "containment_similarity": containment_statistics[
+                            "similarity"
+                        ],
+                        "containment_source_effective_rank": containment_statistics[
+                            "source_effective_rank"
+                        ],
+                        "containment_valid_samples_mean": containment_statistics[
+                            "valid_samples"
+                        ],
+                        "containment_valid_slot_type_groups": containment_statistics[
+                            "valid_groups"
+                        ],
                         "actor_rl_grad_norm_mean": actor_rl_grad_norms.mean(),
                         "actor_rl_grad_norm_max": actor_rl_grad_norms.max(),
                         "actor_cross_grad_norm_mean": (actor_cross_grad_norms.mean()),
@@ -1499,11 +1718,19 @@ def make_train(
                                     calibration_cka_actor_grad_norms
                                     / jnp.maximum(actor_rl_grad_norms, 1e-12)
                                 ).mean(),
+                                "calibration_containment_actor_cross_grad_norm_mean": calibration_containment_actor_grad_norms.mean(),
+                                "calibration_containment_actor_cross_to_rl_ratio": (
+                                    calibration_containment_actor_grad_norms
+                                    / jnp.maximum(actor_rl_grad_norms, 1e-12)
+                                ).mean(),
                                 "calibration_ln_mse_critic_cross_grad_norm": calibration_ln_critic_grad_norm,
                                 "calibration_linear_cka_critic_cross_grad_norm": calibration_cka_critic_grad_norm,
                                 "calibration_ln_mse_critic_cross_to_rl_ratio": calibration_ln_critic_grad_norm
                                 / jnp.maximum(critic_rl_grad_norm, 1e-12),
                                 "calibration_linear_cka_critic_cross_to_rl_ratio": calibration_cka_critic_grad_norm
+                                / jnp.maximum(critic_rl_grad_norm, 1e-12),
+                                "calibration_containment_critic_cross_grad_norm": calibration_containment_critic_grad_norm,
+                                "calibration_containment_critic_cross_to_rl_ratio": calibration_containment_critic_grad_norm
                                 / jnp.maximum(critic_rl_grad_norm, 1e-12),
                             }
                         )
@@ -1774,6 +2001,8 @@ def main(config):
         condition = f"{condition}_shuffled"
     elif config["ALIGN_DISTANCE"] == "linear_cka" and condition != "none":
         condition = f"{condition}_cka"
+    elif config["ALIGN_DISTANCE"] == "containment" and condition != "none":
+        condition = f"{condition}_dsc"
     if config.get("EXPERIMENT_CONDITION"):
         if config["EXPERIMENT_CONDITION"] != condition:
             raise ValueError(

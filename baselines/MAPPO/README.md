@@ -44,7 +44,7 @@ environment.  The algorithm deliberately fails on tasks with unequal action
 dimensions; the default `halfcheetah_6x1` has six one-dimensional actors.
 
 The supported alignment modes are `none`, `c_to_a`, `a_to_c`, and `joint`,
-with either `ALIGN_DISTANCE=ln_mse` or `linear_cka`. Linear CKA uses a
+with `ALIGN_DISTANCE=ln_mse`, `linear_cka`, or `containment`. Linear CKA uses a
 MABrax-specific coefficient selected without returns by matching its initial
 cross-gradient scale to LN-MSE at lambda 0.1:
 
@@ -53,6 +53,10 @@ python scripts/calibrate_mabrax_cka.py \
   --output-root /path/to/mabrax/cka_gradient_calibration \
   --pilot-seed 9001 --gpus 0,1,2,3
 ```
+
+`containment` is the directional ridge-whitened DSC objective documented in
+[`DSC_ALIGNMENT.md`](../../DSC_ALIGNMENT.md). It is opt-in and likewise uses
+an initial-gradient calibration rather than return-based tuning.
 
 Run the complete 56-run matrix (PS/NPS, one distance-free baseline plus three
 directions under both distances, four seeds) with deterministic W&B names and

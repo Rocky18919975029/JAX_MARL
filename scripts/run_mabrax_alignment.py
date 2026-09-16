@@ -19,6 +19,7 @@ from pathlib import Path
 PROTOCOL_VERSION = "mabrax-halfcheetah6x1-alignment-4seed-v1.0"
 ACTOR_VARIANTS = {"ps": True, "nps": False}
 DISTANCES = ("ln_mse", "linear_cka")
+AVAILABLE_DISTANCES = (*DISTANCES, "containment")
 MODES = ("none", "c_to_a", "a_to_c", "joint")
 
 
@@ -66,7 +67,10 @@ class Task:
     def condition(self):
         if self.mode == "none":
             return "none"
-        return f"{self.mode}_cka" if self.distance == "linear_cka" else self.mode
+        suffix = {"ln_mse": "", "linear_cka": "_cka", "containment": "_dsc"}[
+            self.distance
+        ]
+        return f"{self.mode}{suffix}"
 
     @property
     def run_name(self):
@@ -76,14 +80,27 @@ class Task:
         )
 
 
-def task_matrix(actor_variants, seeds, cka_coefficient):
+def task_matrix(
+    actor_variants,
+    seeds,
+    cka_coefficient,
+    distances=DISTANCES,
+    containment_coefficient=None,
+):
     tasks = []
     for actor_label in actor_variants:
         sharing = ACTOR_VARIANTS[actor_label]
         for seed in seeds:
             tasks.append(Task(actor_label, sharing, "ln_mse", "none", seed, 0.1))
-            for distance in DISTANCES:
-                coefficient = 0.1 if distance == "ln_mse" else cka_coefficient
+            for distance in distances:
+                coefficients = {
+                    "ln_mse": 0.1,
+                    "linear_cka": cka_coefficient,
+                    "containment": containment_coefficient,
+                }
+                coefficient = coefficients[distance]
+                if coefficient is None:
+                    raise ValueError(f"Missing calibrated coefficient for {distance}")
                 for mode in MODES[1:]:
                     tasks.append(
                         Task(actor_label, sharing, distance, mode, seed, coefficient)
@@ -93,13 +110,18 @@ def task_matrix(actor_variants, seeds, cka_coefficient):
     return tasks
 
 
-def load_calibration(path):
+def load_calibration(path, expected_distance):
     payload = json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
     if payload.get("environment") != "halfcheetah_6x1":
-        raise ValueError("CKA calibration is not for halfcheetah_6x1")
+        raise ValueError("Alignment calibration is not for halfcheetah_6x1")
+    if payload.get("target_distance") != expected_distance:
+        raise ValueError(
+            f"Expected {expected_distance} calibration, got "
+            f"{payload.get('target_distance')!r}"
+        )
     coefficient = float(payload["global_alignment_coef"])
     if not coefficient > 0:
-        raise ValueError("CKA coefficient must be positive")
+        raise ValueError("Alignment coefficient must be positive")
     return coefficient
 
 
@@ -127,6 +149,8 @@ def build_command(args, task, commit):
         f"ALIGN_MODE={task.mode}",
         f"ALIGN_DISTANCE={task.distance}",
         "ALIGN_DISTANCE_EPS=1e-8",
+        "ALIGN_CONTAINMENT_RIDGE_RATIO=1e-3",
+        "ALIGN_CONTAINMENT_EPS=1e-6",
         f"ALIGNMENT_COEF={task.coefficient:.12g}",
         "ALIGN_GRADIENT_CALIBRATION=false",
         f"EXPERIMENT_CONDITION={task.condition}",
@@ -146,7 +170,13 @@ def build_command(args, task, commit):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
-    parser.add_argument("--cka-calibration", type=Path, required=True)
+    parser.add_argument("--cka-calibration", type=Path)
+    parser.add_argument("--containment-calibration", type=Path)
+    parser.add_argument(
+        "--distances",
+        type=lambda value: parse_csv(value, AVAILABLE_DISTANCES),
+        default=DISTANCES,
+    )
     parser.add_argument(
         "--actor-variants",
         type=lambda value: parse_csv(value, ACTOR_VARIANTS),
@@ -179,16 +209,35 @@ def main():
         text=True,
     ).stdout.strip():
         raise RuntimeError("Worktree is dirty; commit the protocol before launching")
-    cka_coefficient = load_calibration(args.cka_calibration)
-    tasks = task_matrix(args.actor_variants, args.seeds, cka_coefficient)
+    cka_coefficient = None
+    containment_coefficient = None
+    if "linear_cka" in args.distances:
+        if args.cka_calibration is None:
+            parser.error("--cka-calibration is required for linear_cka")
+        cka_coefficient = load_calibration(args.cka_calibration, "linear_cka")
+    if "containment" in args.distances:
+        if args.containment_calibration is None:
+            parser.error("--containment-calibration is required for containment")
+        containment_coefficient = load_calibration(
+            args.containment_calibration, "containment"
+        )
+    tasks = task_matrix(
+        args.actor_variants,
+        args.seeds,
+        cka_coefficient,
+        args.distances,
+        containment_coefficient,
+    )
     args.run_root = args.run_root.expanduser().resolve()
-    expected = len(args.actor_variants) * len(args.seeds) * 7
+    expected = len(args.actor_variants) * len(args.seeds) * (
+        1 + 3 * len(args.distances)
+    )
     if len(tasks) != expected:
         raise AssertionError(f"Expected {expected} tasks, found {len(tasks)}")
     if args.dry_run:
         print(
             f"protocol={PROTOCOL_VERSION} runs={len(tasks)} "
-            f"cka_lambda={cka_coefficient:.10g}"
+            f"cka_lambda={cka_coefficient} dsc_lambda={containment_coefficient}"
         )
         for index, task in enumerate(tasks):
             print(f"GPU {args.gpus[index % len(args.gpus)]}: {task.run_name}")
@@ -215,15 +264,30 @@ def main():
         "git_commit": commit,
         "environment": "halfcheetah_6x1",
         "actor_variants": args.actor_variants,
-        "distances": DISTANCES,
+        "distances": args.distances,
         "modes": MODES,
         "seeds": args.seeds,
         "ln_mse_alignment_coef": 0.1,
         "linear_cka_alignment_coef": cka_coefficient,
-        "cka_calibration": str(args.cka_calibration.expanduser().resolve()),
+        "cka_calibration": (
+            str(args.cka_calibration.expanduser().resolve())
+            if args.cka_calibration is not None
+            else None
+        ),
         "unique_runs": len(tasks),
         "checkpoint_interval": args.checkpoint_interval,
     }
+    if "containment" in args.distances:
+        manifest.update(
+            {
+                "containment_alignment_coef": containment_coefficient,
+                "containment_ridge_ratio": 1e-3,
+                "containment_epsilon": 1e-6,
+                "containment_calibration": str(
+                    args.containment_calibration.expanduser().resolve()
+                ),
+            }
+        )
     manifest_path = args.run_root / "experiment_manifest.json"
     if manifest_path.is_file():
         if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:

@@ -18,10 +18,10 @@ from pathlib import Path
 
 try:
     from h1_protocol import FROZEN_KEYS, repository_root
-    from run_h1_smax_confirmatory import load_cka_calibration, parse_seeds
+    from run_h1_smax_confirmatory import parse_seeds
 except ModuleNotFoundError:  # Imported as scripts.run_smax_alignment_benchmark.
     from scripts.h1_protocol import FROZEN_KEYS, repository_root
-    from scripts.run_h1_smax_confirmatory import load_cka_calibration, parse_seeds
+    from scripts.run_h1_smax_confirmatory import parse_seeds
 
 
 PROTOCOL_VERSION = "smax-alignment-benchmark-4seed-v1.0"
@@ -31,6 +31,7 @@ BENCHMARK_MAPS = ("2s3z", "3s5z_vs_3s6z", "smacv2_10_units", "6h_vs_8z")
 DEFAULT_MAPS = tuple(name for name in BENCHMARK_MAPS if name != "smacv2_10_units")
 ACTOR_VARIANTS = {"ps": True, "nps": False}
 DISTANCES = ("ln_mse", "linear_cka")
+AVAILABLE_DISTANCES = (*DISTANCES, "containment")
 ALIGN_MODES = ("none", "c_to_a", "a_to_c", "joint")
 ALIGNED_MODES = ALIGN_MODES[1:]
 
@@ -53,11 +54,12 @@ class Task:
     def condition(self):
         if self.align_mode == "none":
             return "none"
-        return (
-            f"{self.align_mode}_cka"
-            if self.align_distance == "linear_cka"
-            else self.align_mode
-        )
+        suffix = {
+            "ln_mse": "",
+            "linear_cka": "_cka",
+            "containment": "_dsc",
+        }[self.align_distance]
+        return f"{self.align_mode}{suffix}"
 
     @property
     def lambda_label(self):
@@ -148,7 +150,14 @@ def load_frozen_config(path):
     return frozen, resolved, digest
 
 
-def task_matrix(maps, actors, seeds, cka_alignment_coef):
+def task_matrix(
+    maps,
+    actors,
+    seeds,
+    cka_alignment_coef,
+    distances=DISTANCES,
+    containment_alignment_coef=None,
+):
     tasks = []
     for map_name in maps:
         for actor_label in actors:
@@ -158,8 +167,16 @@ def task_matrix(maps, actors, seeds, cka_alignment_coef):
                 tasks.append(
                     Task(map_name, actor_label, sharing, "ln_mse", "none", seed, 0.1)
                 )
-                for distance in DISTANCES:
-                    coefficient = 0.1 if distance == "ln_mse" else cka_alignment_coef
+                for distance in distances:
+                    coefficient = {
+                        "ln_mse": 0.1,
+                        "linear_cka": cka_alignment_coef,
+                        "containment": containment_alignment_coef,
+                    }[distance]
+                    if coefficient is None:
+                        raise ValueError(
+                            f"Missing calibrated coefficient for {distance}"
+                        )
                     for align_mode in ALIGNED_MODES:
                         tasks.append(
                             Task(
@@ -175,6 +192,25 @@ def task_matrix(maps, actors, seeds, cka_alignment_coef):
     if len(tasks) != len(set(task.run_name for task in tasks)):
         raise AssertionError("Run names are not unique")
     return tasks
+
+
+def load_alignment_calibration(path, target_distance):
+    payload = json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
+    if payload.get("selection_uses_return") is not False:
+        raise ValueError("Calibration must explicitly record no return selection")
+    if payload.get("reference_distance") != "ln_mse":
+        raise ValueError("Calibration reference must be ln_mse")
+    if float(payload.get("reference_alignment_coef", -1)) != 0.1:
+        raise ValueError("Calibration must reference LN-MSE lambda=0.1")
+    if payload.get("target_distance") != target_distance:
+        raise ValueError(
+            f"Expected {target_distance} calibration, got "
+            f"{payload.get('target_distance')!r}"
+        )
+    coefficient = float(payload["global_alignment_coef"])
+    if not (coefficient > 0 and coefficient < float("inf")):
+        raise ValueError("Calibrated coefficient must be finite and positive")
+    return coefficient
 
 
 def matching_frozen_config(config, frozen):
@@ -273,6 +309,10 @@ def build_command(args, frozen, task, commit):
             f"ALIGN_MODE={task.align_mode}",
             f"ALIGN_DISTANCE={task.align_distance}",
             "ALIGN_DISTANCE_EPS=1e-8",
+            "ALIGN_CONTAINMENT_RIDGE_RATIO=1e-3",
+            "ALIGN_CONTAINMENT_EPS=1e-6",
+            "ALIGN_CONTAINMENT_GROUP_BY_UNIT_TYPE=true",
+            "ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES=64",
             "ALIGN_GRADIENT_CALIBRATION=false",
             "ALIGN_TARGET_SHUFFLE=false",
             "ALIGN_TARGET_SHUFFLE_SCOPE=same_agent_env_time",
@@ -297,7 +337,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--frozen-config", type=Path, required=True)
-    parser.add_argument("--cka-calibration", type=Path, required=True)
+    parser.add_argument("--cka-calibration", type=Path)
+    parser.add_argument("--containment-calibration", type=Path)
+    parser.add_argument(
+        "--distances",
+        type=lambda value: parse_csv(value, AVAILABLE_DISTANCES),
+        default=DISTANCES,
+    )
     parser.add_argument(
         "--maps",
         type=lambda value: parse_csv(value, BENCHMARK_MAPS),
@@ -344,11 +390,33 @@ def main():
     if dirty:
         raise RuntimeError("Worktree is dirty; commit the experiment protocol first")
     frozen, frozen_path, frozen_digest = load_frozen_config(args.frozen_config)
-    cka_alignment_coef = load_cka_calibration(args.cka_calibration)
-    tasks = task_matrix(args.maps, args.actor_variants, args.seeds, cka_alignment_coef)
+    cka_alignment_coef = None
+    containment_alignment_coef = None
+    if "linear_cka" in args.distances:
+        if args.cka_calibration is None:
+            parser.error("--cka-calibration is required for linear_cka")
+        cka_alignment_coef = load_alignment_calibration(
+            args.cka_calibration, "linear_cka"
+        )
+    if "containment" in args.distances:
+        if args.containment_calibration is None:
+            parser.error("--containment-calibration is required for containment")
+        containment_alignment_coef = load_alignment_calibration(
+            args.containment_calibration, "containment"
+        )
+    tasks = task_matrix(
+        args.maps,
+        args.actor_variants,
+        args.seeds,
+        cka_alignment_coef,
+        args.distances,
+        containment_alignment_coef,
+    )
     args.run_root = args.run_root.expanduser().resolve()
     reusable = reusable_tasks(args.reuse_root, tasks, frozen, args.run_root)
-    expected = len(args.maps) * len(args.actor_variants) * len(args.seeds) * 7
+    expected = len(args.maps) * len(args.actor_variants) * len(args.seeds) * (
+        1 + 3 * len(args.distances)
+    )
     if len(tasks) != expected:
         raise AssertionError(f"Expected {expected} unique runs, found {len(tasks)}")
 
@@ -357,7 +425,7 @@ def main():
             f"Protocol={PROTOCOL_VERSION} unique_runs={len(tasks)} "
             f"reused={len(reusable)} pending={len(tasks) - len(reusable)} "
             f"seeds={','.join(map(str, args.seeds))} "
-            f"cka_lambda={cka_alignment_coef:.10g}"
+            f"cka_lambda={cka_alignment_coef} dsc_lambda={containment_alignment_coef}"
         )
         for index, task in enumerate(tasks):
             if task.key in reusable:
@@ -388,18 +456,35 @@ def main():
         "git_commit": commit,
         "frozen_config": str(frozen_path),
         "frozen_config_sha256": frozen_digest,
-        "cka_calibration": str(args.cka_calibration.expanduser().resolve()),
+        "cka_calibration": (
+            str(args.cka_calibration.expanduser().resolve())
+            if args.cka_calibration is not None
+            else None
+        ),
         "cka_alignment_coef": cka_alignment_coef,
         "maps": args.maps,
         "actor_variants": args.actor_variants,
         "align_modes": ALIGN_MODES,
-        "align_distances": DISTANCES,
+        "align_distances": args.distances,
         "seeds": args.seeds,
         "unique_runs": len(tasks),
         "reuse_roots": [str(path.expanduser().resolve()) for path in args.reuse_root],
         "reused_runs": len(reusable),
         "none_reuse": "one distance-free run per task/actor/seed",
     }
+    if "containment" in args.distances:
+        manifest.update(
+            {
+                "containment_calibration": str(
+                    args.containment_calibration.expanduser().resolve()
+                ),
+                "containment_alignment_coef": containment_alignment_coef,
+                "containment_ridge_ratio": 1e-3,
+                "containment_epsilon": 1e-6,
+                "containment_group_by_unit_type": True,
+                "containment_min_group_samples": 64,
+            }
+        )
     manifest_path = args.run_root / "experiment_manifest.json"
     if manifest_path.is_file():
         if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:

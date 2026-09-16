@@ -3,6 +3,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_MATRIX_PATH = ROOT / "experiments" / "harl_mamujoco" / "run_matrix.py"
@@ -60,6 +62,20 @@ def test_formal_matrix_has_one_distance_free_baseline():
         }
 
 
+def test_containment_is_opt_in_and_named_dsc():
+    module = load_run_matrix()
+    tasks = module.task_matrix(
+        (1, 2, 3, 4),
+        cka_coefficient=None,
+        distances=("containment",),
+        containment_coefficient=0.25,
+    )
+    assert len(tasks) == 32
+    aligned = [task for task in tasks if task.mode != "none"]
+    assert all(task.distance == "containment" for task in aligned)
+    assert all(task.condition.endswith("_dsc") for task in aligned)
+
+
 def test_alignment_implementation_has_no_cosine_objective():
     source = (ROOT / "experiments" / "harl_mamujoco" / "alignment.py").read_text(
         encoding="utf-8"
@@ -68,6 +84,25 @@ def test_alignment_implementation_has_no_cosine_objective():
     assert "critic_old.detach()" in source
     assert "actor_old.detach()" in source
     assert "source_centered.transpose(0, 1) @ target_centered" in source
+    assert "torch.linalg.solve" in source
+    assert "source_effective_rank" in source
+
+
+def test_torch_containment_is_directional():
+    torch = pytest.importorskip("torch")
+    from experiments.harl_mamujoco.alignment import (
+        directional_subspace_containment,
+    )
+
+    grid = torch.linspace(-2.0, 2.0, 128)
+    full = torch.stack((grid, grid.square(), grid.sin()), dim=-1)
+    rank_two = full.clone()
+    rank_two[:, 2] = 0.0
+    mask = torch.ones(128)
+    contained = directional_subspace_containment(rank_two, full, mask)[0]
+    not_contained = directional_subspace_containment(full, rank_two, mask)[0]
+    assert float(contained) < 5e-3
+    assert float(not_contained) > 0.2
 
 
 def test_runner_records_matched_nps_scaling_and_ep_pairing():

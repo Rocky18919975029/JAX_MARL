@@ -72,6 +72,82 @@ def linear_cka_distance(source, target, mask, epsilon=1e-8):
     return jnp.where(count > 1, distance, jnp.zeros_like(distance))
 
 
+def directional_subspace_containment(
+    source,
+    target,
+    mask,
+    ridge_ratio=1e-3,
+    epsilon=1e-6,
+):
+    """Ridge-whitened directional containment of ``source`` in ``target``.
+
+    Unlike LN-MSE and linear CKA, this distance does not apply per-sample
+    LayerNorm.  It asks what fraction of the effective source subspace is
+    represented by the target subspace after whitening both feature
+    covariances.  ``source`` is the representation receiving the directional
+    update and ``target`` is normally a stop-gradient rollout target.
+
+    Returns ``(loss, similarity, source_effective_rank, valid_samples)`` so
+    training can audit both the optimized quantity and covariance rank.
+    """
+
+    source = source.reshape((-1, source.shape[-1]))
+    target = target.reshape((-1, target.shape[-1]))
+    weights = mask.reshape((-1,)).astype(source.dtype)
+    count = weights.sum()
+    safe_count = jnp.maximum(count, 1.0)
+    column_weights = weights[:, None]
+
+    source_mean = (source * column_weights).sum(axis=0, keepdims=True) / safe_count
+    target_mean = (target * column_weights).sum(axis=0, keepdims=True) / safe_count
+    normalization = jnp.sqrt(jnp.maximum(count - 1.0, 1.0))
+    source_centered = (source - source_mean) * jnp.sqrt(column_weights) / normalization
+    target_centered = (target - target_mean) * jnp.sqrt(column_weights) / normalization
+
+    source_covariance = source_centered.T @ source_centered
+    target_covariance = target_centered.T @ target_centered
+    cross_covariance = source_centered.T @ target_centered
+    source_dim = source_covariance.shape[0]
+    target_dim = target_covariance.shape[0]
+    ridge_ratio = jnp.asarray(ridge_ratio, source.dtype)
+    epsilon = jnp.asarray(epsilon, source.dtype)
+    source_ridge = (
+        ridge_ratio * jnp.trace(source_covariance) / source_dim + epsilon
+    )
+    target_ridge = (
+        ridge_ratio * jnp.trace(target_covariance) / target_dim + epsilon
+    )
+    regularized_source = source_covariance + source_ridge * jnp.eye(
+        source_dim, dtype=source.dtype
+    )
+    regularized_target = target_covariance + target_ridge * jnp.eye(
+        target_dim, dtype=target.dtype
+    )
+
+    # Positive ridge terms make both systems positive definite.  Solves avoid
+    # materializing either inverse or inverse square root.
+    source_whitened_cross = jnp.linalg.solve(
+        regularized_source, cross_covariance
+    )
+    target_whitened_cross = jnp.linalg.solve(
+        regularized_target, cross_covariance.T
+    )
+    overlap = jnp.trace(source_whitened_cross @ target_whitened_cross)
+    source_effective_rank = jnp.trace(
+        jnp.linalg.solve(regularized_source, source_covariance)
+    )
+    similarity = overlap / (source_effective_rank + epsilon)
+    loss = 1.0 - similarity
+    valid = count >= 2
+    zero = jnp.zeros((), dtype=source.dtype)
+    return (
+        jnp.where(valid, loss, zero),
+        jnp.where(valid, similarity, zero),
+        jnp.where(valid, source_effective_rank, zero),
+        count,
+    )
+
+
 def representation_distance(
     source,
     target,
@@ -80,6 +156,8 @@ def representation_distance(
     *,
     agent_axis=1,
     epsilon=1e-8,
+    containment_ridge_ratio=1e-3,
+    containment_epsilon=1e-6,
 ):
     """Compute alignment independently inside each agent's sample pool.
 
@@ -88,21 +166,61 @@ def representation_distance(
     are never pooled into one CKA estimate.
     """
 
-    if source.shape != target.shape:
-        raise ValueError("source and target latents must have identical shapes")
+    if source.shape[:-1] != target.shape[:-1]:
+        raise ValueError("source and target sample axes must have identical shapes")
     if mask.shape != source.shape[:-1]:
         raise ValueError("mask must match every non-feature latent axis")
-    if distance_name not in {"ln_mse", "linear_cka"}:
+    if distance_name not in {"ln_mse", "linear_cka", "containment"}:
         raise ValueError(f"Unknown alignment distance: {distance_name!r}")
 
     source = jnp.moveaxis(source, agent_axis, 0)
     target = jnp.moveaxis(target, agent_axis, 0)
     mask = jnp.moveaxis(mask, agent_axis, 0)
-    distance_fn = (
-        layernorm_mse_distance
-        if distance_name == "ln_mse"
-        else lambda left, right, weights: linear_cka_distance(
+    if distance_name == "ln_mse":
+        distance_fn = layernorm_mse_distance
+    elif distance_name == "linear_cka":
+        distance_fn = lambda left, right, weights: linear_cka_distance(
             left, right, weights, epsilon
         )
-    )
+    else:
+        distance_fn = lambda left, right, weights: directional_subspace_containment(
+            left,
+            right,
+            weights,
+            containment_ridge_ratio,
+            containment_epsilon,
+        )[0]
     return jax.vmap(distance_fn)(source, target, mask).mean()
+
+
+def representation_containment_statistics(
+    source,
+    target,
+    mask,
+    *,
+    agent_axis=1,
+    ridge_ratio=1e-3,
+    epsilon=1e-6,
+):
+    """Return mean DSC similarity/rank/count without pooling agent spaces."""
+
+    if source.shape[:-1] != target.shape[:-1]:
+        raise ValueError("source and target sample axes must have identical shapes")
+    if mask.shape != source.shape[:-1]:
+        raise ValueError("mask must match every non-feature latent axis")
+    source = jnp.moveaxis(source, agent_axis, 0)
+    target = jnp.moveaxis(target, agent_axis, 0)
+    mask = jnp.moveaxis(mask, agent_axis, 0)
+    loss, similarity, effective_rank, count = jax.vmap(
+        directional_subspace_containment,
+        in_axes=(0, 0, 0, None, None),
+    )(source, target, mask, ridge_ratio, epsilon)
+    valid = (count >= 2).astype(source.dtype)
+    denominator = jnp.maximum(valid.sum(), 1.0)
+    return {
+        "loss": (loss * valid).sum() / denominator,
+        "similarity": (similarity * valid).sum() / denominator,
+        "source_effective_rank": (effective_rank * valid).sum() / denominator,
+        "valid_samples": (count * valid).sum() / denominator,
+        "valid_groups": valid.sum(),
+    }

@@ -45,6 +45,21 @@ def test_benchmark_scope_is_explicit_and_distance_free_none_is_not_duplicated():
         assert any(task.align_mode == mode for task in tasks)
 
 
+def test_containment_is_an_opt_in_third_distance():
+    tasks = task_matrix(
+        ("3s5z_vs_3s6z",),
+        ("nps",),
+        (1, 2, 3, 4),
+        cka_alignment_coef=None,
+        distances=("containment",),
+        containment_alignment_coef=0.25,
+    )
+    assert len(tasks) == 16
+    aligned = [task for task in tasks if task.align_mode != "none"]
+    assert all(task.align_distance == "containment" for task in aligned)
+    assert all("_dsc-" in task.run_name for task in aligned)
+
+
 def test_exact_prior_checkpoint_is_reused_but_mismatched_config_is_not(tmp_path):
     tasks = task_matrix(("2s3z",), ("nps",), (1,), 0.037)
     target = next(task for task in tasks if task.condition == "a_to_c_cka")

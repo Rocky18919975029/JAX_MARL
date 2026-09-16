@@ -136,10 +136,14 @@ def main() -> None:
         "--align-mode", choices=("none", "c_to_a", "a_to_c", "joint"), required=True
     )
     parser.add_argument(
-        "--align-distance", choices=("ln_mse", "linear_cka"), default="ln_mse"
+        "--align-distance",
+        choices=("ln_mse", "linear_cka", "containment"),
+        default="ln_mse",
     )
     parser.add_argument("--alignment-coef", type=float, default=0.1)
     parser.add_argument("--alignment-epsilon", type=float, default=1e-8)
+    parser.add_argument("--containment-ridge-ratio", type=float, default=1e-3)
+    parser.add_argument("--containment-epsilon", type=float, default=1e-6)
     parser.add_argument("--checkpoint-interval-steps", type=int, default=500_000)
     parser.add_argument("--wandb-project", default="harl-mamujoco-alignment")
     parser.add_argument("--wandb-entity")
@@ -169,10 +173,13 @@ def main() -> None:
     sys.path.insert(0, str(REPO_ROOT))
 
     actor_label = "ps" if args.actor_parameter_sharing else "nps"
+    distance_suffix = {
+        "ln_mse": "mse",
+        "linear_cka": "cka",
+        "containment": "dsc",
+    }[args.align_distance]
     condition = (
-        "none"
-        if args.align_mode == "none"
-        else f"{args.align_mode}_{'cka' if args.align_distance == 'linear_cka' else 'mse'}"
+        "none" if args.align_mode == "none" else f"{args.align_mode}_{distance_suffix}"
     )
     if args.run_name is None:
         args.run_name = (
@@ -202,6 +209,8 @@ def main() -> None:
         "align_distance": args.align_distance,
         "alignment_coef": args.alignment_coef,
         "alignment_epsilon": args.alignment_epsilon,
+        "containment_ridge_ratio": args.containment_ridge_ratio,
+        "containment_epsilon": args.containment_epsilon,
         "matched_update": True,
         "checkpoint_root": str(args.checkpoint_root),
         "checkpoint_interval_steps": args.checkpoint_interval_steps,

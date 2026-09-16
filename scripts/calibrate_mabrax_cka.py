@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Calibrate one MABrax linear-CKA coefficient from initial gradients."""
+"""Calibrate a MABrax relational-alignment coefficient from initial gradients."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from pathlib import Path
 
 
 PROTOCOL_VERSION = "mabrax-cka-gradient-calibration-v1.0"
+TARGET_DISTANCES = ("linear_cka", "containment")
 ACTOR_VARIANTS = (("ps", True), ("nps", False))
 DIRECTIONS = ("c_to_a", "a_to_c")
 
@@ -37,11 +38,13 @@ class Task:
     sharing: bool
     direction: str
     seed: int
+    calibration_label: str = "CKA"
 
     @property
     def name(self):
         return (
-            f"MABRAX-CKA-calibration-halfcheetah_6x1-{self.actor_label}-"
+            f"MABRAX-{self.calibration_label}-calibration-halfcheetah_6x1-"
+            f"{self.actor_label}-"
             f"{self.direction}-seed{self.seed}"
         )
 
@@ -57,13 +60,15 @@ def load_metrics(path):
     return records[0]
 
 
-def extract_cell(task, metrics):
+def extract_cell(task, metrics, target_distance="linear_cka"):
     recipient = "actor" if task.direction == "c_to_a" else "critic"
     ln_key = f"calibration_ln_mse_{recipient}_cross_to_rl_ratio"
-    cka_key = f"calibration_linear_cka_{recipient}_cross_to_rl_ratio"
+    target_key = f"calibration_{target_distance}_{recipient}_cross_to_rl_ratio"
     ln_ratio = float(metrics[ln_key])
-    cka_ratio = float(metrics[cka_key])
-    if not all(math.isfinite(value) and value > 0 for value in (ln_ratio, cka_ratio)):
+    target_ratio = float(metrics[target_key])
+    if not all(
+        math.isfinite(value) and value > 0 for value in (ln_ratio, target_ratio)
+    ):
         raise RuntimeError(f"Invalid calibration ratios for {task.name}")
     return {
         "actor_parameterization": task.actor_label,
@@ -72,20 +77,23 @@ def extract_cell(task, metrics):
         "gradient_recipient": recipient,
         "pilot_seed": task.seed,
         "ln_mse_cross_to_rl_ratio": ln_ratio,
-        "linear_cka_cross_to_rl_ratio": cka_ratio,
-        "cell_matching_coef": 0.1 * ln_ratio / cka_ratio,
+        f"{target_distance}_cross_to_rl_ratio": target_ratio,
+        "cell_matching_coef": 0.1 * ln_ratio / target_ratio,
     }
 
 
-def pooled_rms_coefficient(cells, reference_coef=0.1):
+def pooled_rms_coefficient(
+    cells, reference_coef=0.1, target_distance="linear_cka"
+):
     reference_squared = sum(cell["ln_mse_cross_to_rl_ratio"] ** 2 for cell in cells)
-    cka_squared = sum(cell["linear_cka_cross_to_rl_ratio"] ** 2 for cell in cells)
-    if not cells or reference_squared <= 0 or cka_squared <= 0:
+    target_key = f"{target_distance}_cross_to_rl_ratio"
+    target_squared = sum(cell[target_key] ** 2 for cell in cells)
+    if not cells or reference_squared <= 0 or target_squared <= 0:
         raise ValueError("Calibration cells and gradient ratios must be positive")
-    return reference_coef * math.sqrt(reference_squared / cka_squared)
+    return reference_coef * math.sqrt(reference_squared / target_squared)
 
 
-def build_command(task, output_root, metrics_path):
+def build_command(task, output_root, metrics_path, protocol_version=PROTOCOL_VERSION):
     return [
         sys.executable,
         str(repository_root() / "baselines/MAPPO/mappo_ff_mabrax.py"),
@@ -96,6 +104,8 @@ def build_command(task, output_root, metrics_path):
         f"ALIGN_MODE={task.direction}",
         "ALIGN_DISTANCE=ln_mse",
         "ALIGN_DISTANCE_EPS=1e-8",
+        "ALIGN_CONTAINMENT_RIDGE_RATIO=1e-3",
+        "ALIGN_CONTAINMENT_EPS=1e-6",
         "ALIGNMENT_COEF=0",
         "ALIGN_GRADIENT_CALIBRATION=true",
         "NUM_ENVS=64",
@@ -107,8 +117,8 @@ def build_command(task, output_root, metrics_path):
         "ANNEAL_LR=false",
         "SAVE_CHECKPOINTS=false",
         f"METRICS_JSONL={metrics_path}",
-        f"MATRIX_PROFILE={PROTOCOL_VERSION}",
-        f"PROTOCOL_VERSION={PROTOCOL_VERSION}",
+        f"MATRIX_PROFILE={protocol_version}",
+        f"PROTOCOL_VERSION={protocol_version}",
         "WANDB_MODE=disabled",
         "PROJECT=jaxmarl-mabrax-cka-calibration",
         f"hydra.run.dir={output_root / 'hydra' / task.name}",
@@ -121,6 +131,9 @@ def main():
     parser.add_argument("--pilot-seed", type=int, default=9001)
     parser.add_argument("--gpus", type=parse_csv, default=("0", "1", "2", "3"))
     parser.add_argument("--reference-coef", type=float, default=0.1)
+    parser.add_argument(
+        "--target-distance", choices=TARGET_DISTANCES, default="linear_cka"
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.reference_coef <= 0:
@@ -130,8 +143,14 @@ def main():
     logs_root = output_root / "logs"
     metrics_root.mkdir(parents=True, exist_ok=True)
     logs_root.mkdir(parents=True, exist_ok=True)
+    calibration_label = "CKA" if args.target_distance == "linear_cka" else "DSC"
+    protocol_version = (
+        PROTOCOL_VERSION
+        if args.target_distance == "linear_cka"
+        else "mabrax-containment-gradient-calibration-v1.0"
+    )
     tasks = [
-        Task(label, sharing, direction, args.pilot_seed)
+        Task(label, sharing, direction, args.pilot_seed, calibration_label)
         for label, sharing in ACTOR_VARIANTS
         for direction in DIRECTIONS
     ]
@@ -144,7 +163,7 @@ def main():
         for task in tasks_for_gpu:
             metrics = metrics_root / f"{task.name}.jsonl"
             log = logs_root / f"{task.name}.log"
-            command = build_command(task, output_root, metrics)
+            command = build_command(task, output_root, metrics, protocol_version)
             print(f"GPU {gpu} START {task.name}", flush=True)
             if args.dry_run:
                 print(" ".join(map(str, command)), flush=True)
@@ -184,10 +203,16 @@ def main():
         return
 
     cells = [
-        extract_cell(task, load_metrics(metrics_root / f"{task.name}.jsonl"))
+        extract_cell(
+            task,
+            load_metrics(metrics_root / f"{task.name}.jsonl"),
+            args.target_distance,
+        )
         for task in tasks
     ]
-    coefficient = pooled_rms_coefficient(cells, args.reference_coef)
+    coefficient = pooled_rms_coefficient(
+        cells, args.reference_coef, args.target_distance
+    )
     commit = subprocess.run(
         ("git", "rev-parse", "HEAD"),
         cwd=repository_root(),
@@ -197,7 +222,7 @@ def main():
     ).stdout.strip()
     result = {
         "schema_version": 1,
-        "protocol_version": PROTOCOL_VERSION,
+        "protocol_version": protocol_version,
         "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "git_commit": commit,
         "environment": "halfcheetah_6x1",
@@ -205,16 +230,20 @@ def main():
         "selection_uses_return": False,
         "reference_distance": "ln_mse",
         "reference_alignment_coef": args.reference_coef,
-        "target_distance": "linear_cka",
+        "target_distance": args.target_distance,
+        "containment_ridge_ratio": 1e-3,
+        "containment_epsilon": 1e-6,
         "aggregation": "equal-cell pooled RMS of initial cross/RL gradient ratios",
         "global_alignment_coef": coefficient,
         "cells": cells,
     }
-    destination = output_root / "cka_gradient_calibration.json"
+    stem = "cka" if args.target_distance == "linear_cka" else "containment"
+    destination = output_root / f"{stem}_gradient_calibration.json"
     destination.write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    print(f"Global lambda_CKA: {coefficient:.10g}")
+    label = "CKA" if args.target_distance == "linear_cka" else "DSC"
+    print(f"Global lambda_{label}: {coefficient:.10g}")
     print(destination)
 
 

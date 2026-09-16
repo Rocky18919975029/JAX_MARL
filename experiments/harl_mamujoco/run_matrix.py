@@ -53,7 +53,11 @@ class Task:
     def condition(self) -> str:
         if self.mode == "none":
             return "none"
-        suffix = "mse" if self.distance == "ln_mse" else "cka"
+        suffix = {
+            "ln_mse": "mse",
+            "linear_cka": "cka",
+            "containment": "dsc",
+        }[self.distance]
         return f"{self.mode}_{suffix}"
 
     @property
@@ -64,10 +68,10 @@ class Task:
         )
 
 
-def load_cka_coefficient(path: Path) -> float:
+def load_alignment_coefficient(path: Path, target_distance: str) -> float:
     payload = json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
     if payload.get("selection_uses_return") is not False:
-        raise ValueError("CKA calibration must not use returns")
+        raise ValueError("Alignment calibration must not use returns")
     if payload.get("performance_fields_persisted") is not False:
         raise ValueError("CKA calibration artifact must exclude performance fields")
     if payload.get("task") != "Humanoid-v2-17x1":
@@ -76,24 +80,34 @@ def load_cka_coefficient(path: Path) -> float:
         )
     if (
         payload.get("reference_distance") != "ln_mse"
-        or payload.get("target_distance") != "linear_cka"
+        or payload.get("target_distance") != target_distance
     ):
-        raise ValueError("Invalid CKA calibration distance pair")
+        raise ValueError("Invalid alignment calibration distance pair")
     value = float(payload["global_alignment_coef"])
     if not (value > 0 and value < float("inf")):
-        raise ValueError("Calibrated CKA coefficient must be finite and positive")
+        raise ValueError("Calibrated coefficient must be finite and positive")
     return value
 
 
-def task_matrix(seeds: tuple[int, ...], cka_coefficient: float) -> list[Task]:
+def task_matrix(
+    seeds: tuple[int, ...],
+    cka_coefficient: float | None,
+    distances=("ln_mse", "linear_cka"),
+    containment_coefficient: float | None = None,
+) -> list[Task]:
     tasks = []
     for actor_label, sharing in (("ps", True), ("nps", False)):
         for seed in seeds:
             tasks.append(Task(actor_label, sharing, "none", "ln_mse", 0.1, seed))
-            for distance, coefficient in (
-                ("ln_mse", 0.1),
-                ("linear_cka", cka_coefficient),
-            ):
+            coefficients = {
+                "ln_mse": 0.1,
+                "linear_cka": cka_coefficient,
+                "containment": containment_coefficient,
+            }
+            for distance in distances:
+                coefficient = coefficients[distance]
+                if coefficient is None:
+                    raise ValueError(f"Missing calibrated coefficient for {distance}")
                 for mode in ("c_to_a", "a_to_c", "joint"):
                     tasks.append(
                         Task(actor_label, sharing, mode, distance, coefficient, seed)
@@ -107,7 +121,11 @@ def main() -> None:
     parser.add_argument(
         "--harl-root", type=Path, default=REPO_ROOT / "third_party" / "HARL"
     )
-    parser.add_argument("--cka-calibration", type=Path, required=True)
+    parser.add_argument("--cka-calibration", type=Path)
+    parser.add_argument("--containment-calibration", type=Path)
+    parser.add_argument(
+        "--distances", default="ln_mse,linear_cka"
+    )
     parser.add_argument("--seeds", type=parse_seeds, default=(1, 2, 3, 4))
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--max-runs-per-gpu", type=int, default=1)
@@ -126,8 +144,28 @@ def main() -> None:
     harl_root = args.harl_root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     (root / "logs").mkdir(parents=True, exist_ok=True)
-    cka_coefficient = load_cka_coefficient(args.cka_calibration)
-    tasks = task_matrix(args.seeds, cka_coefficient)
+    distances = tuple(piece.strip() for piece in args.distances.split(",") if piece.strip())
+    if not distances or len(distances) != len(set(distances)) or not set(
+        distances
+    ).issubset({"ln_mse", "linear_cka", "containment"}):
+        raise ValueError("Invalid --distances selection")
+    cka_coefficient = None
+    containment_coefficient = None
+    if "linear_cka" in distances:
+        if args.cka_calibration is None:
+            raise ValueError("--cka-calibration is required for linear_cka")
+        cka_coefficient = load_alignment_coefficient(
+            args.cka_calibration, "linear_cka"
+        )
+    if "containment" in distances:
+        if args.containment_calibration is None:
+            raise ValueError("--containment-calibration is required for containment")
+        containment_coefficient = load_alignment_coefficient(
+            args.containment_calibration, "containment"
+        )
+    tasks = task_matrix(
+        args.seeds, cka_coefficient, distances, containment_coefficient
+    )
     pending = [
         task
         for task in tasks
@@ -135,7 +173,8 @@ def main() -> None:
     ]
     print(
         f"Protocol={PROTOCOL} unique_runs={len(tasks)} pending={len(pending)} "
-        f"seeds={','.join(map(str, args.seeds))} lambda_CKA={cka_coefficient:.10g}",
+        f"seeds={','.join(map(str, args.seeds))} "
+        f"lambda_CKA={cka_coefficient} lambda_DSC={containment_coefficient}",
         flush=True,
     )
 
@@ -175,6 +214,10 @@ def main() -> None:
                 task.distance,
                 "--alignment-coef",
                 str(task.coefficient),
+                "--containment-ridge-ratio",
+                "0.001",
+                "--containment-epsilon",
+                "0.000001",
                 "--checkpoint-interval-steps",
                 str(args.checkpoint_interval_steps),
                 "--wandb-project",

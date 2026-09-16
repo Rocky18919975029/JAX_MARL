@@ -64,6 +64,12 @@ class AlignedMAMuJoCoRunner(OnPolicyBaseRunner):
         self.align_distance = experiment["align_distance"]
         self.alignment_coef = float(experiment["alignment_coef"])
         self.alignment_epsilon = float(experiment["alignment_epsilon"])
+        self.containment_ridge_ratio = float(
+            experiment.get("containment_ridge_ratio", 1e-3)
+        )
+        self.containment_epsilon = float(
+            experiment.get("containment_epsilon", 1e-6)
+        )
         self.checkpoint_root = (
             Path(experiment["checkpoint_root"]).expanduser().resolve()
         )
@@ -84,6 +90,10 @@ class AlignedMAMuJoCoRunner(OnPolicyBaseRunner):
         if self.alignment_coef < 0 or self.alignment_epsilon <= 0:
             raise ValueError(
                 "Alignment coefficient must be non-negative and epsilon positive"
+            )
+        if self.containment_ridge_ratio < 0 or self.containment_epsilon <= 0:
+            raise ValueError(
+                "Containment ridge ratio must be non-negative and epsilon positive"
             )
 
         model = algo_args["model"]
@@ -341,6 +351,8 @@ class AlignedMAMuJoCoRunner(OnPolicyBaseRunner):
             critic_old,
             mask,
             self.alignment_epsilon,
+            self.containment_ridge_ratio,
+            self.containment_epsilon,
         )
         return {
             "actor_objective": actor_objectives.mean(),
@@ -451,6 +463,15 @@ class AlignedMAMuJoCoRunner(OnPolicyBaseRunner):
                 "distance_c_to_a": outputs["distances"]["c_to_a"],
                 "distance_a_to_c": outputs["distances"]["a_to_c"],
                 "distance_joint": outputs["distances"]["joint"],
+                "containment_similarity": outputs["distances"][
+                    "containment_similarity"
+                ],
+                "containment_source_effective_rank": outputs["distances"][
+                    "containment_source_effective_rank"
+                ],
+                "containment_valid_samples_mean": outputs["distances"][
+                    "containment_valid_samples_mean"
+                ],
                 "actor_rl_grad_norm": _global_norm(rl_grads[:actor_count]),
                 "critic_rl_grad_norm": _global_norm(rl_grads[actor_count:]),
                 "actor_cross_grad_norm": _global_norm(cross_grads[:actor_count]),
@@ -517,18 +538,27 @@ class AlignedMAMuJoCoRunner(OnPolicyBaseRunner):
             outputs["alignment"], recipient_params, allow_unused=True
         )
         cka_norm = _global_norm(cka_grads)
-        if min(rl_norm, ln_norm, cka_norm) <= 0:
+        outputs = self._forward_objectives(
+            actor_arrays, critic_arrays, actor_old, critic_old, "containment"
+        )
+        containment_grads = torch.autograd.grad(
+            outputs["alignment"], recipient_params, allow_unused=True
+        )
+        containment_norm = _global_norm(containment_grads)
+        if min(rl_norm, ln_norm, cka_norm, containment_norm) <= 0:
             raise RuntimeError(
                 f"Calibration gradient norms must be positive: RL={rl_norm}, "
-                f"LN-MSE={ln_norm}, CKA={cka_norm}"
+                f"LN-MSE={ln_norm}, CKA={cka_norm}, DSC={containment_norm}"
             )
         return {
             "recipient": "actor" if self.align_mode == "c_to_a" else "critic",
             "rl_grad_norm": rl_norm,
             "ln_mse_cross_grad_norm": ln_norm,
             "linear_cka_cross_grad_norm": cka_norm,
+            "containment_cross_grad_norm": containment_norm,
             "ln_mse_cross_to_rl_ratio": ln_norm / rl_norm,
             "linear_cka_cross_to_rl_ratio": cka_norm / rl_norm,
+            "containment_cross_to_rl_ratio": containment_norm / rl_norm,
         }
 
     def save_checkpoint(self, label: str, env_step: int) -> Path:
