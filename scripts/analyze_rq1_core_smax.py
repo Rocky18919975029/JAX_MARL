@@ -30,6 +30,10 @@ from matplotlib.ticker import MaxNLocator, ScalarFormatter
 
 
 TASKS = ("10m_vs_11m", "3s5z_vs_3s6z")
+TASK_TIMESTEP_BUDGETS = {
+    "10m_vs_11m": 10_000_000,
+    "3s5z_vs_3s6z": 20_000_000,
+}
 ACTOR_VARIANTS = ("nps",)
 DISTANCES = ("ln_mse", "linear_cka")
 MODES = ("none", "c_to_a", "a_to_c", "joint")
@@ -75,6 +79,8 @@ class RunSource:
     run_name: str
     alignment_coef: float
     source: str
+    total_timesteps: int | None = None
+    protocol_version: str = ""
 
 
 def read_json(path: Path):
@@ -145,7 +151,20 @@ def source_from_checkpoint(checkpoint: Path, source_label: str):
     run_id = metadata.get("wandb_run_id")
     run_name = metadata.get("wandb_run_name")
     coefficient = metadata.get("alignment_coef", config.get("ALIGNMENT_COEF"))
-    if key is None or not project or not run_id or not run_name or coefficient is None:
+    raw_total_timesteps = metadata.get(
+        "total_timesteps", config.get("TOTAL_TIMESTEPS")
+    )
+    try:
+        total_timesteps = int(float(raw_total_timesteps))
+    except (TypeError, ValueError):
+        total_timesteps = None
+    if (
+        key is None
+        or not project
+        or not run_id
+        or not run_name
+        or coefficient is None
+    ):
         return None, None
     return key, RunSource(
         checkpoint=checkpoint.resolve(),
@@ -154,10 +173,14 @@ def source_from_checkpoint(checkpoint: Path, source_label: str):
         run_name=str(run_name),
         alignment_coef=float(coefficient),
         source=source_label,
+        total_timesteps=total_timesteps,
+        protocol_version=str(
+            metadata.get("protocol_version", config.get("PROTOCOL_VERSION", ""))
+        ),
     )
 
 
-def discover_sources(matrix_root: Path):
+def discover_sources(matrix_root: Path, task_budgets=TASK_TIMESTEP_BUDGETS):
     """Resolve final checkpoints from one matrix root or a nested experiment root.
 
     The data-disk layout groups several experiment matrices below ``h1_smax_runs``.
@@ -178,6 +201,9 @@ def discover_sources(matrix_root: Path):
 
     def register(key, source):
         if key is None or source is None:
+            return
+        expected_budget = task_budgets.get(key[0])
+        if source.total_timesteps != expected_budget:
             return
         run_directory = source.checkpoint.parent
         completion_markers = (
@@ -209,6 +235,19 @@ def discover_sources(matrix_root: Path):
         key, source = source_from_checkpoint(metadata_path.parent, "matrix_root")
         register(key, source)
     return sources
+
+
+def select_main_table_rows(table_rows):
+    """Return the three prespecified RQ1 methods in publication order."""
+    lookup = {
+        (row["align_distance"], row["align_mode"]): row for row in table_rows
+    }
+    selected = []
+    for distance, mode, label, *_ in MAIN_FIGURE_METHODS:
+        row = dict(lookup[(distance, mode)])
+        row["method"] = label
+        selected.append(row)
+    return selected
 
 
 def read_history_cache(path: Path):
@@ -393,6 +432,10 @@ def build_task_results(task, seeds, sources, histories):
                     "wandb_run_name": source.run_name if source else "",
                     "checkpoint": str(source.checkpoint) if source else "",
                     "alignment_coef": source.alignment_coef if source else "",
+                    "training_budget_env_steps": source.total_timesteps
+                    if source
+                    else TASK_TIMESTEP_BUDGETS[task],
+                    "protocol_version": source.protocol_version if source else "",
                     "final_return": history[-1]["returns"] if history else "",
                     "final_win_rate": history[-1]["win_rate"] if history else "",
                     "return_auc": normalized_auc(history, "returns") if history else "",
@@ -487,6 +530,7 @@ def build_task_results(task, seeds, sources, histories):
                 "n_complete_seeds": len(complete),
                 "missing_seeds": ";".join(missing),
                 "data_status": "complete" if not missing else "incomplete",
+                "training_budget_env_steps": TASK_TIMESTEP_BUDGETS[task],
                 "threshold_return": thresholds[actor_variant]
                 if thresholds[actor_variant] is not None
                 else "",
@@ -808,6 +852,9 @@ def main():
         "actor_parameterization": "nps",
         "ps_runs_excluded": True,
         "tasks": list(tasks),
+        "task_training_budgets": {
+            task: TASK_TIMESTEP_BUDGETS[task] for task in tasks
+        },
         "seeds": list(args.seeds),
         "complete_checkpoint_sources": len(available_sources),
         "histories_loaded": len(histories),
@@ -821,6 +868,7 @@ def main():
         seed_rows, history_rows, table_rows, curve_rows, thresholds = build_task_results(
             task, args.seeds, sources, histories
         )
+        main_table_rows = select_main_table_rows(table_rows)
         write_csv(task_output / "rq1_seed_results.csv", seed_rows)
         write_csv(
             task_output / "rq1_run_history.csv",
@@ -836,7 +884,8 @@ def main():
                 "win_rate",
             ),
         )
-        write_csv(task_output / "rq1_table.csv", table_rows)
+        write_csv(task_output / "rq1_table.csv", main_table_rows)
+        write_csv(task_output / "rq1_all_methods_table.csv", table_rows)
         write_csv(
             task_output / "rq1_learning_curve.csv",
             curve_rows,
@@ -864,6 +913,7 @@ def main():
         task_manifest = {
             "schema_version": 1,
             "task": task,
+            "training_budget_env_steps": TASK_TIMESTEP_BUDGETS[task],
             "actor_parameterizations": list(ACTOR_VARIANTS),
             "seeds": list(args.seeds),
             "task_separated_statistics": True,
@@ -881,6 +931,9 @@ def main():
             "thresholds": thresholds,
             "tables": {
                 "main": str(task_output / "rq1_table.csv"),
+                "all_methods_supplement": str(
+                    task_output / "rq1_all_methods_table.csv"
+                ),
                 "seed": str(task_output / "rq1_seed_results.csv"),
                 "history": str(task_output / "rq1_run_history.csv"),
                 "curve": str(task_output / "rq1_learning_curve.csv"),
@@ -897,9 +950,12 @@ def main():
             encoding="utf-8",
         )
         top_manifest["task_outputs"][task] = str(task_output)
-        complete_methods = sum(row["data_status"] == "complete" for row in table_rows)
+        complete_methods = sum(
+            row["data_status"] == "complete" for row in main_table_rows
+        )
         print(
-            f"TASK {task}: complete_methods={complete_methods}/{len(table_rows)} "
+            f"TASK {task}: complete_main_methods={complete_methods}/"
+            f"{len(main_table_rows)} "
             f"output={task_output}",
             flush=True,
         )

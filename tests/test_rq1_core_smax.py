@@ -13,6 +13,7 @@ from scripts.analyze_rq1_core_smax import (
     expected_cells,
     interquartile_mean,
     plot_main_learning_curve,
+    select_main_table_rows,
 )
 
 
@@ -42,8 +43,14 @@ def synthetic_complete_task(tmp_path, task):
     return sources, histories
 
 
-def write_checkpoint(root, task="10m_vs_11m", seed=1):
-    checkpoint = root / "nested_matrix" / "checkpoints" / "project" / "run" / "final"
+def write_checkpoint(
+    root,
+    task="10m_vs_11m",
+    seed=1,
+    total_timesteps=10_000_000,
+    run="run",
+):
+    checkpoint = root / "nested_matrix" / "checkpoints" / "project" / run / "final"
     checkpoint.mkdir(parents=True)
     metadata = {
         "map_name": task,
@@ -52,12 +59,14 @@ def write_checkpoint(root, task="10m_vs_11m", seed=1):
         "align_distance": "ln_mse",
         "seed": seed,
         "wandb_project": "project",
-        "wandb_run_id": "run-id",
-        "wandb_run_name": "run-name",
+        "wandb_run_id": f"{run}-id",
+        "wandb_run_name": run,
         "alignment_coef": 0.1,
     }
     (checkpoint / "metadata.json").write_text(json.dumps(metadata))
-    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "config.json").write_text(
+        json.dumps({"TOTAL_TIMESTEPS": total_timesteps})
+    )
     (checkpoint / "model.safetensors").write_bytes(b"model")
     return checkpoint
 
@@ -75,6 +84,25 @@ def test_source_discovery_recurses_below_common_experiment_root(tmp_path):
     sources = discover_sources(tmp_path)
     key = ("10m_vs_11m", "nps", "distance_free", "none", 1)
     assert sources[key].checkpoint == checkpoint.resolve()
+
+
+def test_source_discovery_uses_20m_and_rejects_old_10m_for_3s5z(tmp_path):
+    write_checkpoint(
+        tmp_path,
+        task="3s5z_vs_3s6z",
+        total_timesteps=10_000_000,
+        run="old-10m",
+    )
+    checkpoint = write_checkpoint(
+        tmp_path,
+        task="3s5z_vs_3s6z",
+        total_timesteps=20_000_000,
+        run="new-20m",
+    )
+    sources = discover_sources(tmp_path)
+    key = ("3s5z_vs_3s6z", "nps", "distance_free", "none", 1)
+    assert sources[key].checkpoint == checkpoint.resolve()
+    assert sources[key].total_timesteps == 20_000_000
 
 
 def test_four_seed_iqm_uses_the_middle_two_seeds():
@@ -128,6 +156,12 @@ def test_complete_task_writes_one_prespecified_publication_figure(tmp_path):
     assert len(table) == 7
     assert all(row["data_status"] == "complete" for row in table)
     assert [item[2] for item in MAIN_FIGURE_METHODS] == [
+        "Isolated",
+        "C → A (Linear CKA)",
+        "C → A (MSE)",
+    ]
+    main_table = select_main_table_rows(table)
+    assert [row["method"] for row in main_table] == [
         "Isolated",
         "C → A (Linear CKA)",
         "C → A (MSE)",
