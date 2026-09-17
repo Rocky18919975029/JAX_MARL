@@ -427,11 +427,15 @@ def main():
             f"seeds={','.join(map(str, args.seeds))} "
             f"cka_lambda={cka_alignment_coef} dsc_lambda={containment_alignment_coef}"
         )
-        for index, task in enumerate(tasks):
+        pending_index = 0
+        for task in tasks:
             if task.key in reusable:
                 print(f"REUSE: {task.run_name} <- {reusable[task.key]}")
                 continue
-            print(f"GPU {gpu_ids[index % len(gpu_ids)]}: {task.run_name}")
+            print(
+                f"GPU {gpu_ids[pending_index % len(gpu_ids)]}: {task.run_name}"
+            )
+            pending_index += 1
         return
 
     directories = {
@@ -515,7 +519,8 @@ def main():
     pending_by_gpu = {gpu: collections.deque() for gpu in gpu_ids}
     skipped = 0
     reused = 0
-    for index, task in enumerate(tasks):
+    pending_index = 0
+    for task in tasks:
         if task.key in reusable:
             reused += 1
             continue
@@ -525,7 +530,8 @@ def main():
             if prior.get("status") == "completed":
                 skipped += 1
                 continue
-        pending_by_gpu[gpu_ids[index % len(gpu_ids)]].append(task)
+        pending_by_gpu[gpu_ids[pending_index % len(gpu_ids)]].append(task)
+        pending_index += 1
     append_log(
         launcher_log,
         f"protocol={PROTOCOL_VERSION} selected={len(tasks)} "

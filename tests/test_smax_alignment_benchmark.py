@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 
 from scripts.h1_protocol import MANUAL_REFERENCE
 from scripts.run_smax_alignment_benchmark import (
@@ -58,6 +59,20 @@ def test_containment_is_an_opt_in_third_distance():
     aligned = [task for task in tasks if task.align_mode != "none"]
     assert all(task.align_distance == "containment" for task in aligned)
     assert all("_dsc-" in task.run_name for task in aligned)
+
+
+def test_pending_dsc_runs_can_be_evenly_distributed_after_baseline_reuse():
+    tasks = task_matrix(
+        ("3s5z_vs_3s6z",),
+        ("nps",),
+        (1, 2, 3, 4),
+        cka_alignment_coef=None,
+        distances=("containment",),
+        containment_alignment_coef=0.25,
+    )
+    pending = [task for task in tasks if task.align_mode != "none"]
+    assignments = Counter(index % 4 for index, _ in enumerate(pending))
+    assert assignments == {0: 3, 1: 3, 2: 3, 3: 3}
 
 
 def test_exact_prior_checkpoint_is_reused_but_mismatched_config_is_not(tmp_path):
