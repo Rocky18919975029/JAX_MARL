@@ -22,6 +22,12 @@ except ModuleNotFoundError:  # Imported as scripts.calibrate_h1_cka in tests.
 
 
 MAPS = ("10m_vs_11m", "smacv2_10_units")
+CALIBRATION_MAPS = (
+    *MAPS,
+    "2s3z",
+    "3s5z_vs_3s6z",
+    "6h_vs_8z",
+)
 ACTOR_VARIANTS = (("ps", True), ("nps", False))
 DIRECTIONS = ("c_to_a", "a_to_c")
 CALIBRATION_PROTOCOL = "h1-cka-gradient-calibration-v1.0"
@@ -223,7 +229,9 @@ def main():
     parser.add_argument("--pilot-seed", type=int, default=9001)
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument(
-        "--maps", type=lambda value: parse_csv(value, MAPS), default=MAPS
+        "--maps",
+        type=lambda value: parse_csv(value, CALIBRATION_MAPS),
+        default=MAPS,
     )
     parser.add_argument(
         "--actor-variants",

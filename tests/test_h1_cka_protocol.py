@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts.calibrate_h1_cka import pooled_rms_coefficient
+from scripts.calibrate_h1_cka import CALIBRATION_MAPS, parse_csv, pooled_rms_coefficient
 from scripts import run_h1_smax_confirmatory as launcher
 
 
@@ -61,6 +61,12 @@ def test_pooled_rms_calibration_uses_relative_rl_gradient_scale():
         },
     ]
     assert pooled_rms_coefficient(cells, 0.1) == pytest.approx(0.05)
+
+
+def test_gradient_calibration_accepts_official_smax_benchmark_maps():
+    assert parse_csv("3s5z_vs_3s6z", CALIBRATION_MAPS) == (
+        "3s5z_vs_3s6z",
+    )
 
 
 def test_calibration_file_must_be_return_independent(tmp_path):

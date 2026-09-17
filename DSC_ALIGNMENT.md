@@ -64,6 +64,8 @@ python scripts/calibrate_h1_cka.py \
   --target-distance containment \
   --frozen-config "$FROZEN_CONFIG" \
   --output-root "$DSC_CAL_ROOT" \
+  --maps 3s5z_vs_3s6z \
+  --actor-variants nps \
   --pilot-seed 9001 \
   --gpus 0,1,2,3
 ```
@@ -101,3 +103,24 @@ python scripts/run_mabrax_alignment.py \
 ```
 
 The generated condition/run-name suffix is `_dsc`.
+
+A four-seed, NPS-only DSC matrix on SMAX `3s5z_vs_3s6z` uses:
+
+```bash
+python scripts/run_smax_alignment_benchmark.py \
+  --run-root "$DSC_RUN_ROOT" \
+  --frozen-config "$FROZEN_CONFIG" \
+  --distances containment \
+  --containment-calibration \
+    "$DSC_CAL_ROOT/containment_gradient_calibration.json" \
+  --maps 3s5z_vs_3s6z \
+  --actor-variants nps \
+  --seeds 1-4 \
+  --reuse-root "$H1_ROOT" \
+  --gpus 0,1,2,3 \
+  --max-runs-per-gpu 4
+```
+
+This matrix contains one distance-free `none` baseline and the three DSC
+directions (`c_to_a`, `a_to_c`, and `joint`) per seed. An exactly matching
+completed baseline under `H1_ROOT` is reused rather than retrained.
