@@ -38,11 +38,12 @@ def synthetic_complete_task(tmp_path, task):
     return sources, histories
 
 
-def test_each_task_has_an_independent_56_seed_cell_matrix():
+def test_each_task_has_an_independent_nps_only_28_seed_cell_matrix():
     cells = expected_cells(("10m_vs_11m", "3s5z_vs_3s6z"), (1, 2, 3, 4))
-    assert len(cells) == 112
-    assert sum(cell.task == "10m_vs_11m" for cell in cells) == 56
-    assert sum(cell.task == "3s5z_vs_3s6z" for cell in cells) == 56
+    assert len(cells) == 56
+    assert sum(cell.task == "10m_vs_11m" for cell in cells) == 28
+    assert sum(cell.task == "3s5z_vs_3s6z" for cell in cells) == 28
+    assert {cell.actor_variant for cell in cells} == {"nps"}
 
 
 def test_four_seed_iqm_uses_the_middle_two_seeds():
@@ -93,7 +94,7 @@ def test_complete_task_writes_separate_return_and_win_figures(tmp_path):
     _, _, table, curves, _ = build_task_results(
         task, (1, 2, 3, 4), sources, histories
     )
-    assert len(table) == 14
+    assert len(table) == 7
     assert all(row["data_status"] == "complete" for row in table)
     return_stem = plot_metric(task, "returns", table, curves, tmp_path)
     win_stem = plot_metric(task, "win_rate", table, curves, tmp_path)
@@ -108,17 +109,17 @@ def test_fully_missing_task_still_has_all_blank_method_rows():
     )
     assert not history_rows
     assert not curves
-    assert len(table) == 14
+    assert len(table) == 7
     assert all(row["data_status"] == "incomplete" for row in table)
     assert all(row["final_return_mean"] == "" for row in table)
-    assert thresholds == {"ps": None, "nps": None}
+    assert thresholds == {"nps": None}
 
 
 def test_missing_baseline_leaves_only_paired_fields_blank(tmp_path):
     task = "10m_vs_11m"
     sources, histories = synthetic_complete_task(tmp_path, task)
     for seed in (1, 2, 3, 4):
-        baseline = Cell(task, "ps", "distance_free", "none", seed)
+        baseline = Cell(task, "nps", "distance_free", "none", seed)
         sources.pop(baseline.key)
         histories.pop(baseline.key)
     _, _, table, _, _ = build_task_results(
@@ -127,7 +128,7 @@ def test_missing_baseline_leaves_only_paired_fields_blank(tmp_path):
     selected = next(
         row
         for row in table
-        if row["actor_parameterization"] == "ps"
+        if row["actor_parameterization"] == "nps"
         and row["align_distance"] == "ln_mse"
         and row["align_mode"] == "c_to_a"
     )

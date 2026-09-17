@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build task-separated RQ1 tables and learning curves from W&B histories.
+"""Build task-separated, NPS-only RQ1 tables and curves from W&B histories.
 
 The canonical matrix contains two maps, but this script never pools them.  It
 writes one independent result directory per map.  A table row is populated
 only when all requested training seeds are complete and their W&B histories
-are available; otherwise numeric cells are deliberately left empty.
+are available; otherwise numeric cells are deliberately left empty.  PS runs
+are intentionally outside the RQ1 estimand and are neither loaded nor shown.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import matplotlib.pyplot as plt
 
 
 TASKS = ("10m_vs_11m", "3s5z_vs_3s6z")
-ACTOR_VARIANTS = ("ps", "nps")
+ACTOR_VARIANTS = ("nps",)
 DISTANCES = ("ln_mse", "linear_cka")
 MODES = ("none", "c_to_a", "a_to_c", "joint")
 ALIGNED_MODES = MODES[1:]
@@ -537,7 +538,14 @@ def build_task_results(task, seeds, sources, histories):
 
 
 def plot_metric(task, metric, table_rows, curve_rows, output):
-    figure, axes = plt.subplots(2, 2, figsize=(13.2, 8.6), sharex=True, sharey=True)
+    figure, axes = plt.subplots(
+        len(ACTOR_VARIANTS),
+        len(DISTANCES),
+        figsize=(13.2, 5.0),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
     table_lookup = {
         (row["actor_parameterization"], row["align_distance"], row["align_mode"]): row
         for row in table_rows
@@ -569,7 +577,7 @@ def plot_metric(task, metric, table_rows, curve_rows, output):
                 high = np.asarray([row["ci95_high"] for row in selected])
                 axis.plot(x, mean, color=COLORS[mode], linewidth=2.2, label=LABELS[mode])
                 axis.fill_between(x, low, high, color=COLORS[mode], alpha=0.15)
-            axis.set_title(f"{actor_variant.upper()} · {DISTANCE_LABELS[distance]}")
+            axis.set_title(DISTANCE_LABELS[distance])
             axis.set_xlabel("Environment steps")
             axis.set_ylabel("Episode return" if metric == "returns" else "Win rate")
             axis.ticklabel_format(style="sci", axis="x", scilimits=(0, 0))
@@ -591,18 +599,19 @@ def plot_metric(task, metric, table_rows, curve_rows, output):
         for mode in MODES
     ]
     figure.suptitle(
-        f"RQ1 — {task} — {'episode return' if metric == 'returns' else 'win rate'}",
+        f"RQ1 — {task} — NPS — "
+        f"{'episode return' if metric == 'returns' else 'win rate'}",
         fontsize=15,
         y=0.985,
     )
     figure.legend(
         handles=handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.935),
+        bbox_to_anchor=(0.5, 0.90),
         ncol=4,
         frameon=True,
     )
-    figure.tight_layout(rect=(0.02, 0.02, 0.98, 0.88), w_pad=2.0, h_pad=2.0)
+    figure.tight_layout(rect=(0.02, 0.03, 0.98, 0.80), w_pad=2.0)
     stem = output / "figures" / f"rq1-{task}-{metric}"
     stem.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(stem.with_suffix(".png"), dpi=250, bbox_inches="tight")
@@ -695,6 +704,8 @@ def main():
         "schema_version": 1,
         "matrix_root": str(matrix_root),
         "tasks_are_never_pooled": True,
+        "actor_parameterization": "nps",
+        "ps_runs_excluded": True,
         "tasks": list(tasks),
         "seeds": list(args.seeds),
         "complete_checkpoint_sources": len(available_sources),
