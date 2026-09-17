@@ -3,12 +3,13 @@ import matplotlib
 matplotlib.use("Agg")
 
 from scripts.analyze_rq1_core_smax import (
+    MAIN_FIGURE_METHODS,
     Cell,
     RunSource,
     build_task_results,
     expected_cells,
     interquartile_mean,
-    plot_metric,
+    plot_main_learning_curve,
 )
 
 
@@ -88,7 +89,7 @@ def test_incomplete_four_seed_method_is_left_blank(tmp_path):
     assert seed["final_return"] == ""
 
 
-def test_complete_task_writes_separate_return_and_win_figures(tmp_path):
+def test_complete_task_writes_one_prespecified_publication_figure(tmp_path):
     task = "3s5z_vs_3s6z"
     sources, histories = synthetic_complete_task(tmp_path, task)
     _, _, table, curves, _ = build_task_results(
@@ -96,11 +97,15 @@ def test_complete_task_writes_separate_return_and_win_figures(tmp_path):
     )
     assert len(table) == 7
     assert all(row["data_status"] == "complete" for row in table)
-    return_stem = plot_metric(task, "returns", table, curves, tmp_path)
-    win_stem = plot_metric(task, "win_rate", table, curves, tmp_path)
-    for stem in (return_stem, win_stem):
-        assert stem.with_suffix(".png").is_file()
-        assert stem.with_suffix(".pdf").is_file()
+    assert [item[2] for item in MAIN_FIGURE_METHODS] == [
+        "Isolated",
+        "C → A (Linear CKA)",
+        "C → A (MSE)",
+    ]
+    stem = plot_main_learning_curve(task, table, curves, tmp_path)
+    assert stem.name == f"rq1-{task}-learning-curve"
+    assert stem.with_suffix(".png").is_file()
+    assert stem.with_suffix(".pdf").is_file()
 
 
 def test_fully_missing_task_still_has_all_blank_method_rows():

@@ -25,6 +25,8 @@ import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.ticker import MaxNLocator, ScalarFormatter
 
 
 TASKS = ("10m_vs_11m", "3s5z_vs_3s6z")
@@ -32,12 +34,6 @@ ACTOR_VARIANTS = ("nps",)
 DISTANCES = ("ln_mse", "linear_cka")
 MODES = ("none", "c_to_a", "a_to_c", "joint")
 ALIGNED_MODES = MODES[1:]
-COLORS = {
-    "none": "#222222",
-    "c_to_a": "#377bd1",
-    "a_to_c": "#80b918",
-    "joint": "#bc6c35",
-}
 LABELS = {
     "none": "Isolated",
     "c_to_a": "C → A",
@@ -46,6 +42,11 @@ LABELS = {
 }
 DISTANCE_LABELS = {"ln_mse": "LN-MSE", "linear_cka": "Linear CKA"}
 METRICS = ("returns", "win_rate")
+MAIN_FIGURE_METHODS = (
+    ("distance_free", "none", "Isolated", "#333333", (0, (5, 2)), "o"),
+    ("linear_cka", "c_to_a", "C → A (Linear CKA)", "#0072B2", "-", "s"),
+    ("ln_mse", "c_to_a", "C → A (MSE)", "#D55E00", "-.", "^"),
+)
 
 
 @dataclass(frozen=True)
@@ -537,86 +538,142 @@ def build_task_results(task, seeds, sources, histories):
     return seed_rows, history_rows, table_rows, curve_rows, thresholds
 
 
-def plot_metric(task, metric, table_rows, curve_rows, output):
-    figure, axes = plt.subplots(
-        len(ACTOR_VARIANTS),
-        len(DISTANCES),
-        figsize=(13.2, 5.0),
-        sharex=True,
-        sharey=True,
-        squeeze=False,
-    )
-    table_lookup = {
-        (row["actor_parameterization"], row["align_distance"], row["align_mode"]): row
-        for row in table_rows
+def plot_main_learning_curve(task, table_rows, curve_rows, output):
+    """Plot the three prespecified NPS return curves used in the RQ1 paper."""
+    style = {
+        "font.family": "sans-serif",
+        "font.sans-serif": ["DejaVu Sans", "Arial", "Liberation Sans"],
+        "font.size": 10.5,
+        "axes.labelsize": 11.5,
+        "axes.titlesize": 14,
+        "axes.titleweight": "semibold",
+        "xtick.labelsize": 9.5,
+        "ytick.labelsize": 9.5,
+        "legend.fontsize": 9.5,
+        "axes.linewidth": 0.9,
+        "lines.solid_capstyle": "round",
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
     }
-    for row_index, actor_variant in enumerate(ACTOR_VARIANTS):
-        for column_index, distance in enumerate(DISTANCES):
-            axis = axes[row_index, column_index]
-            missing_labels = []
-            for mode in MODES:
-                method_distance = "distance_free" if mode == "none" else distance
-                status = table_lookup[(actor_variant, method_distance, mode)]["data_status"]
-                selected = sorted(
-                    (
-                        row
-                        for row in curve_rows
-                        if row["actor_parameterization"] == actor_variant
-                        and row["align_distance"] == method_distance
-                        and row["align_mode"] == mode
-                        and row["metric"] == metric
-                    ),
-                    key=lambda row: int(row["env_step"]),
+    with plt.rc_context(style):
+        figure, axis = plt.subplots(figsize=(7.2, 4.45))
+        table_lookup = {
+            (
+                row["actor_parameterization"],
+                row["align_distance"],
+                row["align_mode"],
+            ): row
+            for row in table_rows
+        }
+        missing_labels = []
+        legend_handles = []
+        for distance, mode, label, color, linestyle, marker in MAIN_FIGURE_METHODS:
+            legend_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color=color,
+                    linestyle=linestyle,
+                    linewidth=2.5,
+                    marker=marker,
+                    markersize=5.2,
+                    markerfacecolor="white",
+                    markeredgewidth=1.1,
+                    label=label,
                 )
-                if status != "complete" or not selected:
-                    missing_labels.append(LABELS[mode])
-                    continue
-                x = np.asarray([row["env_step"] for row in selected])
-                mean = np.asarray([row["mean"] for row in selected])
-                low = np.asarray([row["ci95_low"] for row in selected])
-                high = np.asarray([row["ci95_high"] for row in selected])
-                axis.plot(x, mean, color=COLORS[mode], linewidth=2.2, label=LABELS[mode])
-                axis.fill_between(x, low, high, color=COLORS[mode], alpha=0.15)
-            axis.set_title(DISTANCE_LABELS[distance])
-            axis.set_xlabel("Environment steps")
-            axis.set_ylabel("Episode return" if metric == "returns" else "Win rate")
-            axis.ticklabel_format(style="sci", axis="x", scilimits=(0, 0))
-            axis.grid(alpha=0.25)
-            if metric == "win_rate":
-                axis.set_ylim(-0.02, 1.02)
-            if missing_labels:
-                axis.text(
-                    0.02,
-                    0.04,
-                    "Missing: " + ", ".join(missing_labels),
-                    transform=axis.transAxes,
-                    fontsize=8.5,
-                    color="#777777",
-                    va="bottom",
-                )
-    handles = [
-        plt.Line2D([0], [0], color=COLORS[mode], linewidth=2.2, label=LABELS[mode])
-        for mode in MODES
-    ]
-    figure.suptitle(
-        f"RQ1 — {task} — NPS — "
-        f"{'episode return' if metric == 'returns' else 'win rate'}",
-        fontsize=15,
-        y=0.985,
-    )
-    figure.legend(
-        handles=handles,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.90),
-        ncol=4,
-        frameon=True,
-    )
-    figure.tight_layout(rect=(0.02, 0.03, 0.98, 0.80), w_pad=2.0)
-    stem = output / "figures" / f"rq1-{task}-{metric}"
-    stem.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(stem.with_suffix(".png"), dpi=250, bbox_inches="tight")
-    figure.savefig(stem.with_suffix(".pdf"), bbox_inches="tight")
-    plt.close(figure)
+            )
+            status = table_lookup[("nps", distance, mode)]["data_status"]
+            selected = sorted(
+                (
+                    row
+                    for row in curve_rows
+                    if row["actor_parameterization"] == "nps"
+                    and row["align_distance"] == distance
+                    and row["align_mode"] == mode
+                    and row["metric"] == "returns"
+                ),
+                key=lambda row: int(row["env_step"]),
+            )
+            if status != "complete" or not selected:
+                missing_labels.append(label)
+                continue
+            x = np.asarray([row["env_step"] for row in selected])
+            mean = np.asarray([row["mean"] for row in selected])
+            low = np.asarray([row["ci95_low"] for row in selected])
+            high = np.asarray([row["ci95_high"] for row in selected])
+            marker_every = max(1, len(x) // 9)
+            axis.fill_between(
+                x,
+                low,
+                high,
+                color=color,
+                alpha=0.13,
+                linewidth=0,
+                zorder=1,
+            )
+            axis.plot(
+                x,
+                mean,
+                color=color,
+                linestyle=linestyle,
+                linewidth=2.5,
+                marker=marker,
+                markersize=4.3,
+                markerfacecolor="white",
+                markeredgecolor=color,
+                markeredgewidth=1.0,
+                markevery=marker_every,
+                zorder=2,
+            )
+        axis.set_title(f"SMAX — {task}", pad=11)
+        axis.set_xlabel("Environment steps", labelpad=6)
+        axis.set_ylabel("Episode return", labelpad=7)
+        formatter = ScalarFormatter(useMathText=True)
+        formatter.set_powerlimits((0, 0))
+        axis.xaxis.set_major_formatter(formatter)
+        axis.xaxis.set_major_locator(MaxNLocator(nbins=6, min_n_ticks=4))
+        axis.yaxis.set_major_locator(MaxNLocator(nbins=6, min_n_ticks=4))
+        axis.grid(axis="y", color="#D8D8D8", linewidth=0.7, alpha=0.65)
+        axis.grid(axis="x", visible=False)
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        axis.margins(x=0.015)
+        axis.legend(
+            handles=legend_handles,
+            loc="best",
+            frameon=True,
+            fancybox=False,
+            framealpha=0.96,
+            edgecolor="#D0D0D0",
+            handlelength=2.8,
+            borderpad=0.65,
+            labelspacing=0.55,
+        )
+        if missing_labels:
+            axis.text(
+                0.015,
+                0.025,
+                "Unavailable: " + ", ".join(missing_labels),
+                transform=axis.transAxes,
+                fontsize=8.5,
+                color="#666666",
+                va="bottom",
+            )
+        figure.tight_layout(pad=0.8)
+        stem = output / "figures" / f"rq1-{task}-learning-curve"
+        stem.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(
+            stem.with_suffix(".png"),
+            dpi=400,
+            bbox_inches="tight",
+            facecolor="white",
+        )
+        figure.savefig(
+            stem.with_suffix(".pdf"),
+            bbox_inches="tight",
+            facecolor="white",
+        )
+        plt.close(figure)
     return stem
 
 
@@ -753,10 +810,13 @@ def main():
                 "n_seeds",
             ),
         )
-        stems = [
-            plot_metric(task, metric, table_rows, curve_rows, task_output)
-            for metric in METRICS
-        ]
+        figures_dir = task_output / "figures"
+        for stale_metric in METRICS:
+            for extension in ("png", "pdf"):
+                stale = figures_dir / f"rq1-{task}-{stale_metric}.{extension}"
+                if stale.is_file():
+                    stale.unlink()
+        stem = plot_main_learning_curve(task, table_rows, curve_rows, task_output)
         task_manifest = {
             "schema_version": 1,
             "task": task,
@@ -781,7 +841,12 @@ def main():
                 "history": str(task_output / "rq1_run_history.csv"),
                 "curve": str(task_output / "rq1_learning_curve.csv"),
             },
-            "figures": [str(stem.with_suffix(".png")) for stem in stems],
+            "figure_protocol": {
+                "metric": "returns",
+                "methods": [item[2] for item in MAIN_FIGURE_METHODS],
+                "title": f"SMAX — {task}",
+            },
+            "figures": [str(stem.with_suffix(".png"))],
         }
         (task_output / "manifest.json").write_text(
             json.dumps(task_manifest, indent=2, sort_keys=True) + "\n",
