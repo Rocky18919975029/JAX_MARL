@@ -25,10 +25,16 @@ except ModuleNotFoundError:  # Imported as scripts.run_smax_alignment_benchmark.
 
 
 PROTOCOL_VERSION = "smax-alignment-benchmark-4seed-v1.0"
-BENCHMARK_MAPS = ("2s3z", "3s5z_vs_3s6z", "smacv2_10_units", "6h_vs_8z")
+BENCHMARK_MAPS = (
+    "10m_vs_11m",
+    "2s3z",
+    "3s5z_vs_3s6z",
+    "smacv2_10_units",
+    "6h_vs_8z",
+)
 # smacv2_10_units already belongs to the completed H1 matrix. This launcher
 # defaults to the other maps explicitly listed by run_minimal_baseline_set.yaml.
-DEFAULT_MAPS = tuple(name for name in BENCHMARK_MAPS if name != "smacv2_10_units")
+DEFAULT_MAPS = ("2s3z", "3s5z_vs_3s6z", "6h_vs_8z")
 ACTOR_VARIANTS = {"ps": True, "nps": False}
 DISTANCES = ("ln_mse", "linear_cka")
 AVAILABLE_DISTANCES = (*DISTANCES, "containment")
@@ -350,7 +356,9 @@ def main():
         default=DEFAULT_MAPS,
         help=(
             "Defaults to the three benchmark maps not already in the H1 matrix: "
-            "2s3z,3s5z_vs_3s6z,6h_vs_8z."
+            "2s3z,3s5z_vs_3s6z,6h_vs_8z. 10m_vs_11m is also accepted so "
+            "the focused homogeneous/heterogeneous matrix can be completed "
+            "with exact checkpoint reuse."
         ),
     )
     parser.add_argument(

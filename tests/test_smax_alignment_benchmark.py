@@ -26,8 +26,25 @@ def test_other_benchmark_maps_have_168_unique_four_seed_runs():
     assert {task.distance_label for task in none} == {"distance_free"}
 
 
+def test_focused_two_task_matrix_has_112_exactly_reusable_runs():
+    tasks = task_matrix(
+        ("10m_vs_11m", "3s5z_vs_3s6z"),
+        ("ps", "nps"),
+        (1, 2, 3, 4),
+        0.3515769798,
+    )
+    assert len(tasks) == 112
+    assert len({task.key for task in tasks}) == 112
+    assert Counter(task.map_name for task in tasks) == {
+        "10m_vs_11m": 56,
+        "3s5z_vs_3s6z": 56,
+    }
+    assert sum(task.condition == "joint_cka" for task in tasks) == 16
+
+
 def test_benchmark_scope_is_explicit_and_distance_free_none_is_not_duplicated():
     assert BENCHMARK_MAPS == (
+        "10m_vs_11m",
         "2s3z",
         "3s5z_vs_3s6z",
         "smacv2_10_units",
