@@ -1,4 +1,6 @@
 import matplotlib
+import json
+import pytest
 
 matplotlib.use("Agg")
 
@@ -7,6 +9,7 @@ from scripts.analyze_rq1_core_smax import (
     Cell,
     RunSource,
     build_task_results,
+    discover_sources,
     expected_cells,
     interquartile_mean,
     plot_main_learning_curve,
@@ -39,12 +42,39 @@ def synthetic_complete_task(tmp_path, task):
     return sources, histories
 
 
+def write_checkpoint(root, task="10m_vs_11m", seed=1):
+    checkpoint = root / "nested_matrix" / "checkpoints" / "project" / "run" / "final"
+    checkpoint.mkdir(parents=True)
+    metadata = {
+        "map_name": task,
+        "actor_parameter_sharing": False,
+        "align_mode": "none",
+        "align_distance": "ln_mse",
+        "seed": seed,
+        "wandb_project": "project",
+        "wandb_run_id": "run-id",
+        "wandb_run_name": "run-name",
+        "alignment_coef": 0.1,
+    }
+    (checkpoint / "metadata.json").write_text(json.dumps(metadata))
+    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "model.safetensors").write_bytes(b"model")
+    return checkpoint
+
+
 def test_each_task_has_an_independent_nps_only_28_seed_cell_matrix():
     cells = expected_cells(("10m_vs_11m", "3s5z_vs_3s6z"), (1, 2, 3, 4))
     assert len(cells) == 56
     assert sum(cell.task == "10m_vs_11m" for cell in cells) == 28
     assert sum(cell.task == "3s5z_vs_3s6z" for cell in cells) == 28
     assert {cell.actor_variant for cell in cells} == {"nps"}
+
+
+def test_source_discovery_recurses_below_common_experiment_root(tmp_path):
+    checkpoint = write_checkpoint(tmp_path)
+    sources = discover_sources(tmp_path)
+    key = ("10m_vs_11m", "nps", "distance_free", "none", 1)
+    assert sources[key].checkpoint == checkpoint.resolve()
 
 
 def test_four_seed_iqm_uses_the_middle_two_seeds():
@@ -106,6 +136,15 @@ def test_complete_task_writes_one_prespecified_publication_figure(tmp_path):
     assert stem.name == f"rq1-{task}-learning-curve"
     assert stem.with_suffix(".png").is_file()
     assert stem.with_suffix(".pdf").is_file()
+
+
+def test_empty_main_figure_fails_instead_of_writing_blank_axes(tmp_path):
+    _, _, table, curves, _ = build_task_results(
+        "3s5z_vs_3s6z", (1, 2, 3, 4), {}, {}
+    )
+    with pytest.raises(RuntimeError, match="No complete main-figure histories"):
+        plot_main_learning_curve("3s5z_vs_3s6z", table, curves, tmp_path)
+    assert not (tmp_path / "figures").exists()
 
 
 def test_fully_missing_task_still_has_all_blank_method_rows():

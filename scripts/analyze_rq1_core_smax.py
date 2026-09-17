@@ -158,10 +158,42 @@ def source_from_checkpoint(checkpoint: Path, source_label: str):
 
 
 def discover_sources(matrix_root: Path):
-    """Resolve the exact reused or newly trained final checkpoint per cell."""
+    """Resolve final checkpoints from one matrix root or a nested experiment root.
+
+    The data-disk layout groups several experiment matrices below ``h1_smax_runs``.
+    Consequently, restricting discovery to ``matrix_root/checkpoints`` silently
+    misses valid MSE/CKA runs when the common parent is supplied.  Search nested
+    checkpoint trees while excluding archived outputs, and deterministically keep
+    the newest completed candidate if a cell occurs more than once.
+    """
     sources = {}
-    reuse_path = matrix_root / "reused_runs.json"
-    if reuse_path.is_file():
+    source_ranks = {}
+
+    def is_archived(path):
+        try:
+            parts = path.resolve().relative_to(matrix_root.resolve()).parts
+        except ValueError:
+            parts = path.parts
+        return "archive" in parts
+
+    def register(key, source):
+        if key is None or source is None:
+            return
+        run_directory = source.checkpoint.parent
+        completion_markers = (
+            run_directory / "completed.json",
+            run_directory / "final" / "completed.json",
+        )
+        completed = int(any(path.is_file() for path in completion_markers))
+        metadata_mtime = (source.checkpoint / "metadata.json").stat().st_mtime_ns
+        rank = (completed, metadata_mtime, str(source.checkpoint))
+        if rank > source_ranks.get(key, (-1, -1, "")):
+            sources[key] = source
+            source_ranks[key] = rank
+
+    for reuse_path in sorted(matrix_root.rglob("reused_runs.json")):
+        if is_archived(reuse_path):
+            continue
         for serialized_key, raw_checkpoint in read_json(reuse_path).get("runs", {}).items():
             expected_key = tuple(serialized_key.split("|"))
             expected_key = (*expected_key[:4], int(expected_key[4]))
@@ -170,13 +202,12 @@ def discover_sources(matrix_root: Path):
                 raise RuntimeError(
                     f"Reuse key mismatch: manifest={expected_key}, checkpoint={key}"
                 )
-            sources[key] = source
-    for metadata_path in sorted(
-        (matrix_root / "checkpoints").rglob("final/metadata.json")
-    ):
+            register(key, source)
+    for metadata_path in sorted(matrix_root.rglob("final/metadata.json")):
+        if is_archived(metadata_path) or "checkpoints" not in metadata_path.parts:
+            continue
         key, source = source_from_checkpoint(metadata_path.parent, "matrix_root")
-        if key is not None:
-            sources[key] = source
+        register(key, source)
     return sources
 
 
@@ -567,6 +598,7 @@ def plot_main_learning_curve(task, table_rows, curve_rows, output):
         }
         missing_labels = []
         legend_handles = []
+        plotted_methods = 0
         for distance, mode, label, color, linestyle, marker in MAIN_FIGURE_METHODS:
             legend_handles.append(
                 Line2D(
@@ -597,6 +629,7 @@ def plot_main_learning_curve(task, table_rows, curve_rows, output):
             if status != "complete" or not selected:
                 missing_labels.append(label)
                 continue
+            plotted_methods += 1
             x = np.asarray([row["env_step"] for row in selected])
             mean = np.asarray([row["mean"] for row in selected])
             low = np.asarray([row["ci95_low"] for row in selected])
@@ -624,6 +657,13 @@ def plot_main_learning_curve(task, table_rows, curve_rows, output):
                 markeredgewidth=1.0,
                 markevery=marker_every,
                 zorder=2,
+            )
+        if plotted_methods == 0:
+            plt.close(figure)
+            raise RuntimeError(
+                f"No complete main-figure histories were found for {task}: "
+                + ", ".join(missing_labels)
+                + ". Check --matrix-root and wandb_history_issues.csv."
             )
         axis.set_title(f"SMAX — {task}", pad=11)
         axis.set_xlabel("Environment steps", labelpad=6)
@@ -702,6 +742,10 @@ def main():
     output_root.mkdir(parents=True, exist_ok=True)
     sources = discover_sources(matrix_root)
     expected = expected_cells(tasks, args.seeds)
+    print(
+        f"DISCOVERED sources={len(sources)} matrix_root={matrix_root}",
+        flush=True,
+    )
 
     histories = {}
     issues = []
