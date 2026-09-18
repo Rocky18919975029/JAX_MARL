@@ -9,6 +9,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 RUN_MATRIX_PATH = ROOT / "experiments" / "harl_mamujoco" / "run_matrix.py"
 NPS_CORE_PATH = ROOT / "experiments" / "harl_mamujoco" / "run_nps_core_matrix.py"
+NPS_MONITOR_PATH = ROOT / "experiments" / "harl_mamujoco" / "monitor_nps_core_matrix.py"
 
 
 def load_run_matrix():
@@ -22,6 +23,15 @@ def load_run_matrix():
 
 def load_nps_core_launcher():
     spec = importlib.util.spec_from_file_location("harl_nps_core", NPS_CORE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_nps_core_monitor():
+    spec = importlib.util.spec_from_file_location("harl_nps_monitor", NPS_MONITOR_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -120,6 +130,40 @@ def test_nps_core_launcher_delegates_fixed_confirmatory_matrix(tmp_path):
     assert command[command.index("--seeds") + 1] == "1-4"
     assert command[command.index("--max-runs-per-gpu") + 1] == "3"
     assert command[-1] == "--dry-run"
+
+
+def test_nps_core_monitor_reads_live_and_checkpoint_progress(tmp_path):
+    module = load_nps_core_monitor()
+    root = tmp_path / "runs"
+    status = root / "status"
+    status.mkdir(parents=True)
+    live_name = "HARL-Humanoid-v2-17x1-nps-none-lam0p1-seed1"
+    legacy_name = "HARL-Humanoid-v2-17x1-nps-c_to_a_mse-lam0p1-seed1"
+    (status / f"{live_name}.json").write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "run_name": live_name,
+                "env_steps": 1_250_000,
+                "total_env_steps": 10_000_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (status / f"{legacy_name}.json").write_text(
+        json.dumps({"status": "running", "run_name": legacy_name}),
+        encoding="utf-8",
+    )
+    metadata = root / "checkpoints" / legacy_name / "step_000002000000"
+    metadata.mkdir(parents=True)
+    (metadata / "metadata.json").write_text(
+        json.dumps({"environment_steps": 2_000_000}), encoding="utf-8"
+    )
+    rows = module.load_rows(root, 10_000_000)
+    assert {row["run_name"]: row["steps"] for row in rows} == {
+        live_name: 1_250_000,
+        legacy_name: 2_000_000,
+    }
 
 
 def test_containment_is_opt_in_and_named_dsc():

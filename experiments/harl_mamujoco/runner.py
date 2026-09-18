@@ -67,12 +67,11 @@ class AlignedMAMuJoCoRunner(OnPolicyBaseRunner):
         self.containment_ridge_ratio = float(
             experiment.get("containment_ridge_ratio", 1e-3)
         )
-        self.containment_epsilon = float(
-            experiment.get("containment_epsilon", 1e-6)
-        )
+        self.containment_epsilon = float(experiment.get("containment_epsilon", 1e-6))
         self.checkpoint_root = (
             Path(experiment["checkpoint_root"]).expanduser().resolve()
         )
+        self.status_path = Path(experiment["status_path"]).expanduser().resolve()
         self.checkpoint_interval = int(experiment["checkpoint_interval_steps"])
         self.upload_checkpoints = bool(experiment["wandb_upload_checkpoints"])
         self.wandb_run = wandb_run
@@ -667,6 +666,16 @@ class AlignedMAMuJoCoRunner(OnPolicyBaseRunner):
             self.prep_training()
             actor_infos, critic_info = self.train()
             env_step = episode * steps_per_update
+            _write_json(
+                self.status_path,
+                {
+                    "status": "running",
+                    "run_name": self.experiment["run_name"],
+                    "env_steps": int(env_step),
+                    "total_env_steps": int(train["num_env_steps"]),
+                    "pid": os.getpid(),
+                },
+            )
 
             if episode % train["log_interval"] == 0:
                 completed_return = (

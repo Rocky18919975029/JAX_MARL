@@ -197,6 +197,7 @@ def main() -> None:
     main_args, algo_args, env_args, config_path = load_configuration(args)
     parent_commit = git_commit(REPO_ROOT)
     harl_commit = git_commit(args.harl_root)
+    status_path = args.run_root / "status" / f"{args.run_name}.json"
     experiment = {
         "protocol_version": args.protocol_version,
         "run_name": args.run_name,
@@ -213,6 +214,7 @@ def main() -> None:
         "containment_epsilon": args.containment_epsilon,
         "matched_update": True,
         "checkpoint_root": str(args.checkpoint_root),
+        "status_path": str(status_path),
         "checkpoint_interval_steps": args.checkpoint_interval_steps,
         "wandb_upload_checkpoints": args.wandb_upload_checkpoints,
         "source_config": str(config_path),
@@ -245,12 +247,13 @@ def main() -> None:
 
     from experiments.harl_mamujoco.runner import AlignedMAMuJoCoRunner
 
-    status_path = args.run_root / "status" / f"{args.run_name}.json"
     write_json(
         status_path,
         {
             "status": "running",
             "run_name": args.run_name,
+            "env_steps": 0,
+            "total_env_steps": int(algo_args["train"]["num_env_steps"]),
             "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "pid": os.getpid(),
             **{
@@ -281,10 +284,26 @@ def main() -> None:
                 args.calibration_output.expanduser().resolve(),
                 {**experiment, **metrics, "selection_uses_return": False},
             )
-            write_json(status_path, {"status": "completed", "run_name": args.run_name})
+            write_json(
+                status_path,
+                {
+                    "status": "completed",
+                    "run_name": args.run_name,
+                    "env_steps": 0,
+                    "total_env_steps": 0,
+                },
+            )
         else:
             runner.run()
-            write_json(status_path, {"status": "completed", "run_name": args.run_name})
+            write_json(
+                status_path,
+                {
+                    "status": "completed",
+                    "run_name": args.run_name,
+                    "env_steps": int(algo_args["train"]["num_env_steps"]),
+                    "total_env_steps": int(algo_args["train"]["num_env_steps"]),
+                },
+            )
     except BaseException as error:
         write_json(
             status_path,

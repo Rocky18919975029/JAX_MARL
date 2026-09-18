@@ -189,6 +189,13 @@ The launcher generates exactly 12 unique runs, skips only runs with a
 checkpoint `completed.json`, and retries interrupted or failed runs. With four
 GPUs and the default three slots per GPU, all 12 runs can execute concurrently.
 
+Display all 12 per-run progress bars:
+
+```bash
+watch -n 10 python experiments/harl_mamujoco/monitor_nps_core_matrix.py \
+  --run-root "$FORMAL_ROOT"
+```
+
 Progress checks:
 
 ```bash
