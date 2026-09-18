@@ -76,6 +76,10 @@ class StatusCallback(Callback):
         )
 
     def on_batch_collected(self, batch):
+        for loss_module in self.experiment.losses.values():
+            request = getattr(loss_module, "request_gradient_audit", None)
+            if request is not None:
+                request()
         atomic_json(
             self.status_path,
             {
@@ -205,7 +209,7 @@ def parse_args():
     parser.add_argument("--evaluation-interval", type=int, default=120_000)
     parser.add_argument("--evaluation-episodes", type=int, default=200)
     parser.add_argument("--checkpoint-interval", type=int, default=600_000)
-    parser.add_argument("--wandb-project", default="benchmarl-vmas-nps-alignment")
+    parser.add_argument("--wandb-project", default="benchmarl-vmas-nps-alignment-v2")
     parser.add_argument(
         "--wandb-mode", choices=("online", "offline", "disabled"), default="online"
     )

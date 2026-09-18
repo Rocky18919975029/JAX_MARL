@@ -6,6 +6,7 @@ import contextlib
 from dataclasses import dataclass
 from typing import Type
 
+import torch
 from torchrl.objectives import ClipPPOLoss, ValueEstimators
 
 from benchmarl.algorithms.mappo import Mappo, MappoConfig
@@ -46,10 +47,35 @@ class AlignmentClipPPOLoss(ClipPPOLoss):
         self.align_distance = align_distance
         self.alignment_coef = float(alignment_coef)
         self.alignment_epsilon = float(alignment_epsilon)
+        self._gradient_audit_requested = False
+        self._gradient_audit = {
+            "alignment_rl_only_gradient_norm": 0.0,
+            "alignment_aux_only_gradient_norm": 0.0,
+            "alignment_combined_gradient_norm": 0.0,
+            "alignment_aux_to_rl_gradient_ratio": 0.0,
+        }
         self.out_keys = list(self.out_keys) + [
             "alignment_loss",
             "alignment_weighted_loss",
+            *self._gradient_audit,
         ]
+
+    def request_gradient_audit(self) -> None:
+        """Measure separate actor-gradient norms on the next training minibatch."""
+
+        self._gradient_audit_requested = True
+
+    def _actor_gradient_norm(self, loss: torch.Tensor) -> torch.Tensor:
+        parameters = list(self.actor_network_params.flatten_keys().values())
+        gradients = torch.autograd.grad(
+            loss, parameters, retain_graph=True, allow_unused=True
+        )
+        squared = [
+            gradient.detach().square().sum()
+            for gradient in gradients
+            if gradient is not None
+        ]
+        return torch.stack(squared).sum().sqrt() if squared else loss.new_zeros(())
 
     def alignment_loss(self, tensordict, distance: str | None = None):
         td = tensordict.clone(False)
@@ -76,19 +102,32 @@ class AlignmentClipPPOLoss(ClipPPOLoss):
 
     def forward(self, tensordict):
         output = super().forward(tensordict)
+        rl_objective = output["loss_objective"]
         if self.align_mode == "none":
-            alignment = output["loss_objective"] * 0.0
+            alignment = rl_objective * 0.0
         else:
             alignment = self.alignment_loss(tensordict)
-            output.set(
-                "loss_objective",
-                output["loss_objective"] + self.alignment_coef * alignment,
-            )
+        weighted_alignment = self.alignment_coef * alignment
+        combined_objective = rl_objective + weighted_alignment
+        output.set("loss_objective", combined_objective)
+
+        if self._gradient_audit_requested:
+            rl_norm = self._actor_gradient_norm(rl_objective)
+            aux_norm = self._actor_gradient_norm(weighted_alignment)
+            combined_norm = self._actor_gradient_norm(combined_objective)
+            ratio = aux_norm / torch.clamp(rl_norm, min=1e-12)
+            self._gradient_audit = {
+                "alignment_rl_only_gradient_norm": float(rl_norm.cpu()),
+                "alignment_aux_only_gradient_norm": float(aux_norm.cpu()),
+                "alignment_combined_gradient_norm": float(combined_norm.cpu()),
+                "alignment_aux_to_rl_gradient_ratio": float(ratio.cpu()),
+            }
+            self._gradient_audit_requested = False
+
         output.set("alignment_loss", alignment.detach())
-        output.set(
-            "alignment_weighted_loss",
-            (self.alignment_coef * alignment).detach(),
-        )
+        output.set("alignment_weighted_loss", weighted_alignment.detach())
+        for key, value in self._gradient_audit.items():
+            output.set(key, rl_objective.new_tensor(value))
         return output
 
 

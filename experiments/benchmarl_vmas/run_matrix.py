@@ -21,7 +21,7 @@ from experiments.benchmarl_vmas.protocol import (
     DEFAULT_SEEDS,
     PROTOCOL_VERSION,
     TASKS,
-    load_cka_coefficient,
+    load_cka_coefficients,
     matrix,
     parse_csv,
     parse_seeds,
@@ -49,7 +49,7 @@ def main() -> None:
     parser.add_argument("--seeds", type=parse_seeds, default=DEFAULT_SEEDS)
     parser.add_argument("--gpus", type=parse_csv, default=("0", "1", "2", "3"))
     parser.add_argument("--max-runs-per-gpu", type=int, default=1)
-    parser.add_argument("--wandb-project", default="benchmarl-vmas-nps-alignment")
+    parser.add_argument("--wandb-project", default="benchmarl-vmas-nps-alignment-v2")
     parser.add_argument(
         "--wandb-mode", choices=("online", "offline", "disabled"), default="online"
     )
@@ -71,13 +71,14 @@ def main() -> None:
     root = args.run_root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     (root / "logs").mkdir(parents=True, exist_ok=True)
-    cka_coefficient = load_cka_coefficient(args.cka_calibration)
-    runs = matrix(args.seeds, args.tasks, cka_coefficient)
+    cka_coefficients = load_cka_coefficients(args.cka_calibration)
+    runs = matrix(args.seeds, args.tasks, cka_coefficients)
     pending = [run for run in runs if not completed(root, run.name)]
     print(
         f"Protocol={PROTOCOL_VERSION} total={len(runs)} pending={len(pending)} "
         f"tasks={','.join(args.tasks)} seeds={','.join(map(str, args.seeds))} "
-        f"lambda_CKA={cka_coefficient:.10g}",
+        "lambda_CKA="
+        + ",".join(f"{task}:{cka_coefficients[task]:.10g}" for task in args.tasks),
         flush=True,
     )
 

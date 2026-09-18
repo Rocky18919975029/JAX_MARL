@@ -36,11 +36,13 @@ PY
 
 The integration targets BenchMARL 1.5.x, TorchRL 0.10–0.11, and VMAS >=1.3.4.
 
-## 1. Gradient-scale calibration
+## 1. Task-specific gradient-scale calibration
 
 The CKA coefficient is selected without returns. One independent pilot seed uses
-the same initial rollout/minibatch protocol on all three tasks. A single global
-coefficient is obtained from the equal-task pooled RMS gradient ratios.
+the same initial rollout on all three tasks. For every task, eight minibatches
+are drawn through the exact replay-buffer sampling path used by training. Their
+RMS gradients determine one task-specific CKA coefficient that matches LN-MSE
+at coefficient 0.1. No coefficient is shared across tasks.
 
 ```bash
 export VMAS_ROOT="/home/data/zeshenghong/JaxMARL/benchmarl_vmas_nps_phase1"
@@ -51,6 +53,7 @@ mkdir -p "$VMAS_CAL_ROOT"
 nohup python experiments/benchmarl_vmas/calibrate_cka.py \
   --output-root "$VMAS_CAL_ROOT" \
   --pilot-seed 9001 \
+  --minibatches 8 \
   --gpus 0,1,2,3 \
   > "$VMAS_CAL_ROOT/calibration.stdout" 2>&1 &
 
@@ -102,8 +105,8 @@ nohup python experiments/benchmarl_vmas/run_matrix.py \
   --tasks discovery_5,passage_5,football_5v5_heuristic \
   --seeds 1-4 \
   --gpus 0,1,2,3 \
-  --max-runs-per-gpu 1 \
-  --wandb-project benchmarl-vmas-nps-alignment \
+  --max-runs-per-gpu 4 \
+  --wandb-project benchmarl-vmas-nps-alignment-v2 \
   > "$VMAS_FORMAL_ROOT/training.stdout" 2>&1 &
 
 tail --retry -F "$VMAS_FORMAL_ROOT/launcher.log"
@@ -111,6 +114,17 @@ tail --retry -F "$VMAS_FORMAL_ROOT/launcher.log"
 
 The launcher is restart-safe: completed status files are skipped. Increase
 `--max-runs-per-gpu` only after checking GPU memory and simulator throughput.
+
+Besides the usual return and loss curves, every rollout batch records a
+first-minibatch actor-gradient audit in W&B:
+
+- `train/agents/alignment_rl_only_gradient_norm`;
+- `train/agents/alignment_aux_only_gradient_norm`;
+- `train/agents/alignment_combined_gradient_norm`;
+- `train/agents/alignment_aux_to_rl_gradient_ratio`.
+
+These curves make gradient-scale drift after the initial calibration visible;
+they are diagnostics only and do not modify the optimizer update.
 
 ## 4. Progress
 

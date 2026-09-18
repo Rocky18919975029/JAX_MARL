@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument("--task", choices=TASKS, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pilot-seed", type=int, required=True)
+    parser.add_argument("--minibatches", type=int, required=True)
     args = parser.parse_args()
     run_cell(args, args.task, args.output.expanduser().resolve())
 

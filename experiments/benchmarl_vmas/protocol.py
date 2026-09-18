@@ -9,12 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROTOCOL_VERSION = "benchmarl-vmas-nps-alignment-v1.0"
-CALIBRATION_PROTOCOL_VERSION = "benchmarl-vmas-nps-cka-calibration-v1.0"
+PROTOCOL_VERSION = "benchmarl-vmas-nps-alignment-v1.1"
+CALIBRATION_PROTOCOL_VERSION = "benchmarl-vmas-nps-cka-calibration-v1.1"
 TASKS = ("discovery_5", "passage_5", "football_5v5_heuristic")
 CONDITIONS = ("none", "c_to_a_mse", "c_to_a_cka")
 DEFAULT_SEEDS = (1, 2, 3, 4)
 REFERENCE_ALIGNMENT_COEF = 0.1
+CALIBRATION_PILOT_SEED = 9001
+CALIBRATION_MINIBATCHES = 8
 
 
 def parse_csv(value: str) -> tuple[str, ...]:
@@ -78,30 +80,31 @@ class Run:
 def matrix(
     seeds: tuple[int, ...] = DEFAULT_SEEDS,
     tasks: tuple[str, ...] = TASKS,
-    cka_coefficient: float | None = None,
+    cka_coefficients: dict[str, float] | None = None,
 ) -> list[Run]:
-    if (
-        cka_coefficient is None
-        or not math.isfinite(cka_coefficient)
-        or cka_coefficient <= 0
-    ):
-        raise ValueError("a finite positive CKA coefficient is required")
+    if cka_coefficients is None:
+        raise ValueError("task-specific CKA coefficients are required")
     runs = []
     for task in tasks:
         if task not in TASKS:
             raise ValueError(f"unsupported task: {task}")
+        coefficient = cka_coefficients.get(task)
+        if coefficient is None or not math.isfinite(coefficient) or coefficient <= 0:
+            raise ValueError(
+                f"a finite positive CKA coefficient is required for {task}"
+            )
         for seed in seeds:
             runs.extend(
                 (
                     Run(task, "none", seed, 0.0),
                     Run(task, "c_to_a_mse", seed, REFERENCE_ALIGNMENT_COEF),
-                    Run(task, "c_to_a_cka", seed, cka_coefficient),
+                    Run(task, "c_to_a_cka", seed, coefficient),
                 )
             )
     return runs
 
 
-def load_cka_coefficient(path: Path) -> float:
+def load_cka_coefficients(path: Path) -> dict[str, float]:
     payload = json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
     expected = {
         "protocol_version": CALIBRATION_PROTOCOL_VERSION,
@@ -111,6 +114,9 @@ def load_cka_coefficient(path: Path) -> float:
         "target_distance": "linear_cka",
         "tasks": list(TASKS),
         "actor_parameterization": "nps",
+        "minibatch_sampling": "training_replay_buffer_random",
+        "pilot_seed": CALIBRATION_PILOT_SEED,
+        "calibration_minibatches": CALIBRATION_MINIBATCHES,
     }
     mismatches = {
         key: (payload.get(key), value)
@@ -119,7 +125,15 @@ def load_cka_coefficient(path: Path) -> float:
     }
     if mismatches:
         raise ValueError(f"incompatible CKA calibration artifact: {mismatches}")
-    coefficient = float(payload["global_alignment_coef"])
-    if not math.isfinite(coefficient) or coefficient <= 0:
-        raise ValueError("calibrated CKA coefficient must be finite and positive")
-    return coefficient
+    raw = payload.get("task_alignment_coefs")
+    if not isinstance(raw, dict) or set(raw) != set(TASKS):
+        raise ValueError("calibration artifact must contain one coefficient per task")
+    coefficients = {task: float(raw[task]) for task in TASKS}
+    invalid = {
+        task: value
+        for task, value in coefficients.items()
+        if not math.isfinite(value) or value <= 0
+    }
+    if invalid:
+        raise ValueError(f"invalid calibrated CKA coefficients: {invalid}")
+    return coefficients
