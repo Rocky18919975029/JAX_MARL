@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -29,11 +30,22 @@ def test_phase_one_matrix_is_exactly_36_nps_runs():
             assert cell[-1].coefficient == pytest.approx(coefficients[task])
 
 
+def test_protocol_uses_official_task_names_without_agent_count_overrides():
+    assert TASKS == ("discovery", "passage", "football")
+    source = (
+        Path(__file__).parents[1]
+        / "experiments"
+        / "benchmarl_vmas"
+        / "train_alignment.py"
+    ).read_text(encoding="utf-8")
+    assert ".config.update(" not in source
+
+
 def test_direction_and_distance_are_locked():
     runs = matrix(
         seeds=(1,),
-        tasks=("discovery_5",),
-        cka_coefficients={"discovery_5": 0.37},
+        tasks=("discovery",),
+        cka_coefficients={"discovery": 0.37},
     )
     assert [(run.align_mode, run.align_distance) for run in runs] == [
         ("none", "ln_mse"),
@@ -72,7 +84,7 @@ def test_calibration_artifact_rejects_other_task_sets(tmp_path):
     payload = calibration_payload()
     path = tmp_path / "calibration.json"
     path.write_text(json.dumps(payload))
-    payload["tasks"] = ["discovery_5"]
+    payload["tasks"] = ["discovery"]
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="incompatible"):
         load_cka_coefficients(path)

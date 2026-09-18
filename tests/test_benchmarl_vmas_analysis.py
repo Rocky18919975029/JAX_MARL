@@ -11,7 +11,7 @@ def test_analysis_loads_completed_runs_without_pooling_tasks(tmp_path):
     output.mkdir(parents=True)
     status = {
         "status": "completed",
-        "task": "discovery_5",
+        "task": "discovery",
         "condition": "none",
         "seed": 1,
         "benchmarl_output": str(output),
@@ -36,7 +36,7 @@ def test_analysis_loads_completed_runs_without_pooling_tasks(tmp_path):
     records = load_records(root)
     assert records == [
         {
-            "task": "discovery_5",
+            "task": "discovery",
             "condition": "none",
             "seed": 1,
             "env_step": 120000,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train NPS MAPPO with optional C→A alignment on one five-agent VMAS task."""
+"""Train NPS MAPPO with optional C→A alignment on an official VMAS task."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ from benchmarl.experiment.callback import Callback
 
 
 TASK_ENUM_NAMES = {
-    "discovery_5": "DISCOVERY",
-    "passage_5": "PASSAGE",
-    "football_5v5_heuristic": "FOOTBALL",
+    "discovery": "DISCOVERY",
+    "passage": "PASSAGE",
+    "football": "FOOTBALL",
 }
 
 
@@ -64,8 +64,10 @@ class StatusCallback(Callback):
 
     def on_setup(self):
         groups = self.experiment.group_map
-        if len(groups) != 1 or len(next(iter(groups.values()))) != 5:
-            raise RuntimeError(f"expected exactly five learning agents, got {groups}")
+        if len(groups) != 1 or not next(iter(groups.values())):
+            raise RuntimeError(
+                f"expected exactly one non-empty learning group, got {groups}"
+            )
         atomic_json(
             self.status_path,
             {
@@ -95,18 +97,9 @@ class StatusCallback(Callback):
 def build_task(task_name: str):
     from benchmarl.environments import VmasTask
 
-    task = getattr(VmasTask, TASK_ENUM_NAMES[task_name]).get_from_yaml()
-    if task_name == "discovery_5":
-        task.config.update(n_agents=5)
-    elif task_name == "football_5v5_heuristic":
-        task.config.update(
-            n_blue_agents=5,
-            n_red_agents=5,
-            ai_red_agents=True,
-            physically_different=False,
-            randomise_formation_indices=False,
-        )
-    return task
+    # Deliberately return the official YAML unchanged.  In particular, do not
+    # rewrite agent counts to manufacture a five-agent benchmark.
+    return getattr(VmasTask, TASK_ENUM_NAMES[task_name]).get_from_yaml()
 
 
 def build_experiment(args, callbacks=None):

@@ -2,7 +2,7 @@
 
 This protocol runs exactly 36 MAPPO experiments:
 
-- tasks: `discovery_5`, `passage_5`, `football_5v5_heuristic`;
+- tasks: official BenchMARL `discovery`, `passage`, and `football` VMAS tasks;
 - actor parameterization: non-parameter-sharing only;
 - conditions: isolated, C→A LN-MSE, C→A Linear CKA;
 - training seeds: 1, 2, 3, 4.
@@ -14,9 +14,9 @@ minibatch passes, minibatches of 4096, a 256×256 Tanh MLP, and learning rate
 the same architecture; isolated training only sets the auxiliary coefficient to
 zero.
 
-For Football, five blue policies learn against five VMAS heuristic red players.
-`physically_different=false` and `randomise_formation_indices=false` avoid adding
-role/type randomization to this first phase.
+The task objects are loaded directly from BenchMARL's official VMAS YAML files.
+This protocol does not override agent counts or any other environment option.
+Consequently, task names deliberately do not contain hand-authored agent counts.
 
 ## Existing server environment
 
@@ -102,7 +102,7 @@ mkdir -p "$VMAS_FORMAL_ROOT"
 nohup python experiments/benchmarl_vmas/run_matrix.py \
   --run-root "$VMAS_FORMAL_ROOT" \
   --cka-calibration "$VMAS_CKA_CAL" \
-  --tasks discovery_5,passage_5,football_5v5_heuristic \
+  --tasks discovery,passage,football \
   --seeds 1-4 \
   --gpus 0,1,2,3 \
   --max-runs-per-gpu 4 \
@@ -143,9 +143,9 @@ python experiments/benchmarl_vmas/analyze.py \
 Results are deliberately written into three independent directories:
 
 ```text
-analysis/discovery_5/
-analysis/passage_5/
-analysis/football_5v5_heuristic/
+analysis/discovery/
+analysis/passage/
+analysis/football/
 ```
 
 Each contains `checkpoint_returns.csv`, `curve_summary.csv`,

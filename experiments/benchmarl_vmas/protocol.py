@@ -9,9 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROTOCOL_VERSION = "benchmarl-vmas-nps-alignment-v1.1"
-CALIBRATION_PROTOCOL_VERSION = "benchmarl-vmas-nps-cka-calibration-v1.1"
-TASKS = ("discovery_5", "passage_5", "football_5v5_heuristic")
+PROTOCOL_VERSION = "benchmarl-vmas-nps-alignment-v1.2"
+CALIBRATION_PROTOCOL_VERSION = "benchmarl-vmas-nps-cka-calibration-v1.2"
+# These names map directly to BenchMARL's official VMAS task YAMLs.  Agent
+# counts and every other environment option are owned by those YAMLs and must
+# not be overridden by this protocol.
+TASKS = ("discovery", "passage", "football")
 CONDITIONS = ("none", "c_to_a_mse", "c_to_a_cka")
 DEFAULT_SEEDS = (1, 2, 3, 4)
 REFERENCE_ALIGNMENT_COEF = 0.1
