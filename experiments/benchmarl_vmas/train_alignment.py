@@ -208,7 +208,7 @@ def parse_args():
     parser.add_argument("--cka-multiplier", type=float)
     parser.add_argument(
         "--experiment-stage",
-        choices=("formal", "cka_tuning", "cka_validation"),
+        choices=("formal", "calibration", "cka_tuning", "cka_validation"),
         default="formal",
     )
     parser.add_argument("--device", default="cuda")

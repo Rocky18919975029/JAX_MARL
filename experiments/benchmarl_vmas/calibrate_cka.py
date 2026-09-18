@@ -81,6 +81,9 @@ def run_cell(
         wandb_mode="disabled",
         disable_evaluation=True,
         disable_logging=True,
+        cka_calibration_coef=None,
+        cka_multiplier=None,
+        experiment_stage="calibration",
     )
     if experiment_overrides:
         experiment_values.update(experiment_overrides)
