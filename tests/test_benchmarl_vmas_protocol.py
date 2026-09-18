@@ -1,3 +1,4 @@
+import ast
 import json
 from pathlib import Path
 
@@ -52,6 +53,20 @@ def test_protocol_uses_official_task_names_without_agent_count_overrides():
         / "train_alignment.py"
     ).read_text(encoding="utf-8")
     assert ".config.update(" not in source
+
+
+def test_custom_experiment_class_is_module_level_for_callback_pickling():
+    source = (
+        Path(__file__).parents[1]
+        / "experiments"
+        / "benchmarl_vmas"
+        / "train_alignment.py"
+    ).read_text(encoding="utf-8")
+    module = ast.parse(source)
+    top_level_classes = {
+        node.name for node in module.body if isinstance(node, ast.ClassDef)
+    }
+    assert "MatchedNpsExperiment" in top_level_classes
 
 
 def test_direction_and_distance_are_locked():

@@ -14,6 +14,10 @@ import sys
 import traceback
 from pathlib import Path
 
+import torch
+from benchmarl.experiment import Experiment
+from benchmarl.experiment.callback import Callback
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -22,7 +26,6 @@ from experiments.benchmarl_vmas.protocol import (
     REFERENCE_MSE_ALIGNMENT_COEF,
     TASKS,
 )
-from benchmarl.experiment.callback import Callback
 
 
 TASK_ENUM_NAMES = {
@@ -99,6 +102,49 @@ class StatusCallback(Callback):
         )
 
 
+class MatchedNpsExperiment(Experiment):
+    """BenchMARL experiment with independent per-actor gradient clipping."""
+
+    def _setup_algorithm(self):
+        super()._setup_algorithm()
+        self._nps_actor_clip_groups = {}
+        for group, loss in self.losses.items():
+            slots = [[] for _ in self.group_map[group]]
+            unmatched = []
+            for key, parameter in loss.actor_network_params.items(True, True):
+                pieces = key if isinstance(key, tuple) else (key,)
+                text = ".".join(map(str, pieces))
+                match = re.search(
+                    r"(?:^|\.)(?:encoders|heads)\.(\d+)(?:\.|$)", text
+                )
+                if match is None:
+                    unmatched.append(text)
+                    continue
+                slot = int(match.group(1))
+                if slot >= len(slots):
+                    raise RuntimeError(f"invalid actor slot in parameter key: {text}")
+                slots[slot].append(parameter)
+            if unmatched or any(not parameters for parameters in slots):
+                raise RuntimeError(
+                    "could not partition NPS actor parameters by slot: "
+                    f"unmatched={unmatched}, sizes={list(map(len, slots))}"
+                )
+            optimizer = self.optimizers[group]["loss_objective"]
+            self._nps_actor_clip_groups[id(optimizer)] = slots
+
+    def _grad_clip(self, optimizer):
+        slots = self._nps_actor_clip_groups.get(id(optimizer))
+        if slots is None:
+            return super()._grad_clip(optimizer)
+        if self.config.clip_grad_norm and self.config.clip_grad_val is not None:
+            norms = [
+                torch.nn.utils.clip_grad_norm_(parameters, self.config.clip_grad_val)
+                for parameters in slots
+            ]
+            return float(torch.linalg.vector_norm(torch.stack(norms)))
+        return super()._grad_clip(optimizer)
+
+
 def build_task(task_name: str):
     from benchmarl.environments import VmasTask
 
@@ -109,8 +155,7 @@ def build_task(task_name: str):
 
 def build_experiment(args, callbacks=None):
     from benchmarl.algorithms import MappoConfig
-    from benchmarl.experiment import Experiment, ExperimentConfig
-    import torch
+    from benchmarl.experiment import ExperimentConfig
 
     from experiments.benchmarl_vmas.algorithm import AlignmentMappoConfig
     from experiments.benchmarl_vmas.model import AlignmentMlpConfig
@@ -184,48 +229,6 @@ def build_experiment(args, callbacks=None):
 
     model = AlignmentMlpConfig(hidden_sizes=(256, 256))
     critic_model = AlignmentMlpConfig(hidden_sizes=(256, 256))
-
-    class MatchedNpsExperiment(Experiment):
-        """BenchMARL experiment with independent per-actor gradient clipping."""
-
-        def _setup_algorithm(self):
-            super()._setup_algorithm()
-            self._nps_actor_clip_groups = {}
-            for group, loss in self.losses.items():
-                slots = [[] for _ in self.group_map[group]]
-                unmatched = []
-                for key, parameter in loss.actor_network_params.items(True, True):
-                    pieces = key if isinstance(key, tuple) else (key,)
-                    text = ".".join(map(str, pieces))
-                    match = re.search(r"(?:^|\.)(?:encoders|heads)\.(\d+)(?:\.|$)", text)
-                    if match is None:
-                        unmatched.append(text)
-                        continue
-                    slot = int(match.group(1))
-                    if slot >= len(slots):
-                        raise RuntimeError(f"invalid actor slot in parameter key: {text}")
-                    slots[slot].append(parameter)
-                if unmatched or any(not parameters for parameters in slots):
-                    raise RuntimeError(
-                        "could not partition NPS actor parameters by slot: "
-                        f"unmatched={unmatched}, sizes={list(map(len, slots))}"
-                    )
-                optimizer = self.optimizers[group]["loss_objective"]
-                self._nps_actor_clip_groups[id(optimizer)] = slots
-
-        def _grad_clip(self, optimizer):
-            slots = self._nps_actor_clip_groups.get(id(optimizer))
-            if slots is None:
-                return super()._grad_clip(optimizer)
-            if self.config.clip_grad_norm and self.config.clip_grad_val is not None:
-                norms = [
-                    torch.nn.utils.clip_grad_norm_(
-                        parameters, self.config.clip_grad_val
-                    )
-                    for parameters in slots
-                ]
-                return float(torch.linalg.vector_norm(torch.stack(norms)))
-            return super()._grad_clip(optimizer)
 
     return MatchedNpsExperiment(
         task=build_task(args.task),
