@@ -41,6 +41,12 @@ def completed(root: Path, run_name: str) -> bool:
         return False
 
 
+def gpu_slots(gpus: tuple[str, ...], max_runs_per_gpu: int) -> list[str]:
+    """Interleave GPUs so partial matrices use every device before reusing one."""
+
+    return [gpu for _ in range(max_runs_per_gpu) for gpu in gpus]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
@@ -92,7 +98,7 @@ def main() -> None:
         flush=True,
     )
 
-    slots = [gpu for gpu in args.gpus for _ in range(args.max_runs_per_gpu)]
+    slots = gpu_slots(args.gpus, args.max_runs_per_gpu)
     queues = [[] for _ in slots]
     for index, run in enumerate(pending):
         queues[index % len(slots)].append(run)

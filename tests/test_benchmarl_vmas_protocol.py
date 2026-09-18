@@ -16,6 +16,7 @@ from experiments.benchmarl_vmas.protocol import (
     load_cka_coefficients,
     matrix,
 )
+from experiments.benchmarl_vmas.run_matrix import gpu_slots
 
 
 def test_phase_one_matrix_is_exactly_36_nps_runs():
@@ -67,6 +68,23 @@ def test_custom_experiment_class_is_module_level_for_callback_pickling():
         node.name for node in module.body if isinstance(node, ast.ClassDef)
     }
     assert "MatchedNpsExperiment" in top_level_classes
+
+
+def test_gpu_slots_are_interleaved_before_devices_are_reused():
+    assert gpu_slots(("0", "1", "2", "3"), 3) == [
+        "0",
+        "1",
+        "2",
+        "3",
+        "0",
+        "1",
+        "2",
+        "3",
+        "0",
+        "1",
+        "2",
+        "3",
+    ]
 
 
 def test_direction_and_distance_are_locked():
