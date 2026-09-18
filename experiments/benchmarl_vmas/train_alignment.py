@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import math
 import os
 import subprocess
 import sys
@@ -150,6 +151,14 @@ def build_experiment(args, callbacks=None):
     )
     config.create_json = True
     config.project_name = args.wandb_project
+    tuning_tags = []
+    if args.cka_multiplier is not None:
+        tuning_tags.extend(
+            (
+                f"cka-base-{args.cka_calibration_coef:.10g}",
+                f"cka-multiplier-{args.cka_multiplier:.10g}",
+            )
+        )
     config.wandb_extra_kwargs = {
         "name": args.run_name,
         "group": f"{args.task}-nps",
@@ -160,6 +169,8 @@ def build_experiment(args, callbacks=None):
             args.task,
             args.condition,
             PROTOCOL_VERSION,
+            args.experiment_stage,
+            *tuning_tags,
         ],
         "mode": args.wandb_mode,
     }
@@ -200,6 +211,13 @@ def parse_args():
     )
     parser.add_argument("--alignment-coef", type=float, required=True)
     parser.add_argument("--alignment-epsilon", type=float, default=1e-8)
+    parser.add_argument("--cka-calibration-coef", type=float)
+    parser.add_argument("--cka-multiplier", type=float)
+    parser.add_argument(
+        "--experiment-stage",
+        choices=("formal", "cka_tuning", "cka_validation"),
+        default="formal",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-frames", type=int, default=10_000_000)
     parser.add_argument("--frames-per-batch", type=int, default=60_000)
@@ -227,6 +245,19 @@ def validate_args(args) -> None:
         raise ValueError("isolated runs must use coefficient 0")
     if args.condition != "none" and args.alignment_coef <= 0:
         raise ValueError("aligned runs require a positive coefficient")
+    tuning_values = (args.cka_calibration_coef, args.cka_multiplier)
+    if any(value is not None for value in tuning_values):
+        if args.condition != "c_to_a_cka" or any(
+            value is None or value <= 0 for value in tuning_values
+        ):
+            raise ValueError(
+                "CKA calibration coefficient and multiplier require a CKA run"
+            )
+        expected_coefficient = args.cka_calibration_coef * args.cka_multiplier
+        if not math.isclose(
+            args.alignment_coef, expected_coefficient, rel_tol=1e-9, abs_tol=1e-12
+        ):
+            raise ValueError("alignment coefficient does not match base × multiplier")
     if args.frames_per_batch % args.num_envs:
         raise ValueError("frames-per-batch must be divisible by num-envs")
     for value in (args.evaluation_interval, args.checkpoint_interval):
@@ -252,6 +283,9 @@ def main() -> None:
         "align_mode": args.align_mode,
         "align_distance": args.align_distance,
         "alignment_coef": args.alignment_coef,
+        "cka_calibration_coef": args.cka_calibration_coef,
+        "cka_multiplier": args.cka_multiplier,
+        "experiment_stage": args.experiment_stage,
         "git_commit": git_commit(),
         "package_versions": package_versions(),
         "max_frames": args.max_frames,
