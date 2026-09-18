@@ -3,8 +3,10 @@ Based on PureJaxRL Implementation of IPPO, with changes to give a centralised cr
 """
 
 import functools
+import json
 import os
 from functools import partial
+from pathlib import Path
 from typing import Dict, NamedTuple, Sequence
 
 import distrax
@@ -20,6 +22,11 @@ from omegaconf import OmegaConf
 
 import jaxmarl
 import wandb
+from baselines.MAPPO.alignment_utils import (
+    representation_distance,
+    tree_l2_norm,
+    vmapped_optimizer,
+)
 from jaxmarl.wrappers.baselines import JaxMARLWrapper, MPELogWrapper
 
 
@@ -114,7 +121,7 @@ class ActorRNN(nn.Module):
 
         pi = distrax.Categorical(logits=action_logits)
 
-        return hidden, pi
+        return hidden, pi, actor_mean
 
 
 class CriticRNN(nn.Module):
@@ -133,17 +140,17 @@ class CriticRNN(nn.Module):
         rnn_in = (embedding, dones)
         hidden, embedding = ScannedRNN()(hidden, rnn_in)
 
-        critic = nn.Dense(
+        critic_latent = nn.Dense(
             self.config["GRU_HIDDEN_DIM"],
             kernel_init=orthogonal(2),
             bias_init=constant(0.0),
         )(embedding)
-        critic = nn.relu(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
+        critic_latent = nn.relu(critic_latent)
+        value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
+            critic_latent
         )
 
-        return hidden, jnp.squeeze(critic, axis=-1)
+        return hidden, jnp.squeeze(value, axis=-1), critic_latent
 
 
 class Transition(NamedTuple):
@@ -155,6 +162,7 @@ class Transition(NamedTuple):
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     world_state: jnp.ndarray
+    critic_latent: jnp.ndarray
     info: jnp.ndarray
 
 
@@ -169,6 +177,24 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
 
 
 def make_train(config):
+    config.setdefault("ACTOR_PARAMETER_SHARING", True)
+    config.setdefault("MATCHED_COMPARISON", False)
+    config.setdefault("ALIGN_MODE", "none")
+    config.setdefault("ALIGN_DISTANCE", "ln_mse")
+    config.setdefault("ALIGNMENT_COEF", 0.0)
+    config.setdefault("ALIGN_DISTANCE_EPS", 1e-8)
+    if config["ALIGN_MODE"] not in {"none", "c_to_a"}:
+        raise ValueError("MPE alignment supports only none and c_to_a")
+    if config["ALIGN_DISTANCE"] not in {"ln_mse", "linear_cka"}:
+        raise ValueError("MPE alignment supports only ln_mse and linear_cka")
+    if config["ALIGN_MODE"] != "none" and config["ACTOR_PARAMETER_SHARING"]:
+        raise ValueError("The MPE alignment protocol requires independent actors")
+    if config["ALIGN_MODE"] != "none" and not config["MATCHED_COMPARISON"]:
+        raise ValueError("Alignment requires MATCHED_COMPARISON=true")
+    if not config["ACTOR_PARAMETER_SHARING"] and (
+        config["NUM_ENVS"] % config["NUM_MINIBATCHES"]
+    ):
+        raise ValueError("NUM_ENVS must be divisible by NUM_MINIBATCHES for NPS")
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
@@ -209,6 +235,17 @@ def make_train(config):
             config["NUM_ENVS"], config["GRU_HIDDEN_DIM"]
         )
         actor_network_params = actor_network.init(_rng_actor, ac_init_hstate, ac_init_x)
+        if not config["ACTOR_PARAMETER_SHARING"]:
+            if config["MATCHED_COMPARISON"]:
+                actor_network_params = jax.tree.map(
+                    lambda value: jnp.repeat(value[None], env.num_agents, axis=0),
+                    actor_network_params,
+                )
+            else:
+                actor_rngs = jax.random.split(_rng_actor, env.num_agents)
+                actor_network_params = jax.vmap(
+                    actor_network.init, in_axes=(0, None, None)
+                )(actor_rngs, ac_init_hstate, ac_init_x)
 
         cr_init_x = (
             jnp.zeros(
@@ -245,6 +282,11 @@ def make_train(config):
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["LR"], eps=1e-5),
             )
+        actor_tx = (
+            actor_tx
+            if config["ACTOR_PARAMETER_SHARING"]
+            else vmapped_optimizer(actor_tx)
+        )
         actor_train_state = TrainState.create(
             apply_fn=actor_network.apply,
             params=actor_network_params,
@@ -284,11 +326,37 @@ def make_train(config):
                     obs_batch[np.newaxis, :],
                     last_done[np.newaxis, :],
                 )
-                ac_hstate, pi = actor_network.apply(
-                    train_states[0].params, hstates[0], ac_in
-                )
+                if config["ACTOR_PARAMETER_SHARING"]:
+                    ac_hstate, pi, _ = actor_network.apply(
+                        train_states[0].params, hstates[0], ac_in
+                    )
+                else:
+                    actor_obs = obs_batch.reshape(
+                        (env.num_agents, config["NUM_ENVS"], -1)
+                    )
+                    actor_done = last_done.reshape((env.num_agents, config["NUM_ENVS"]))
+                    actor_hidden = hstates[0].reshape(
+                        (env.num_agents, config["NUM_ENVS"], -1)
+                    )
+
+                    def apply_actor(params, hidden, observation, done):
+                        return actor_network.apply(
+                            params,
+                            hidden,
+                            (observation[None], done[None]),
+                        )
+
+                    ac_hstate, pi, _ = jax.vmap(apply_actor)(
+                        train_states[0].params,
+                        actor_hidden,
+                        actor_obs,
+                        actor_done,
+                    )
+                    ac_hstate = ac_hstate.reshape((config["NUM_ACTORS"], -1))
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
+                action = action.reshape((1, config["NUM_ACTORS"]))
+                log_prob = log_prob.reshape((1, config["NUM_ACTORS"]))
                 env_act = unbatchify(
                     action, env.agents, config["NUM_ENVS"], env.num_agents
                 )
@@ -301,7 +369,7 @@ def make_train(config):
                     world_state[None, :],
                     last_done[np.newaxis, :],
                 )
-                cr_hstate, value = critic_network.apply(
+                cr_hstate, value, critic_latent = critic_network.apply(
                     train_states[1].params, hstates[1], cr_in
                 )
 
@@ -322,6 +390,7 @@ def make_train(config):
                     log_prob.squeeze(),
                     obs_batch,
                     world_state,
+                    jax.lax.stop_gradient(critic_latent.squeeze(0)),
                     info,
                 )
                 runner_state = (
@@ -348,7 +417,7 @@ def make_train(config):
                 last_world_state[None, :],
                 last_done[np.newaxis, :],
             )
-            _, last_val = critic_network.apply(
+            _, last_val, _ = critic_network.apply(
                 train_states[1].params, hstates[1], cr_in
             )
             last_val = last_val.squeeze()
@@ -389,9 +458,9 @@ def make_train(config):
 
                     def _actor_loss_fn(actor_params, init_hstate, traj_batch, gae):
                         # RERUN NETWORK
-                        _, pi = actor_network.apply(
+                        _, pi, actor_latent = actor_network.apply(
                             actor_params,
-                            init_hstate.squeeze(),
+                            init_hstate.squeeze(axis=0),
                             (traj_batch.obs, traj_batch.done),
                         )
                         log_prob = pi.log_prob(traj_batch.action)
@@ -399,7 +468,8 @@ def make_train(config):
                         # CALCULATE ACTOR LOSS
                         logratio = log_prob - traj_batch.log_prob
                         ratio = jnp.exp(logratio)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        if not config["MATCHED_COMPARISON"]:
+                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -424,15 +494,16 @@ def make_train(config):
                             ratio,
                             approx_kl,
                             clip_frac,
+                            actor_latent,
                         )
 
                     def _critic_loss_fn(
                         critic_params, init_hstate, traj_batch, targets
                     ):
                         # RERUN NETWORK
-                        _, value = critic_network.apply(
+                        _, value, _ = critic_network.apply(
                             critic_params,
-                            init_hstate.squeeze(),
+                            init_hstate.squeeze(axis=0),
                             (traj_batch.world_state, traj_batch.done),
                         )
 
@@ -448,10 +519,110 @@ def make_train(config):
                         critic_loss = config["VF_COEF"] * value_loss
                         return critic_loss, (value_loss)
 
-                    actor_grad_fn = jax.value_and_grad(_actor_loss_fn, has_aux=True)
-                    actor_loss, actor_grads = actor_grad_fn(
-                        actor_train_state.params, ac_init_hstate, traj_batch, advantages
-                    )
+                    if config["ACTOR_PARAMETER_SHARING"]:
+                        actor_grad_fn = jax.value_and_grad(_actor_loss_fn, has_aux=True)
+                        actor_loss, actor_grads = actor_grad_fn(
+                            actor_train_state.params,
+                            ac_init_hstate,
+                            traj_batch,
+                            advantages,
+                        )
+                        alignment_loss = jnp.asarray(0.0)
+                        weighted_alignment_loss = jnp.asarray(0.0)
+                        actor_rl_grad_norm = tree_l2_norm(actor_grads)
+                        actor_alignment_grad_norm = jnp.asarray(0.0)
+                        actor_combined_grad_norm = actor_rl_grad_norm
+                    else:
+                        minibatch_envs = traj_batch.obs.shape[1] // env.num_agents
+
+                        def split_agents(value):
+                            value = value.reshape(
+                                (
+                                    value.shape[0],
+                                    env.num_agents,
+                                    minibatch_envs,
+                                    *value.shape[2:],
+                                )
+                            )
+                            return jnp.swapaxes(value, 0, 1)
+
+                        actor_hstate = split_agents(ac_init_hstate)
+                        actor_traj = jax.tree.map(split_agents, traj_batch)
+                        actor_advantages = (advantages - advantages.mean()) / (
+                            advantages.std() + 1e-8
+                        )
+                        actor_advantages = split_agents(actor_advantages)
+
+                        def actor_outputs(params):
+                            return jax.vmap(_actor_loss_fn)(
+                                params,
+                                actor_hstate,
+                                actor_traj,
+                                actor_advantages,
+                            )
+
+                        def distance_from_outputs(actor_aux, distance_name):
+                            current_actor_latent = jnp.swapaxes(actor_aux[5], 0, 1)
+                            target_critic_latent = jnp.swapaxes(
+                                actor_traj.critic_latent, 0, 1
+                            )
+                            return representation_distance(
+                                current_actor_latent,
+                                jax.lax.stop_gradient(target_critic_latent),
+                                jnp.ones(current_actor_latent.shape[:-1], dtype=bool),
+                                distance_name,
+                                agent_axis=1,
+                                epsilon=config["ALIGN_DISTANCE_EPS"],
+                            )
+
+                        def alignment_objective(params, distance_name):
+                            _, actor_aux = actor_outputs(params)
+                            return distance_from_outputs(actor_aux, distance_name)
+
+                        def actor_objective(params):
+                            per_agent_loss, actor_aux = actor_outputs(params)
+                            if config["ALIGN_MODE"] == "c_to_a":
+                                alignment = distance_from_outputs(
+                                    actor_aux, config["ALIGN_DISTANCE"]
+                                )
+                            else:
+                                alignment = jnp.asarray(0.0)
+                            weighted = config["ALIGNMENT_COEF"] * alignment
+                            return per_agent_loss.mean() + weighted, (
+                                actor_aux,
+                                alignment,
+                                weighted,
+                            )
+
+                        (actor_objective_value, actor_objective_aux), actor_grads = (
+                            jax.value_and_grad(actor_objective, has_aux=True)(
+                                actor_train_state.params
+                            )
+                        )
+                        actor_aux, alignment_loss, weighted_alignment_loss = (
+                            actor_objective_aux
+                        )
+                        actor_loss = (actor_objective_value, actor_aux)
+                        if config["ALIGN_MODE"] == "c_to_a":
+                            alignment_grads = jax.grad(
+                                lambda params: config["ALIGNMENT_COEF"]
+                                * alignment_objective(params, config["ALIGN_DISTANCE"])
+                            )(actor_train_state.params)
+                        else:
+                            alignment_grads = jax.tree.map(jnp.zeros_like, actor_grads)
+                        rl_grads = jax.tree.map(
+                            lambda total, cross: total - cross,
+                            actor_grads,
+                            alignment_grads,
+                        )
+                        actor_rl_grad_norm = tree_l2_norm(rl_grads)
+                        actor_alignment_grad_norm = tree_l2_norm(alignment_grads)
+                        actor_combined_grad_norm = tree_l2_norm(actor_grads)
+                        # The objective averages agents.  Restore each independent
+                        # actor's PPO/aux scale before its private optimizer step.
+                        actor_grads = jax.tree.map(
+                            lambda value: value * env.num_agents, actor_grads
+                        )
                     critic_grad_fn = jax.value_and_grad(_critic_loss_fn, has_aux=True)
                     critic_loss, critic_grads = critic_grad_fn(
                         critic_train_state.params, cr_init_hstate, traj_batch, targets
@@ -473,6 +644,15 @@ def make_train(config):
                         "ratio": actor_loss[1][2],
                         "approx_kl": actor_loss[1][3],
                         "clip_frac": actor_loss[1][4],
+                        "alignment_loss": alignment_loss,
+                        "alignment_weighted_loss": weighted_alignment_loss,
+                        "actor_rl_gradient_norm": actor_rl_grad_norm,
+                        "actor_alignment_gradient_norm": actor_alignment_grad_norm,
+                        "actor_combined_gradient_norm": actor_combined_grad_norm,
+                        "actor_alignment_to_rl_gradient_ratio": (
+                            actor_alignment_grad_norm
+                            / jnp.maximum(actor_rl_grad_norm, 1e-12)
+                        ),
                     }
 
                     return (actor_train_state, critic_train_state), loss_info
@@ -499,24 +679,60 @@ def make_train(config):
                     advantages.squeeze(),
                     targets.squeeze(),
                 )
-                permutation = jax.random.permutation(_rng, config["NUM_ACTORS"])
-
-                shuffled_batch = jax.tree.map(
-                    lambda x: jnp.take(x, permutation, axis=1), batch
-                )
-
-                minibatches = jax.tree.map(
-                    lambda x: jnp.swapaxes(
-                        jnp.reshape(
-                            x,
-                            [x.shape[0], config["NUM_MINIBATCHES"], -1]
-                            + list(x.shape[2:]),
+                if config["ACTOR_PARAMETER_SHARING"]:
+                    permutation = jax.random.permutation(_rng, config["NUM_ACTORS"])
+                    shuffled_batch = jax.tree.map(
+                        lambda x: jnp.take(x, permutation, axis=1), batch
+                    )
+                    minibatches = jax.tree.map(
+                        lambda x: jnp.swapaxes(
+                            jnp.reshape(
+                                x,
+                                [x.shape[0], config["NUM_MINIBATCHES"], -1]
+                                + list(x.shape[2:]),
+                            ),
+                            1,
+                            0,
                         ),
-                        1,
-                        0,
-                    ),
-                    shuffled_batch,
-                )
+                        shuffled_batch,
+                    )
+                else:
+                    # Use the same environment permutation for every actor.  This
+                    # preserves one trajectory slice per NPS actor in each
+                    # minibatch and keeps actor/critic latent samples paired.
+                    permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
+
+                    def nps_minibatches(value):
+                        value = value.reshape(
+                            (
+                                value.shape[0],
+                                env.num_agents,
+                                config["NUM_ENVS"],
+                                *value.shape[2:],
+                            )
+                        )
+                        value = jnp.take(value, permutation, axis=2)
+                        value = value.reshape(
+                            (
+                                value.shape[0],
+                                env.num_agents,
+                                config["NUM_MINIBATCHES"],
+                                config["NUM_ENVS"] // config["NUM_MINIBATCHES"],
+                                *value.shape[3:],
+                            )
+                        )
+                        value = jnp.moveaxis(value, 2, 0)
+                        return value.reshape(
+                            (
+                                config["NUM_MINIBATCHES"],
+                                value.shape[1],
+                                env.num_agents
+                                * (config["NUM_ENVS"] // config["NUM_MINIBATCHES"]),
+                                *value.shape[4:],
+                            )
+                        )
+
+                    minibatches = jax.tree.map(nps_minibatches, batch)
 
                 train_states, loss_info = jax.lax.scan(
                     _update_minbatch, train_states, minibatches
@@ -551,16 +767,40 @@ def make_train(config):
             rng = update_state[-1]
 
             def callback(metric):
-
-                wandb.log(
-                    {
-                        "returns": metric["returned_episode_returns"][-1, :].mean(),
-                        "env_step": metric["update_steps"]
-                        * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
-                        **metric["loss"],
-                    }
+                env_step = (
+                    (int(metric["update_steps"]) + 1)
+                    * config["NUM_ENVS"]
+                    * config["NUM_STEPS"]
                 )
+                payload = {
+                    "returns": float(
+                        np.asarray(metric["returned_episode_returns"][-1, :]).mean()
+                    ),
+                    "env_step": env_step,
+                    **{
+                        key: float(np.asarray(value).mean())
+                        for key, value in metric["loss"].items()
+                    },
+                }
+                wandb.log(payload)
+                metrics_path = config.get("METRICS_JSONL", "")
+                if metrics_path:
+                    destination = Path(metrics_path)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with destination.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+                status_path = config.get("STATUS_JSON", "")
+                if status_path:
+                    destination = Path(status_path)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = destination.with_suffix(destination.suffix + ".tmp")
+                    status = dict(config.get("STATUS_METADATA", {}))
+                    status.update(status="running", env_steps=env_step)
+                    temporary.write_text(
+                        json.dumps(status, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    os.replace(temporary, destination)
 
             metric["update_steps"] = update_steps
             jax.experimental.io_callback(callback, None, metric)
@@ -580,7 +820,12 @@ def make_train(config):
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, 0), None, config["NUM_UPDATES"]
         )
-        return {"runner_state": runner_state}
+        final_train_states = runner_state[0][0]
+        return {
+            "runner_state": runner_state,
+            "actor_params": final_train_states[0].params,
+            "critic_params": final_train_states[1].params,
+        }
 
     return train
 
