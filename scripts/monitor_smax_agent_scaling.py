@@ -14,7 +14,6 @@ try:
     from run_smax_agent_scaling import (
         AGENT_COUNTS,
         FAMILY_MAPS,
-        TOTAL_TIMESTEPS,
         parse_counts,
         parse_csv,
         task_matrix,
@@ -24,7 +23,6 @@ except ModuleNotFoundError:
     from scripts.run_smax_agent_scaling import (
         AGENT_COUNTS,
         FAMILY_MAPS,
-        TOTAL_TIMESTEPS,
         parse_counts,
         parse_csv,
         task_matrix,
@@ -75,6 +73,7 @@ def snapshot(root, tasks):
     rows = []
     counts = {key: 0 for key in ("DONE", "REUSED", "RUNNING", "FAILED", "PENDING")}
     for task in tasks:
+        total_timesteps = task.total_timesteps
         log_path = root / "logs" / f"{task.run_name}.log"
         text = log_path.read_text(errors="replace") if log_path.is_file() else ""
         steps = parse_latest_step(text)
@@ -92,10 +91,10 @@ def snapshot(root, tasks):
             )
         if task.run_name in reused:
             status = "REUSED"
-            steps = TOTAL_TIMESTEPS
+            steps = total_timesteps
         elif final_exists(root, task.run_name) or marker_status == "completed":
             status = "DONE"
-            steps = TOTAL_TIMESTEPS
+            steps = total_timesteps
         elif task.run_name in processes:
             status = "RUNNING"
         elif (
@@ -107,7 +106,7 @@ def snapshot(root, tasks):
         else:
             status = "PENDING"
         counts[status] += 1
-        percent = min(100.0, 100.0 * steps / TOTAL_TIMESTEPS)
+        percent = min(100.0, 100.0 * steps / total_timesteps)
         filled = round(24 * percent / 100.0)
         bar = "█" * filled + "░" * (24 - filled)
         rows.append(
@@ -118,6 +117,7 @@ def snapshot(root, tasks):
                 bar,
                 percent,
                 steps,
+                total_timesteps,
                 task.run_name,
             )
         )
@@ -131,13 +131,22 @@ def render(root, tasks, clear=False):
     summary = "  ".join(f"{key}={counts[key]}" for key in counts)
     print(f"{summary}  TOTAL={len(tasks)}\n")
     prior_count = None
-    for agent_count, family, status, bar, percent, steps, run_name in rows:
+    for (
+        agent_count,
+        family,
+        status,
+        bar,
+        percent,
+        steps,
+        total_timesteps,
+        run_name,
+    ) in rows:
         if prior_count is not None and agent_count != prior_count:
             print()
         prior_count = agent_count
         print(
             f"n={agent_count:2d} {family[:3]:3s} {status:7s} [{bar}] "
-            f"{percent:6.2f}% {steps:>10,}/{TOTAL_TIMESTEPS:,}  {run_name}"
+            f"{percent:6.2f}% {steps:>10,}/{total_timesteps:,}  {run_name}"
         )
 
 

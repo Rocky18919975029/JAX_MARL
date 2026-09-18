@@ -4,7 +4,8 @@
 Both the homogeneous and heterogeneous families use the same ally counts.
 Every enemy team has exactly one additional unit.  The only trained conditions
 are isolated, C-to-A LN-MSE, and C-to-A Linear CKA.  All runs use four matched
-seeds and a 20M-step budget by default.
+seeds.  Homogeneous maps use 10M steps and heterogeneous maps use 20M steps,
+matching the converged budgets of the two anchor tasks.
 """
 
 from __future__ import annotations
@@ -35,9 +36,12 @@ except ModuleNotFoundError:
     )
 
 
-PROTOCOL_VERSION = "smax-agent-scaling-nps-20m-v1.0"
-TOTAL_TIMESTEPS = 20_000_000
-DEFAULT_PROJECT = "jaxmarl-smax-agent-scaling-nps-20m"
+PROTOCOL_VERSION = "smax-agent-scaling-nps-v1.1"
+FAMILY_TOTAL_TIMESTEPS = {
+    "homogeneous": 10_000_000,
+    "heterogeneous": 20_000_000,
+}
+DEFAULT_PROJECT = "jaxmarl-smax-agent-scaling-nps"
 AGENT_COUNTS = (3, 5, 8, 10, 15)
 FAMILY_MAPS = {
     "homogeneous": {
@@ -78,6 +82,10 @@ class Task:
     @property
     def distance_label(self):
         return "distance_free" if self.align_mode == "none" else self.align_distance
+
+    @property
+    def total_timesteps(self):
+        return FAMILY_TOTAL_TIMESTEPS[self.family]
 
     @property
     def key(self):
@@ -182,7 +190,7 @@ def git_state(repo):
     return commit, dirty
 
 
-def load_effective_frozen_config(path):
+def load_base_frozen_config(path):
     resolved = path.expanduser().resolve()
     payload = json.loads(resolved.read_text(encoding="utf-8"))
     frozen = dict(payload.get("training_config", payload))
@@ -193,7 +201,6 @@ def load_effective_frozen_config(path):
         raise ValueError("Agent scaling requires MATCHED_COMPARISON=true")
     if float(frozen["ALIGNMENT_COEF"]) != 0.1:
         raise ValueError("LN-MSE reference coefficient must be 0.1")
-    frozen["TOTAL_TIMESTEPS"] = TOTAL_TIMESTEPS
     digest = hashlib.sha256(
         json.dumps(frozen, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -202,7 +209,12 @@ def load_effective_frozen_config(path):
 
 def configs_match(config, frozen, task):
     for key in FROZEN_KEYS:
-        expected = task.alignment_coef if key == "ALIGNMENT_COEF" else frozen[key]
+        if key == "ALIGNMENT_COEF":
+            expected = task.alignment_coef
+        elif key == "TOTAL_TIMESTEPS":
+            expected = task.total_timesteps
+        else:
+            expected = frozen[key]
         actual = config.get(key)
         if key == "ALIGNMENT_COEF":
             try:
@@ -278,7 +290,12 @@ def build_command(args, frozen, task, commit):
             for nested_key, value in frozen[key].items():
                 command.append(f"ENV_KWARGS.{nested_key}={hydra_value(value)}")
         else:
-            value = task.alignment_coef if key == "ALIGNMENT_COEF" else frozen[key]
+            if key == "ALIGNMENT_COEF":
+                value = task.alignment_coef
+            elif key == "TOTAL_TIMESTEPS":
+                value = task.total_timesteps
+            else:
+                value = frozen[key]
             command.append(f"{key}={hydra_value(value)}")
     command.extend(
         (
@@ -334,9 +351,7 @@ def main():
     commit, dirty = git_state(repo)
     if dirty:
         raise RuntimeError("Worktree is dirty; commit the scaling protocol first")
-    frozen, frozen_path, frozen_digest = load_effective_frozen_config(
-        args.frozen_config
-    )
+    frozen, frozen_path, frozen_digest = load_base_frozen_config(args.frozen_config)
     cka_coef = load_alignment_calibration(args.cka_calibration, "linear_cka")
     tasks = task_matrix(args.families, args.agent_counts, args.seeds, cka_coef)
     args.run_root = args.run_root.expanduser().resolve()
@@ -358,7 +373,7 @@ def main():
             f"Protocol={PROTOCOL_VERSION} selected={len(tasks)} "
             f"reused={len(reusable)} "
             f"completed_local={completed_count} pending={pending_count} "
-            f"total_timesteps={TOTAL_TIMESTEPS} cka_lambda={cka_coef}"
+            f"budgets={FAMILY_TOTAL_TIMESTEPS} cka_lambda={cka_coef}"
         )
         pending_index = 0
         for task in tasks:
@@ -392,8 +407,8 @@ def main():
         "protocol_version": PROTOCOL_VERSION,
         "git_commit": commit,
         "frozen_config": str(frozen_path),
-        "effective_frozen_config_sha256": frozen_digest,
-        "total_timesteps": TOTAL_TIMESTEPS,
+        "base_frozen_config_sha256": frozen_digest,
+        "family_total_timesteps": FAMILY_TOTAL_TIMESTEPS,
         "checkpoint_interval": args.checkpoint_interval,
         "families": list(args.families),
         "agent_counts": list(args.agent_counts),
@@ -551,6 +566,7 @@ def main():
                 "align_mode": task.align_mode,
                 "align_distance": task.distance_label,
                 "alignment_coef": task.alignment_coef,
+                "total_timesteps": task.total_timesteps,
                 "seed": task.seed,
                 "gpu": gpu,
                 "started_at_utc": started,

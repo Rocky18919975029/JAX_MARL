@@ -7,8 +7,8 @@ from scripts.h1_protocol import MANUAL_REFERENCE
 from scripts.monitor_smax_agent_scaling import parse_latest_step, reused_run_names
 from scripts.run_smax_agent_scaling import (
     AGENT_COUNTS,
+    FAMILY_TOTAL_TIMESTEPS,
     FAMILY_MAPS,
-    TOTAL_TIMESTEPS,
     reusable_tasks,
     task_matrix,
 )
@@ -49,7 +49,16 @@ def test_full_scaling_matrix_has_120_unique_matched_runs():
         "c_to_a_mse",
         "c_to_a_cka",
     }
-    assert TOTAL_TIMESTEPS == 20_000_000
+    assert FAMILY_TOTAL_TIMESTEPS == {
+        "homogeneous": 10_000_000,
+        "heterogeneous": 20_000_000,
+    }
+    assert {task.total_timesteps for task in tasks if task.family == "homogeneous"} == {
+        10_000_000
+    }
+    assert {
+        task.total_timesteps for task in tasks if task.family == "heterogeneous"
+    } == {20_000_000}
 
 
 def test_task_order_advances_from_small_to_large_agent_counts():
@@ -61,14 +70,8 @@ def test_task_order_advances_from_small_to_large_agent_counts():
     assert tuple(seen) == AGENT_COUNTS
 
 
-def test_exact_20m_anchor_is_reused_but_10m_anchor_is_not(tmp_path):
-    tasks = task_matrix(
-        families=("heterogeneous",),
-        agent_counts=(8,),
-        seeds=(1,),
-    )
-    target = next(task for task in tasks if task.display_condition == "c_to_a_cka")
-    final = tmp_path / "checkpoints" / "anchor" / "final"
+def write_reusable_checkpoint(root, target, frozen):
+    final = root / "checkpoints" / target.run_name / "final"
     final.mkdir(parents=True)
     metadata = {
         "map_name": target.map_name,
@@ -77,16 +80,42 @@ def test_exact_20m_anchor_is_reused_but_10m_anchor_is_not(tmp_path):
         "align_mode": target.align_mode,
         "align_distance": target.align_distance,
     }
-    frozen = dict(MANUAL_REFERENCE)
-    frozen["TOTAL_TIMESTEPS"] = TOTAL_TIMESTEPS
     config = dict(frozen)
+    config["TOTAL_TIMESTEPS"] = target.total_timesteps
     config["ALIGNMENT_COEF"] = target.alignment_coef
     (final / "metadata.json").write_text(json.dumps(metadata))
     (final / "config.json").write_text(json.dumps(config))
     (final / "model.safetensors").write_bytes(b"model")
+    return final, config
+
+
+def test_heterogeneous_anchor_requires_20m_for_reuse(tmp_path):
+    tasks = task_matrix(
+        families=("heterogeneous",),
+        agent_counts=(8,),
+        seeds=(1,),
+    )
+    target = next(task for task in tasks if task.display_condition == "c_to_a_cka")
+    frozen = dict(MANUAL_REFERENCE)
+    final, config = write_reusable_checkpoint(tmp_path, target, frozen)
     assert reusable_tasks((tmp_path,), tasks, frozen) == {target.key: final.resolve()}
 
     config["TOTAL_TIMESTEPS"] = 10_000_000
+    (final / "config.json").write_text(json.dumps(config))
+    assert reusable_tasks((tmp_path,), tasks, frozen) == {}
+
+
+def test_homogeneous_anchor_reuses_10m_and_rejects_20m(tmp_path):
+    tasks = task_matrix(
+        families=("homogeneous",), agent_counts=(10,), seeds=(1,)
+    )
+    target = next(task for task in tasks if task.display_condition == "c_to_a_cka")
+    frozen = dict(MANUAL_REFERENCE)
+    final, config = write_reusable_checkpoint(tmp_path, target, frozen)
+    assert target.total_timesteps == 10_000_000
+    assert reusable_tasks((tmp_path,), tasks, frozen) == {target.key: final.resolve()}
+
+    config["TOTAL_TIMESTEPS"] = 20_000_000
     (final / "config.json").write_text(json.dumps(config))
     assert reusable_tasks((tmp_path,), tasks, frozen) == {}
 
