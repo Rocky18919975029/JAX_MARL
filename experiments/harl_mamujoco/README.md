@@ -172,6 +172,23 @@ Increase `--max-runs-per-gpu` only after observing CPU, RAM, GPU memory, and
 simulation throughput. Unlike SMAX, MA-MuJoCo environment stepping is not a
 large JAX GPU batch, so excessive process concurrency can reduce throughput.
 
+For the focused main experiment (NPS only; isolated, C→A LN-MSE, and C→A
+Linear CKA; four seeds), use the dedicated restart-safe 12-run launcher:
+
+```bash
+nohup python experiments/harl_mamujoco/run_nps_core_matrix.py \
+  --run-root "$FORMAL_ROOT" \
+  --cka-calibration "$CKA_CALIBRATION" \
+  --gpus 0,1,2,3 \
+  --max-runs-per-gpu 3 \
+  --wandb-project harl-mamujoco-humanoid17x1-nps-core \
+  > "$FORMAL_ROOT/training.stdout" 2>&1 &
+```
+
+The launcher generates exactly 12 unique runs, skips only runs with a
+checkpoint `completed.json`, and retries interrupted or failed runs. With four
+GPUs and the default three slots per GPU, all 12 runs can execute concurrently.
+
 Progress checks:
 
 ```bash

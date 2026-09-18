@@ -94,9 +94,13 @@ def task_matrix(
     cka_coefficient: float | None,
     distances=("ln_mse", "linear_cka"),
     containment_coefficient: float | None = None,
+    actor_variants=("ps", "nps"),
+    directions=("c_to_a", "a_to_c", "joint"),
 ) -> list[Task]:
     tasks = []
-    for actor_label, sharing in (("ps", True), ("nps", False)):
+    sharing_by_label = {"ps": True, "nps": False}
+    for actor_label in actor_variants:
+        sharing = sharing_by_label[actor_label]
         for seed in seeds:
             tasks.append(Task(actor_label, sharing, "none", "ln_mse", 0.1, seed))
             coefficients = {
@@ -108,7 +112,7 @@ def task_matrix(
                 coefficient = coefficients[distance]
                 if coefficient is None:
                     raise ValueError(f"Missing calibrated coefficient for {distance}")
-                for mode in ("c_to_a", "a_to_c", "joint"):
+                for mode in directions:
                     tasks.append(
                         Task(actor_label, sharing, mode, distance, coefficient, seed)
                     )
@@ -123,9 +127,9 @@ def main() -> None:
     )
     parser.add_argument("--cka-calibration", type=Path)
     parser.add_argument("--containment-calibration", type=Path)
-    parser.add_argument(
-        "--distances", default="ln_mse,linear_cka"
-    )
+    parser.add_argument("--distances", default="ln_mse,linear_cka")
+    parser.add_argument("--actor-variants", default="ps,nps")
+    parser.add_argument("--directions", default="c_to_a,a_to_c,joint")
     parser.add_argument("--seeds", type=parse_seeds, default=(1, 2, 3, 4))
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--max-runs-per-gpu", type=int, default=1)
@@ -144,19 +148,39 @@ def main() -> None:
     harl_root = args.harl_root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     (root / "logs").mkdir(parents=True, exist_ok=True)
-    distances = tuple(piece.strip() for piece in args.distances.split(",") if piece.strip())
-    if not distances or len(distances) != len(set(distances)) or not set(
-        distances
-    ).issubset({"ln_mse", "linear_cka", "containment"}):
+    distances = tuple(
+        piece.strip() for piece in args.distances.split(",") if piece.strip()
+    )
+    if (
+        not distances
+        or len(distances) != len(set(distances))
+        or not set(distances).issubset({"ln_mse", "linear_cka", "containment"})
+    ):
         raise ValueError("Invalid --distances selection")
+    actor_variants = tuple(
+        piece.strip() for piece in args.actor_variants.split(",") if piece.strip()
+    )
+    if (
+        not actor_variants
+        or len(actor_variants) != len(set(actor_variants))
+        or not set(actor_variants).issubset({"ps", "nps"})
+    ):
+        raise ValueError("Invalid --actor-variants selection")
+    directions = tuple(
+        piece.strip() for piece in args.directions.split(",") if piece.strip()
+    )
+    if (
+        not directions
+        or len(directions) != len(set(directions))
+        or not set(directions).issubset({"c_to_a", "a_to_c", "joint"})
+    ):
+        raise ValueError("Invalid --directions selection")
     cka_coefficient = None
     containment_coefficient = None
     if "linear_cka" in distances:
         if args.cka_calibration is None:
             raise ValueError("--cka-calibration is required for linear_cka")
-        cka_coefficient = load_alignment_coefficient(
-            args.cka_calibration, "linear_cka"
-        )
+        cka_coefficient = load_alignment_coefficient(args.cka_calibration, "linear_cka")
     if "containment" in distances:
         if args.containment_calibration is None:
             raise ValueError("--containment-calibration is required for containment")
@@ -164,7 +188,12 @@ def main() -> None:
             args.containment_calibration, "containment"
         )
     tasks = task_matrix(
-        args.seeds, cka_coefficient, distances, containment_coefficient
+        args.seeds,
+        cka_coefficient,
+        distances,
+        containment_coefficient,
+        actor_variants,
+        directions,
     )
     pending = [
         task
