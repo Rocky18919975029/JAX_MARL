@@ -59,6 +59,19 @@ class Scenario:
     unit_type_profile: Tuple[int, ...] = ()
 
 
+def _fixed_scenario(ally_types, enemy_types):
+    """Build a fixed-composition scenario from ally and enemy type IDs."""
+    ally_types = tuple(ally_types)
+    enemy_types = tuple(enemy_types)
+    return Scenario(
+        jnp.asarray(ally_types + enemy_types, dtype=jnp.uint8),
+        len(ally_types),
+        len(enemy_types),
+        False,
+        False,
+    )
+
+
 MAP_NAME_TO_SCENARIO = {
     # name: (unit_types, n_allies, n_enemies, SMACv2 position generation, SMACv2 unit generation)
     "3m": Scenario(jnp.zeros((6,), dtype=jnp.uint8), 3, 3, False, False),
@@ -87,9 +100,18 @@ MAP_NAME_TO_SCENARIO = {
         False,
     ),
     "8m": Scenario(jnp.zeros((16,), dtype=jnp.uint8), 8, 8, False, False),
+    # Agent-count scaling suite.  Homogeneous and heterogeneous maps use the
+    # same ally counts and exactly one additional enemy.  The heterogeneous
+    # family keeps an approximately 40/60 stalker/zealot composition and adds
+    # the extra enemy as a zealot.
+    "3m_vs_4m": _fixed_scenario([0] * 3, [0] * 4),
     "5m_vs_6m": Scenario(jnp.zeros((11,), dtype=jnp.uint8), 5, 6, False, False),
+    "8m_vs_9m": _fixed_scenario([0] * 8, [0] * 9),
     "10m_vs_11m": Scenario(jnp.zeros((21,), dtype=jnp.uint8), 10, 11, False, False),
+    "15m_vs_16m": _fixed_scenario([0] * 15, [0] * 16),
     "27m_vs_30m": Scenario(jnp.zeros((57,), dtype=jnp.uint8), 27, 30, False, False),
+    "1s2z_vs_1s3z": _fixed_scenario([2] + [3] * 2, [2] + [3] * 3),
+    "2s3z_vs_2s4z": _fixed_scenario([2] * 2 + [3] * 3, [2] * 2 + [3] * 4),
     "3s5z_vs_3s6z": Scenario(
         jnp.concatenate(
             [
@@ -102,6 +124,8 @@ MAP_NAME_TO_SCENARIO = {
         False,
         False,
     ),
+    "4s6z_vs_4s7z": _fixed_scenario([2] * 4 + [3] * 6, [2] * 4 + [3] * 7),
+    "6s9z_vs_6s10z": _fixed_scenario([2] * 6 + [3] * 9, [2] * 6 + [3] * 10),
     "3s_vs_5z": Scenario(
         jnp.array([2, 2, 2, 3, 3, 3, 3, 3], dtype=jnp.uint8), 3, 5, False, False
     ),

@@ -24,6 +24,13 @@ SMAX is a purely JAX SMAC-like environment. It, like SMAC, focuses on decentrali
 | smacv2_10_units_hetero_h5 | six types, profile `[2, 2, 2, 2, 1, 1]` | mirrored ally profile |
 | smacv2_20_units | 20 randomly chosen  | 20 randomly chosen     |
 
+The controlled agent-count scaling suite uses matched ally counts in two
+families.  Homogeneous maps are `3m_vs_4m`, `5m_vs_6m`, `8m_vs_9m`,
+`10m_vs_11m`, and `15m_vs_16m`.  Heterogeneous maps are `1s2z_vs_1s3z`,
+`2s3z_vs_2s4z`, `3s5z_vs_3s6z`, `4s6z_vs_4s7z`, and
+`6s9z_vs_6s10z`.  The ally counts are 3, 5, 8, 10, and 15 in both families;
+the enemy team always contains exactly one additional unit.
+
 ## Visualisation
 You can see the example `smax_introduction.py` in the tutorials folder for an introduction to SMAX, including example visualisation. SMAX environments tick at 8 times faster than each step of the agent. This means that when visualising, we have to expand the state sequence to encompass all ticks. This is why the `state_seq` for SMAX consists of a sequence of `(key, state, actions)` -- we must have not only the state and actions, but also the exact key passed to the step function to interpolate between the different states correctly. This process means visualisation can be time consuming if done for a large number of steps.
 
