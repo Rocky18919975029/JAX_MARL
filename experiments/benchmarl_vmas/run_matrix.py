@@ -21,7 +21,7 @@ from experiments.benchmarl_vmas.protocol import (
     DEFAULT_SEEDS,
     PROTOCOL_VERSION,
     TASKS,
-    load_cka_coefficients,
+    load_alignment_coefficients,
     matrix,
     parse_csv,
     parse_seeds,
@@ -44,7 +44,13 @@ def completed(root: Path, run_name: str) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
-    parser.add_argument("--cka-calibration", type=Path, required=True)
+    parser.add_argument(
+        "--alignment-calibration",
+        "--cka-calibration",
+        dest="alignment_calibration",
+        type=Path,
+        required=True,
+    )
     parser.add_argument("--tasks", type=parse_csv, default=TASKS)
     parser.add_argument("--seeds", type=parse_seeds, default=DEFAULT_SEEDS)
     parser.add_argument("--gpus", type=parse_csv, default=("0", "1", "2", "3"))
@@ -71,14 +77,18 @@ def main() -> None:
     root = args.run_root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     (root / "logs").mkdir(parents=True, exist_ok=True)
-    cka_coefficients = load_cka_coefficients(args.cka_calibration)
-    runs = matrix(args.seeds, args.tasks, cka_coefficients)
+    alignment_coefficients = load_alignment_coefficients(args.alignment_calibration)
+    runs = matrix(args.seeds, args.tasks, alignment_coefficients)
     pending = [run for run in runs if not completed(root, run.name)]
     print(
         f"Protocol={PROTOCOL_VERSION} total={len(runs)} pending={len(pending)} "
         f"tasks={','.join(args.tasks)} seeds={','.join(map(str, args.seeds))} "
-        "lambda_CKA="
-        + ",".join(f"{task}:{cka_coefficients[task]:.10g}" for task in args.tasks),
+        "lambdas="
+        + ",".join(
+            f"{task}:mse={alignment_coefficients[task]['c_to_a_mse']:.10g},"
+            f"cka={alignment_coefficients[task]['c_to_a_cka']:.10g}"
+            for task in args.tasks
+        ),
         flush=True,
     )
 

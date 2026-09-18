@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, MISSING
 from typing import Sequence
 
@@ -18,6 +19,15 @@ def _mlp(input_dim: int, hidden_sizes: Sequence[int]) -> nn.Sequential:
         layers.extend((nn.Linear(previous, width), nn.Tanh()))
         previous = width
     return nn.Sequential(*layers)
+
+
+def _head(
+    input_dim: int, hidden_sizes: Sequence[int], output_dim: int
+) -> nn.Sequential:
+    return nn.Sequential(
+        _mlp(input_dim, hidden_sizes),
+        nn.Linear(hidden_sizes[-1] if hidden_sizes else input_dim, output_dim),
+    )
 
 
 class AlignmentMlp(Model):
@@ -42,7 +52,12 @@ class AlignmentMlp(Model):
         if kwargs:
             raise TypeError(f"unexpected AlignmentMlp arguments: {sorted(kwargs)}")
         self.hidden_sizes = tuple(hidden_sizes)
-        self.latent_dim = self.hidden_sizes[-1]
+        # Match the SMAX protocol: align an internal representation that still
+        # has a trainable nonlinear policy/value head downstream.  With the
+        # official 256x256 MLP this preserves the architecture while exposing
+        # the first 256-D hidden layer rather than the pre-output layer.
+        self.latent_dim = self.hidden_sizes[0]
+        head_hidden_sizes = self.hidden_sizes[1:]
         per_agent_input = sum(
             int(spec.shape[-1]) for spec in self.input_spec.values(True, True)
         )
@@ -51,14 +66,17 @@ class AlignmentMlp(Model):
         if self.input_has_agent_dim and not self.centralised:
             if self.share_params:
                 raise ValueError("This protocol requires non-parameter-sharing actors")
+            prototype_encoder = _mlp(per_agent_input, (self.latent_dim,))
+            prototype_head = _head(
+                self.latent_dim, head_hidden_sizes, self.output_features
+            )
+            # Independent parameters with exactly matched initialization, as in
+            # the SMAX NPS matched-comparison protocol.
             self.encoders = nn.ModuleList(
-                [_mlp(per_agent_input, self.hidden_sizes) for _ in range(self.n_agents)]
+                [copy.deepcopy(prototype_encoder) for _ in range(self.n_agents)]
             )
             self.heads = nn.ModuleList(
-                [
-                    nn.Linear(self.latent_dim, self.output_features)
-                    for _ in range(self.n_agents)
-                ]
+                [copy.deepcopy(prototype_head) for _ in range(self.n_agents)]
             )
             self.central_encoder = None
             self.central_head = None
@@ -66,8 +84,15 @@ class AlignmentMlp(Model):
             central_input = per_agent_input * (
                 self.n_agents if self.input_has_agent_dim else 1
             )
-            self.central_encoder = _mlp(central_input, self.hidden_sizes)
-            self.central_head = nn.Linear(self.latent_dim, self.output_features)
+            if self.is_critic:
+                # The same centralized critic is evaluated once per agent with
+                # an explicit one-hot identity.  This produces z^C_i rather
+                # than copying one shared latent to every NPS actor.
+                central_input += self.n_agents
+            self.central_encoder = _mlp(central_input, (self.latent_dim,))
+            self.central_head = _head(
+                self.latent_dim, head_hidden_sizes, self.output_features
+            )
             self.encoders = None
             self.heads = None
         self.to(self.device)
@@ -99,15 +124,25 @@ class AlignmentMlp(Model):
         else:
             if self.input_has_agent_dim:
                 value = value.flatten(start_dim=-2)
-            central_latent = self.central_encoder(value)
-            output = self.central_head(central_latent)
-            latent = central_latent.unsqueeze(-2).expand(
-                *central_latent.shape[:-1], self.n_agents, self.latent_dim
-            )
+            if self.is_critic:
+                central = value.unsqueeze(-2).expand(
+                    *value.shape[:-1], self.n_agents, value.shape[-1]
+                )
+                identity = torch.eye(
+                    self.n_agents, device=value.device, dtype=value.dtype
+                )
+                identity = identity.view(
+                    *((1,) * (central.ndim - 2)), self.n_agents, self.n_agents
+                ).expand(*central.shape[:-1], self.n_agents)
+                latent = self.central_encoder(torch.cat((central, identity), dim=-1))
+                output = self.central_head(latent)
+            else:
+                latent = self.central_encoder(value)
+                output = self.central_head(latent)
         tensordict.set(self.out_key, output)
         # Collection/evaluation run under no_grad. Avoid storing a 256-D latent
         # for every simulator frame; PPO recomputes it on the sampled minibatch.
-        if torch.is_grad_enabled():
+        if self.is_critic or torch.is_grad_enabled():
             tensordict.set(self.latent_key, latent)
         return tensordict
 

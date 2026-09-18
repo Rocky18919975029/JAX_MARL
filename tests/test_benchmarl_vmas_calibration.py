@@ -2,7 +2,14 @@ import argparse
 import sys
 import types
 
+import pytest
+
 from experiments.benchmarl_vmas import calibrate_cka
+
+
+def test_cka_coefficient_matches_fixed_mse_gradient_scale():
+    coefficient = calibrate_cka.matched_cka_coefficient(2.0, 8.0)
+    assert coefficient * 8.0 == pytest.approx(0.1 * 2.0)
 
 
 def test_calibration_namespace_supplies_training_metadata(monkeypatch, tmp_path):

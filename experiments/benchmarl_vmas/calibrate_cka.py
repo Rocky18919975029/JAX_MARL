@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Calibrate task-specific VMAS CKA coefficients from initial actor gradients."""
+"""Calibrate task-specific VMAS auxiliary coefficients against PPO gradients."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from experiments.benchmarl_vmas.protocol import (
     CALIBRATION_MINIBATCHES,
     CALIBRATION_PILOT_SEED,
     CALIBRATION_PROTOCOL_VERSION,
-    REFERENCE_ALIGNMENT_COEF,
+    REFERENCE_MSE_ALIGNMENT_COEF,
     TASKS,
     parse_csv,
 )
@@ -47,6 +47,14 @@ def root_mean_square(values: list[float]) -> float:
     if not values:
         raise ValueError("cannot aggregate an empty gradient sequence")
     return math.sqrt(sum(value * value for value in values) / len(values))
+
+
+def matched_cka_coefficient(mse_norm: float, cka_norm: float) -> float:
+    if min(mse_norm, cka_norm) <= 0 or not all(
+        math.isfinite(value) for value in (mse_norm, cka_norm)
+    ):
+        raise ValueError("gradient norms must be finite and positive")
+    return REFERENCE_MSE_ALIGNMENT_COEF * mse_norm / cka_norm
 
 
 def run_cell(
@@ -107,9 +115,18 @@ def run_cell(
             # Use the exact random replay-buffer sampling path used by training,
             # rather than a correlated prefix of the flattened rollout.
             minibatch = replay_buffer.sample().to(experiment.config.train_device)
-            ppo = loss_module(minibatch)["loss_objective"]
-            mse = loss_module.alignment_loss(minibatch, "ln_mse")
-            cka = loss_module.alignment_loss(minibatch, "linear_cka")
+            loss_values = loss_module(minibatch)
+            ppo = loss_values["loss_objective"] + loss_values["loss_entropy"]
+            # Training sums the private per-agent objectives after TorchRL's
+            # agent-mean reduction.  Calibrate the exact same scaled losses.
+            mse = (
+                loss_module.alignment_loss(minibatch, "ln_mse")
+                * loss_module.n_agents
+            )
+            cka = (
+                loss_module.alignment_loss(minibatch, "linear_cka")
+                * loss_module.n_agents
+            )
             row = {
                 "minibatch_index": minibatch_index,
                 "rl_gradient_norm": gradient_norm(ppo, actor_parameters),
@@ -136,7 +153,8 @@ def run_cell(
         cka_norm = root_mean_square(
             [row["linear_cka_gradient_norm"] for row in measurements]
         )
-        coefficient = REFERENCE_ALIGNMENT_COEF * mse_norm / cka_norm
+        mse_coefficient = REFERENCE_MSE_ALIGNMENT_COEF
+        cka_coefficient = matched_cka_coefficient(mse_norm, cka_norm)
         payload = {
             "calibration_protocol_version": CALIBRATION_PROTOCOL_VERSION,
             "task": task,
@@ -150,11 +168,17 @@ def run_cell(
             "linear_cka_gradient_norm": cka_norm,
             "ln_mse_cross_to_rl_ratio": mse_norm / rl_norm,
             "linear_cka_cross_to_rl_ratio": cka_norm / rl_norm,
-            "cell_matching_coef": coefficient,
+            "reference_distance": "ln_mse",
+            "reference_alignment_coef": REFERENCE_MSE_ALIGNMENT_COEF,
+            "target_distance": "linear_cka",
+            "ln_mse_alignment_coef": mse_coefficient,
+            "linear_cka_alignment_coef": cka_coefficient,
             "matched_ln_mse_cross_to_rl_ratio": (
-                REFERENCE_ALIGNMENT_COEF * mse_norm / rl_norm
+                mse_coefficient * mse_norm / rl_norm
             ),
-            "matched_linear_cka_cross_to_rl_ratio": coefficient * cka_norm / rl_norm,
+            "matched_linear_cka_cross_to_rl_ratio": (
+                cka_coefficient * cka_norm / rl_norm
+            ),
             "minibatch_measurements": measurements,
             "selection_uses_return": False,
         }
@@ -197,6 +221,10 @@ def main() -> None:
                 payload.get("pilot_seed") == args.pilot_seed,
                 payload.get("calibration_minibatches") == args.minibatches,
                 payload.get("minibatch_sampling") == "training_replay_buffer_random",
+                payload.get("reference_distance") == "ln_mse",
+                payload.get("reference_alignment_coef")
+                == REFERENCE_MSE_ALIGNMENT_COEF,
+                payload.get("target_distance") == "linear_cka",
             )
         )
 
@@ -249,7 +277,13 @@ def main() -> None:
         return
 
     cells = [json.loads((metrics / f"{task}.json").read_text()) for task in TASKS]
-    coefficients = {cell["task"]: cell["cell_matching_coef"] for cell in cells}
+    coefficients = {
+        cell["task"]: {
+            "c_to_a_mse": cell["ln_mse_alignment_coef"],
+            "c_to_a_cka": cell["linear_cka_alignment_coef"],
+        }
+        for cell in cells
+    }
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=REPO_ROOT,
@@ -268,7 +302,7 @@ def main() -> None:
         "selection_uses_return": False,
         "performance_fields_persisted": False,
         "reference_distance": "ln_mse",
-        "reference_alignment_coef": REFERENCE_ALIGNMENT_COEF,
+        "reference_alignment_coef": REFERENCE_MSE_ALIGNMENT_COEF,
         "target_distance": "linear_cka",
         "minibatch_sampling": "training_replay_buffer_random",
         "calibration_minibatches": args.minibatches,
@@ -276,10 +310,11 @@ def main() -> None:
         "task_alignment_coefs": coefficients,
         "cells": cells,
     }
-    destination = root / "cka_gradient_calibration.json"
+    destination = root / "alignment_gradient_calibration.json"
     destination.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     for task in TASKS:
-        print(f"lambda_CKA[{task}]: {coefficients[task]:.10g}")
+        print(f"lambda_MSE[{task}]: {coefficients[task]['c_to_a_mse']:.10g}")
+        print(f"lambda_CKA[{task}]: {coefficients[task]['c_to_a_cka']:.10g}")
     print(destination)
 
 

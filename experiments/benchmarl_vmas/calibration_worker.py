@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-GPU worker for VMAS CKA gradient calibration."""
+"""Single-GPU worker for VMAS MSE-to-CKA gradient calibration."""
 
 from __future__ import annotations
 

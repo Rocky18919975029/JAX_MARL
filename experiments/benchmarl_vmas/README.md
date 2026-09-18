@@ -10,9 +10,13 @@ This protocol runs exactly 36 MAPPO experiments:
 The implementation uses the official BenchMARL VMAS fine-tuned MAPPO settings:
 10M frames, 600 vectorized environments, 60k frames per rollout batch, 45
 minibatch passes, minibatches of 4096, a 256×256 Tanh MLP, and learning rate
-5e-5. The critic is centralized and parameter-shared. All three conditions use
-the same architecture; isolated training only sets the auxiliary coefficient to
-zero.
+5e-5. All three conditions use the same architecture.  The matched NPS protocol
+copies one initial actor into independent parameter sets, globally normalizes
+rollout advantages, conditions the shared centralized critic on agent identity,
+and freezes rollout-time critic latents for every PPO epoch.  Alignment is
+applied to the first hidden layer, leaving the second hidden layer as a
+nonlinear policy/value head.  Isolated training only sets the auxiliary
+coefficient to zero.
 
 The task objects are loaded directly from BenchMARL's official VMAS YAML files.
 This protocol does not override agent counts or any other environment option.
@@ -38,15 +42,16 @@ The integration targets BenchMARL 1.5.x, TorchRL 0.10–0.11, and VMAS >=1.3.4.
 
 ## 1. Task-specific gradient-scale calibration
 
-The CKA coefficient is selected without returns. One independent pilot seed uses
-the same initial rollout on all three tasks. For every task, eight minibatches
-are drawn through the exact replay-buffer sampling path used by training. Their
-RMS gradients determine one task-specific CKA coefficient that matches LN-MSE
-at coefficient 0.1. No coefficient is shared across tasks.
+Coefficients are selected without returns. LN-MSE retains the SMAX reference
+coefficient of 0.1. One independent pilot seed uses the same initial rollout
+protocol on all three tasks. For every task, eight minibatches are drawn through
+the exact replay-buffer sampling path used by training. Their RMS actor
+gradients set a task-specific CKA coefficient whose weighted actor gradient
+matches weighted LN-MSE. No coefficient is shared across tasks.
 
 ```bash
-export VMAS_ROOT="/home/data/zeshenghong/JaxMARL/benchmarl_vmas_nps_phase1"
-export VMAS_CAL_ROOT="$VMAS_ROOT/cka_gradient_calibration"
+export VMAS_ROOT="/home/data/zeshenghong/JaxMARL/benchmarl_vmas_nps_v2"
+export VMAS_CAL_ROOT="$VMAS_ROOT/alignment_gradient_calibration"
 
 mkdir -p "$VMAS_CAL_ROOT"
 
@@ -66,12 +71,12 @@ This launches all three conditions on all three tasks for seed 1 and 120k frames
 It exercises both auxiliary losses and task construction before formal training.
 
 ```bash
-export VMAS_CKA_CAL="$VMAS_CAL_ROOT/cka_gradient_calibration.json"
+export VMAS_ALIGNMENT_CAL="$VMAS_CAL_ROOT/alignment_gradient_calibration.json"
 export VMAS_SMOKE_ROOT="$VMAS_ROOT/smoke"
 
 python experiments/benchmarl_vmas/run_matrix.py \
   --run-root "$VMAS_SMOKE_ROOT" \
-  --cka-calibration "$VMAS_CKA_CAL" \
+  --alignment-calibration "$VMAS_ALIGNMENT_CAL" \
   --seeds 1 \
   --gpus 0,1,2,3 \
   --max-runs-per-gpu 1 \
@@ -101,7 +106,7 @@ mkdir -p "$VMAS_FORMAL_ROOT"
 
 nohup python experiments/benchmarl_vmas/run_matrix.py \
   --run-root "$VMAS_FORMAL_ROOT" \
-  --cka-calibration "$VMAS_CKA_CAL" \
+  --alignment-calibration "$VMAS_ALIGNMENT_CAL" \
   --tasks discovery,passage,football \
   --seeds 1-4 \
   --gpus 0,1,2,3 \
