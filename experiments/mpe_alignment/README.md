@@ -87,3 +87,36 @@ and vector PDF without querying W&B:
 python experiments/mpe_alignment/analyze.py \
   --run-root "$MPE_FORMAL_ROOT"
 ```
+
+## Exploratory Linear CKA coefficient sweep
+
+The dedicated sweep launcher runs only C→A Linear CKA. By default it evaluates
+`0.01x, 0.03x, 0.1x, 0.3x, 1x, 3x, 10x, 30x, 100x` the calibrated coefficient
+with seeds 1–4. This spans four orders of magnitude and produces 36 runs:
+
+```bash
+export MPE_SWEEP_ROOT="$MPE_ROOT/cka_lambda_sweep"
+
+nohup python experiments/mpe_alignment/run_cka_lambda_sweep.py \
+  --run-root "$MPE_SWEEP_ROOT" \
+  --cka-calibration "$MPE_CALIBRATION" \
+  --multipliers 0.01,0.03,0.1,0.3,1,3,10,30,100 \
+  --seeds 1-4 \
+  --gpus 0,1,2,3 \
+  --max-runs-per-gpu 3 \
+  --wandb-project jaxmarl-mpe-spread5-cka-lambda-sweep \
+  > "$MPE_SWEEP_ROOT/training.stdout" 2>&1 &
+```
+
+Monitor the 36 runs with:
+
+```bash
+watch -n 5 python experiments/mpe_alignment/monitor.py \
+  --run-root "$MPE_SWEEP_ROOT" \
+  --expected-runs 36
+```
+
+In W&B, group by `config.CKA_COEFFICIENT_MULTIPLIER` and plot `returns` against
+`env_step`. Any coefficient selected from these return curves is exploratory
+and must be evaluated on independent seeds before being used for a
+confirmatory claim.

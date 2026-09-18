@@ -17,7 +17,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--total-timesteps", type=int, default=10_000_000)
+    parser.add_argument("--expected-runs", type=int, default=12)
     args = parser.parse_args()
+    if args.expected_runs < 1 or args.total_timesteps < 1:
+        raise ValueError("expected-runs and total-timesteps must be positive")
     root = args.run_root.expanduser().resolve()
     rows = []
     for path in sorted((root / "status").glob("*.json")):
@@ -32,10 +35,11 @@ def main() -> None:
         state: sum(row[1] == state for row in rows)
         for state in ("COMPLETED", "RUNNING", "FAILED", "INITIALIZING")
     }
+    pending = max(0, args.expected_runs - len(rows))
     print(
         f"DONE={counts['COMPLETED']} RUNNING={counts['RUNNING']} "
         f"INITIALIZING={counts['INITIALIZING']} FAILED={counts['FAILED']} "
-        f"TOTAL={len(rows)} / 12\n"
+        f"PENDING={pending} TOTAL={len(rows)} / {args.expected_runs}\n"
     )
     for name, state, steps in rows:
         progress = min(1.0, steps / args.total_timesteps)

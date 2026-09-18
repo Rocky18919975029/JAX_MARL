@@ -11,6 +11,10 @@ from experiments.mpe_alignment.protocol import (
     load_cka_coefficient,
     matrix,
 )
+from experiments.mpe_alignment.run_cka_lambda_sweep import (
+    parse_multipliers,
+    sweep_matrix,
+)
 
 
 def test_matrix_is_twelve_nps_runs():
@@ -59,3 +63,29 @@ def test_calibration_artifact_is_strict(tmp_path):
 def test_non_positive_cka_coefficient_is_rejected():
     with pytest.raises(ValueError):
         matrix(cka_coefficient=0.0)
+
+
+def test_cka_lambda_sweep_spans_four_orders_and_four_seeds():
+    multipliers = (0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0)
+    runs = sweep_matrix(0.164058395, multipliers)
+    assert len(runs) == 36
+    assert len({run.name for run in runs}) == 36
+    assert {run.seed for run in runs} == set(DEFAULT_SEEDS)
+    assert {run.multiplier for run in runs} == set(multipliers)
+    assert sorted({run.coefficient for run in runs}) == pytest.approx(
+        sorted(0.164058395 * multiplier for multiplier in multipliers)
+    )
+
+
+def test_cka_sweep_multiplier_parser_is_strict():
+    assert parse_multipliers("0.01,0.1,1,10,100") == (
+        0.01,
+        0.1,
+        1.0,
+        10.0,
+        100.0,
+    )
+    with pytest.raises(Exception):
+        parse_multipliers("1,1")
+    with pytest.raises(Exception):
+        parse_multipliers("0,1")

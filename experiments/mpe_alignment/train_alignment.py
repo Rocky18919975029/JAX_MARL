@@ -68,6 +68,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-minibatches", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--wandb-project", default="jaxmarl-mpe-spread5-alignment")
+    parser.add_argument("--wandb-group", default="simple_spread_5-nps")
+    parser.add_argument("--protocol-version", default=PROTOCOL_VERSION)
+    parser.add_argument("--sweep-base-coefficient", type=float)
+    parser.add_argument("--sweep-multiplier", type=float)
     parser.add_argument(
         "--wandb-mode", choices=("online", "offline", "disabled"), default="online"
     )
@@ -87,6 +91,14 @@ def validate(args: argparse.Namespace) -> None:
         raise ValueError("num-envs must be divisible by num-minibatches")
     if args.total_timesteps < args.num_envs * args.num_steps:
         raise ValueError("total-timesteps must contain at least one rollout")
+    sweep_values = (args.sweep_base_coefficient, args.sweep_multiplier)
+    if any(value is not None for value in sweep_values):
+        if args.condition != "c_to_a_cka" or not all(
+            value is not None and value > 0 for value in sweep_values
+        ):
+            raise ValueError(
+                "sweep metadata requires positive base/multiplier on CKA runs"
+            )
 
 
 def build_config(args: argparse.Namespace, status_path: Path, metadata: dict) -> dict:
@@ -109,7 +121,10 @@ def build_config(args: argparse.Namespace, status_path: Path, metadata: dict) ->
         ALIGNMENT_COEF=args.alignment_coef,
         ALIGN_DISTANCE_EPS=1e-8,
         EXPERIMENT_CONDITION=args.condition,
-        PROTOCOL_VERSION=PROTOCOL_VERSION,
+        PROTOCOL_VERSION=args.protocol_version,
+        HYPERPARAMETER_SWEEP=args.sweep_multiplier is not None,
+        CKA_SWEEP_BASE_COEFFICIENT=args.sweep_base_coefficient,
+        CKA_COEFFICIENT_MULTIPLIER=args.sweep_multiplier,
         WANDB_MODE=args.wandb_mode,
         PROJECT=args.wandb_project,
         METRICS_JSONL=str(args.run_root / "metrics" / f"{args.run_name}.jsonl"),
@@ -126,7 +141,7 @@ def main() -> None:
     status_path = args.run_root / "status" / f"{args.run_name}.json"
     metadata = {
         "schema_version": 1,
-        "protocol_version": PROTOCOL_VERSION,
+        "protocol_version": args.protocol_version,
         "run_name": args.run_name,
         "task": args.task,
         "environment": "MPE_simple_spread_v3",
@@ -139,6 +154,9 @@ def main() -> None:
         "align_mode": args.align_mode,
         "align_distance": args.align_distance,
         "alignment_coefficient": args.alignment_coef,
+        "hyperparameter_sweep": args.sweep_multiplier is not None,
+        "cka_sweep_base_coefficient": args.sweep_base_coefficient,
+        "cka_coefficient_multiplier": args.sweep_multiplier,
         "total_timesteps": args.total_timesteps,
         "official_config": str(OFFICIAL_CONFIG.relative_to(REPO_ROOT)),
         "git_commit": git_commit(),
@@ -152,14 +170,14 @@ def main() -> None:
         run = wandb.init(
             project=args.wandb_project,
             name=args.run_name,
-            group="simple_spread_5-nps",
+            group=args.wandb_group,
             tags=[
                 "MPE",
                 "MAPPO",
                 "NPS",
                 "simple_spread_5",
                 args.condition,
-                PROTOCOL_VERSION,
+                args.protocol_version,
             ],
             config=config,
             mode=args.wandb_mode,
