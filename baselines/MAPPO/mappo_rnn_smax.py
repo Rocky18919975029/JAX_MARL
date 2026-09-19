@@ -155,6 +155,11 @@ def make_checkpoint_callback(config, run):
                     "ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES"
                 ],
                 "alignment_coef": config["ALIGNMENT_COEF"],
+                "oracle_latent_distortion": config[
+                    "ORACLE_LATENT_DISTORTION"
+                ],
+                "oracle_distortion_coef": config["ORACLE_DISTORTION_COEF"],
+                "oracle_fisher_ridge": config["ORACLE_FISHER_RIDGE"],
                 "align_target_shuffle": config["ALIGN_TARGET_SHUFFLE"],
                 "condition": config.get("EXPERIMENT_CONDITION", ""),
                 "matrix_profile": config.get("MATRIX_PROFILE", ""),
@@ -296,20 +301,25 @@ class ActorRNN(nn.Module):
             self.config["FC_DIM_SIZE"],
             kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
+            name="Dense_0",
         )(obs)
         embedding = nn.relu(embedding)
 
         rnn_in = (embedding, dones)
-        hidden, actor_latent = ScannedRNN()(hidden, rnn_in)
+        hidden, actor_latent = ScannedRNN(name="ScannedRNN_0")(hidden, rnn_in)
 
         actor_mean = nn.Dense(
             self.config["GRU_HIDDEN_DIM"],
             kernel_init=orthogonal(2),
             bias_init=constant(0.0),
+            name="Dense_1",
         )(actor_latent)
         actor_mean = nn.relu(actor_mean)
         actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+            name="Dense_2",
         )(actor_mean)
         unavail_actions = 1 - avail_actions
         action_logits = actor_mean - (unavail_actions * 1e10)
@@ -393,6 +403,132 @@ def vmapped_optimizer(tx):
 
 def tree_l2_norm(tree):
     return jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree.leaves(tree)))
+
+
+def complete_mc_return_to_go(reward, global_done, gamma):
+    """Return exact within-rollout MC returns and their validity mask.
+
+    The scan deliberately does not bootstrap at the rollout boundary.  A
+    transition is valid only when an episode termination is observed at or
+    after that transition inside the same rollout.  Consequently, the
+    unfinished suffix after the final observed termination is excluded from
+    the oracle objective.
+    """
+
+    reward = jax.lax.stop_gradient(reward)
+    global_done = jax.lax.stop_gradient(global_done.astype(bool))
+
+    def reverse_step(carry, transition):
+        next_return, future_has_terminal = carry
+        current_reward, current_done = transition
+        current_return = current_reward + gamma * (~current_done) * next_return
+        current_valid = current_done | future_has_terminal
+        return (current_return, current_valid), (current_return, current_valid)
+
+    initial = (jnp.zeros_like(reward[-1]), jnp.zeros_like(global_done[-1]))
+    _, (returns, valid) = jax.lax.scan(
+        reverse_step,
+        initial,
+        (reward, global_done),
+        reverse=True,
+    )
+    return jax.lax.stop_gradient(returns), jax.lax.stop_gradient(valid)
+
+
+def categorical_latent_score(
+    actor_latent,
+    action,
+    avail_actions,
+    policy_hidden_params,
+    policy_logits_params,
+):
+    """Compute d log pi(a|z) / dz exactly for the two-layer policy head.
+
+    This analytic expression is equivalent to differentiating the Categorical
+    log probability with respect to ``actor_latent``.  Keeping it as ordinary
+    JAX operations makes the outer derivative of the oracle distortion both
+    explicit and substantially cheaper than nesting reverse-mode transforms.
+    """
+
+    hidden_pre = (
+        actor_latent @ policy_hidden_params["kernel"]
+        + policy_hidden_params["bias"]
+    )
+    hidden = jax.nn.relu(hidden_pre)
+    logits = hidden @ policy_logits_params["kernel"] + policy_logits_params["bias"]
+    logits = logits - (1 - avail_actions) * 1e10
+    probabilities = jax.nn.softmax(logits, axis=-1)
+    logit_score = jax.nn.one_hot(action, logits.shape[-1]) - probabilities
+    hidden_score = logit_score @ policy_logits_params["kernel"].T
+    hidden_pre_score = hidden_score * (hidden_pre > 0).astype(hidden_score.dtype)
+    return hidden_pre_score @ policy_hidden_params["kernel"].T
+
+
+def oracle_latent_distortion(
+    scores,
+    reference_advantage,
+    critic_advantage,
+    mask,
+    fisher_ridge,
+):
+    """Compute sum_i (g_ref-g_gae)^T (F_i+xi I)^-1 (g_ref-g_gae).
+
+    Inputs use the leading agent axis.  Both scalar learning signals are
+    explicitly stop-gradient quantities; the objective differentiates only
+    through the current actor latent scores (and therefore only into actor
+    parameters).  ``reference_advantage`` is the baseline-free, complete MC
+    return-to-go used as the policy-gradient reference signal.
+    """
+
+    reference_advantage = jax.lax.stop_gradient(reference_advantage)
+    critic_advantage = jax.lax.stop_gradient(critic_advantage)
+    mask = jax.lax.stop_gradient(mask.astype(scores.dtype))
+
+    def per_agent(agent_scores, agent_reference, agent_critic, agent_mask):
+        flat_scores = agent_scores.reshape((-1, agent_scores.shape[-1]))
+        flat_reference = agent_reference.reshape((-1,))
+        flat_critic = agent_critic.reshape((-1,))
+        flat_mask = agent_mask.reshape((-1,))
+        count = flat_mask.sum()
+        denominator = jnp.maximum(count, 1.0)
+        weighted_scores = flat_scores * flat_mask[:, None]
+        g_reference = (
+            weighted_scores * flat_reference[:, None]
+        ).sum(axis=0) / denominator
+        g_critic = (
+            weighted_scores * flat_critic[:, None]
+        ).sum(axis=0) / denominator
+        fisher = weighted_scores.T @ flat_scores / denominator
+        fisher = 0.5 * (fisher + fisher.T)
+        delta = g_reference - g_critic
+        ridge_matrix = fisher + fisher_ridge * jnp.eye(
+            fisher.shape[0], dtype=fisher.dtype
+        )
+        solution = jnp.linalg.solve(ridge_matrix, delta)
+        distortion = jnp.maximum(delta @ solution, 0.0)
+        distortion = jnp.where(count > 0, distortion, 0.0)
+        return distortion, count, g_reference, g_critic
+
+    distortion, count, g_reference, g_critic = jax.vmap(per_agent)(
+        scores,
+        reference_advantage,
+        critic_advantage,
+        mask,
+    )
+    reference_norm = jnp.sqrt(jnp.square(g_reference).sum())
+    critic_norm = jnp.sqrt(jnp.square(g_critic).sum())
+    cosine_denominator = jnp.maximum(reference_norm * critic_norm, 1e-12)
+    return {
+        "epsilon_lat": distortion.sum(),
+        "epsilon_lat_per_agent": distortion,
+        "valid_samples": count.sum(),
+        "valid_samples_per_agent": count,
+        "reference_gradient_norm": reference_norm,
+        "critic_gradient_norm": critic_norm,
+        "reference_critic_gradient_cosine": (
+            (g_reference * g_critic).sum() / cosine_denominator
+        ),
+    }
 
 
 def normalize_latent_samples(latent):
@@ -710,6 +846,9 @@ def make_train(
     config.setdefault("ALIGN_CONTAINMENT_GROUP_BY_UNIT_TYPE", True)
     config.setdefault("ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES", 64)
     config.setdefault("ALIGN_GRADIENT_CALIBRATION", False)
+    config.setdefault("ORACLE_LATENT_DISTORTION", False)
+    config.setdefault("ORACLE_DISTORTION_COEF", 0.0)
+    config.setdefault("ORACLE_FISHER_RIDGE", 1e-3)
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
@@ -741,6 +880,32 @@ def make_train(
         raise ValueError("ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES must be at least 2.")
     if config["ALIGN_MODE"] != "none" and not config["MATCHED_COMPARISON"]:
         raise ValueError("Representation alignment requires MATCHED_COMPARISON=true.")
+    if float(config["ORACLE_DISTORTION_COEF"]) < 0:
+        raise ValueError("ORACLE_DISTORTION_COEF must be nonnegative.")
+    if float(config["ORACLE_FISHER_RIDGE"]) <= 0:
+        raise ValueError("ORACLE_FISHER_RIDGE must be positive.")
+    if config["ORACLE_LATENT_DISTORTION"]:
+        if not config["MATCHED_COMPARISON"]:
+            raise ValueError(
+                "Oracle latent-distortion training requires MATCHED_COMPARISON=true."
+            )
+        if config["ACTOR_PARAMETER_SHARING"]:
+            raise ValueError(
+                "The oracle protocol is defined for independent (NPS) actors."
+            )
+        if config["ALIGN_MODE"] != "none":
+            raise ValueError(
+                "Oracle latent distortion and representation alignment are mutually "
+                "exclusive experimental conditions."
+            )
+        if float(config["ORACLE_DISTORTION_COEF"]) <= 0:
+            raise ValueError(
+                "Oracle training requires ORACLE_DISTORTION_COEF > 0."
+            )
+    elif float(config["ORACLE_DISTORTION_COEF"]) != 0:
+        raise ValueError(
+            "ORACLE_DISTORTION_COEF must be zero when the oracle objective is disabled."
+        )
     if config["ALIGN_MODE"] == "none" and config["ALIGN_DISTANCE"] != "ln_mse":
         raise ValueError(
             "ALIGN_MODE=none must use ALIGN_DISTANCE=ln_mse so the distance-free "
@@ -1140,14 +1305,31 @@ def make_train(
                 return advantages, advantages + traj_batch.value
 
             advantages, targets = _calculate_gae(traj_batch, last_val)
+            # The oracle reference never bootstraps at the rollout boundary.
+            # Only transitions whose episode termination is observed within
+            # this rollout are retained by reference_valid.
+            reference_advantages, reference_valid = complete_mc_return_to_go(
+                traj_batch.reward,
+                traj_batch.global_done,
+                config["GAMMA"],
+            )
+            advantages = jax.lax.stop_gradient(advantages)
+            reference_advantages = jax.lax.stop_gradient(reference_advantages)
+            reference_valid = jax.lax.stop_gradient(reference_valid)
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_states, batch_info):
                     actor_train_state, critic_train_state = train_states
-                    ac_init_hstate, cr_init_hstate, traj_batch, advantages, targets = (
-                        batch_info
-                    )
+                    (
+                        ac_init_hstate,
+                        cr_init_hstate,
+                        traj_batch,
+                        advantages,
+                        targets,
+                        reference_advantages,
+                        reference_valid,
+                    ) = batch_info
 
                     def _actor_loss_fn(actor_params, init_hstate, traj_batch, gae):
                         # RERUN NETWORK
@@ -1182,6 +1364,18 @@ def make_train(
 
                         actor_loss = loss_actor - config["ENT_COEF"] * entropy
 
+                        if config["ORACLE_LATENT_DISTORTION"]:
+                            policy_params = actor_params["params"]
+                            actor_score = categorical_latent_score(
+                                actor_latent,
+                                traj_batch.action,
+                                traj_batch.avail_actions,
+                                policy_params["Dense_1"],
+                                policy_params["Dense_2"],
+                            )
+                        else:
+                            actor_score = jnp.zeros_like(actor_latent)
+
                         return actor_loss, (
                             loss_actor,
                             entropy,
@@ -1189,6 +1383,7 @@ def make_train(
                             approx_kl,
                             clip_frac,
                             actor_latent,
+                            actor_score,
                         )
 
                     def _critic_loss_fn(
@@ -1373,10 +1568,43 @@ def make_train(
                             alignment_objective = (
                                 actor_alignment + critic_alignment + joint_alignment
                             )
+                            oracle_zero = jnp.zeros((), dtype=actor_latent.dtype)
+                            oracle_statistics = {
+                                "epsilon_lat": oracle_zero,
+                                "epsilon_lat_per_agent": jnp.zeros(
+                                    (env.num_agents,), dtype=actor_latent.dtype
+                                ),
+                                "valid_samples": oracle_zero,
+                                "valid_samples_per_agent": jnp.zeros(
+                                    (env.num_agents,), dtype=actor_latent.dtype
+                                ),
+                                "reference_gradient_norm": oracle_zero,
+                                "critic_gradient_norm": oracle_zero,
+                                "reference_critic_gradient_cosine": oracle_zero,
+                            }
+                            if config["ORACLE_LATENT_DISTORTION"]:
+                                oracle_scores = actor_aux[6]
+                                oracle_reference = split_agents(
+                                    reference_advantages
+                                )
+                                oracle_critic = split_agents(advantages)
+                                oracle_mask = split_agents(
+                                    traj_batch.alive_mask & reference_valid
+                                )
+                                oracle_statistics = oracle_latent_distortion(
+                                    oracle_scores,
+                                    oracle_reference,
+                                    oracle_critic,
+                                    oracle_mask,
+                                    config["ORACLE_FISHER_RIDGE"],
+                                )
                             total_loss = (
                                 actor_losses.mean()
                                 + critic_rl_loss
                                 + config["ALIGNMENT_COEF"] * alignment_objective
+                                + config["ORACLE_DISTORTION_COEF"]
+                                * oracle_statistics["epsilon_lat"]
+                                / env.num_agents
                             )
                             return total_loss, (
                                 actor_losses,
@@ -1390,6 +1618,7 @@ def make_train(
                                 critic_alignment,
                                 joint_alignment,
                                 containment_statistics,
+                                oracle_statistics,
                             )
 
                         (
@@ -1405,8 +1634,11 @@ def make_train(
                         )
 
                         if (
-                            config["ALIGN_MODE"] == "none"
-                            or config["ALIGNMENT_COEF"] == 0
+                            (
+                                config["ALIGN_MODE"] == "none"
+                                or config["ALIGNMENT_COEF"] == 0
+                            )
+                            and not config["ORACLE_LATENT_DISTORTION"]
                         ):
                             actor_cross_grads = jax.tree.map(
                                 jnp.zeros_like, actor_grads
@@ -1420,8 +1652,12 @@ def make_train(
                                 _, auxiliary = matched_total_loss(
                                     actor_params, critic_params
                                 )
-                                return config["ALIGNMENT_COEF"] * (
-                                    auxiliary[7] + auxiliary[8] + auxiliary[9]
+                                return (
+                                    config["ALIGNMENT_COEF"]
+                                    * (auxiliary[7] + auxiliary[8] + auxiliary[9])
+                                    + config["ORACLE_DISTORTION_COEF"]
+                                    * auxiliary[11]["epsilon_lat"]
+                                    / env.num_agents
                                 )
 
                             actor_cross_grads, critic_cross_grads = jax.grad(
@@ -1499,6 +1735,7 @@ def make_train(
                         critic_alignment_loss = matched_aux[8]
                         joint_alignment_loss = matched_aux[9]
                         containment_statistics = matched_aux[10]
+                        oracle_statistics = matched_aux[11]
                     elif config["ACTOR_PARAMETER_SHARING"]:
                         actor_loss, actor_grads = actor_grad_fn(
                             actor_train_state.params,
@@ -1527,6 +1764,19 @@ def make_train(
                             "source_effective_rank": zero,
                             "valid_samples": zero,
                             "valid_groups": zero,
+                        }
+                        oracle_statistics = {
+                            "epsilon_lat": zero,
+                            "epsilon_lat_per_agent": jnp.zeros(
+                                (env.num_agents,), dtype=zero.dtype
+                            ),
+                            "valid_samples": zero,
+                            "valid_samples_per_agent": jnp.zeros(
+                                (env.num_agents,), dtype=zero.dtype
+                            ),
+                            "reference_gradient_norm": zero,
+                            "critic_gradient_norm": zero,
+                            "reference_critic_gradient_cosine": zero,
                         }
                         actor_cross_grads = jax.tree.map(jnp.zeros_like, actor_grads)
                         critic_cross_grads = jax.tree.map(jnp.zeros_like, critic_grads)
@@ -1563,6 +1813,19 @@ def make_train(
                             "source_effective_rank": zero,
                             "valid_samples": zero,
                             "valid_groups": zero,
+                        }
+                        oracle_statistics = {
+                            "epsilon_lat": zero,
+                            "epsilon_lat_per_agent": jnp.zeros(
+                                (env.num_agents,), dtype=zero.dtype
+                            ),
+                            "valid_samples": zero,
+                            "valid_samples_per_agent": jnp.zeros(
+                                (env.num_agents,), dtype=zero.dtype
+                            ),
+                            "reference_gradient_norm": zero,
+                            "critic_gradient_norm": zero,
+                            "reference_critic_gradient_cosine": zero,
                         }
                         actor_cross_grads = jax.tree.map(jnp.zeros_like, actor_grads)
                         critic_cross_grads = jax.tree.map(jnp.zeros_like, critic_grads)
@@ -1657,6 +1920,21 @@ def make_train(
                             + critic_alignment_loss
                             + joint_alignment_loss
                         ),
+                        "oracle_epsilon_lat": oracle_statistics["epsilon_lat"],
+                        "oracle_objective_weighted": config[
+                            "ORACLE_DISTORTION_COEF"
+                        ]
+                        * oracle_statistics["epsilon_lat"],
+                        "oracle_valid_samples": oracle_statistics["valid_samples"],
+                        "oracle_reference_gradient_norm": oracle_statistics[
+                            "reference_gradient_norm"
+                        ],
+                        "oracle_critic_gradient_norm": oracle_statistics[
+                            "critic_gradient_norm"
+                        ],
+                        "oracle_reference_critic_gradient_cosine": oracle_statistics[
+                            "reference_critic_gradient_cosine"
+                        ],
                         "containment_similarity": containment_statistics[
                             "similarity"
                         ],
@@ -1677,6 +1955,19 @@ def make_train(
                             actor_cross_grad_norms
                             / jnp.maximum(actor_rl_grad_norms, 1e-12)
                         ).mean(),
+                        "oracle_actor_grad_norm_mean": jnp.where(
+                            config["ORACLE_LATENT_DISTORTION"],
+                            actor_cross_grad_norms.mean(),
+                            0.0,
+                        ),
+                        "oracle_actor_to_rl_grad_ratio_mean": jnp.where(
+                            config["ORACLE_LATENT_DISTORTION"],
+                            (
+                                actor_cross_grad_norms
+                                / jnp.maximum(actor_rl_grad_norms, 1e-12)
+                            ).mean(),
+                            0.0,
+                        ),
                         "actor_grad_norm_mean": actor_grad_norms.mean(),
                         "actor_grad_norm_max": actor_grad_norms.max(),
                         "actor_grad_norm_after_clip_mean": (
@@ -1747,6 +2038,12 @@ def make_train(
                             loss_info[f"advantage_std_agent_{agent_idx}"] = (
                                 agent_advantages.std()
                             )
+                            loss_info[f"oracle_epsilon_lat_agent_{agent_idx}"] = (
+                                oracle_statistics["epsilon_lat_per_agent"][agent_idx]
+                            )
+                            loss_info[f"oracle_valid_samples_agent_{agent_idx}"] = (
+                                oracle_statistics["valid_samples_per_agent"][agent_idx]
+                            )
 
                     return (actor_train_state, critic_train_state), loss_info
 
@@ -1756,6 +2053,8 @@ def make_train(
                     traj_batch,
                     advantages,
                     targets,
+                    reference_advantages,
+                    reference_valid,
                     rng,
                 ) = update_state
                 rng, _rng = jax.random.split(rng)
@@ -1771,6 +2070,8 @@ def make_train(
                     traj_batch,
                     advantages.squeeze(),
                     targets.squeeze(),
+                    reference_advantages.squeeze(),
+                    reference_valid.squeeze(),
                 )
                 if (
                     config["ACTOR_PARAMETER_SHARING"]
@@ -1840,6 +2141,8 @@ def make_train(
                     traj_batch,
                     advantages,
                     targets,
+                    reference_advantages,
+                    reference_valid,
                     rng,
                 )
                 return update_state, loss_info
@@ -1850,6 +2153,8 @@ def make_train(
                 traj_batch,
                 advantages,
                 targets,
+                reference_advantages,
+                reference_valid,
                 rng,
             )
             update_state, loss_info = jax.lax.scan(
@@ -1985,6 +2290,9 @@ def main(config):
     config.setdefault("ALIGN_DISTANCE", "ln_mse")
     config.setdefault("ALIGN_DISTANCE_EPS", 1e-8)
     config.setdefault("ALIGN_GRADIENT_CALIBRATION", False)
+    config.setdefault("ORACLE_LATENT_DISTORTION", False)
+    config.setdefault("ORACLE_DISTORTION_COEF", 0.0)
+    config.setdefault("ORACLE_FISHER_RIDGE", 1e-3)
     config.setdefault("METRICS_JSONL", "")
     if not config.get("GIT_COMMIT"):
         try:
@@ -1997,7 +2305,9 @@ def main(config):
         except (OSError, subprocess.CalledProcessError):
             config["GIT_COMMIT"] = "unknown"
     condition = config["ALIGN_MODE"]
-    if config["ALIGN_TARGET_SHUFFLE"]:
+    if config["ORACLE_LATENT_DISTORTION"]:
+        condition = "oracle_latent_distortion"
+    elif config["ALIGN_TARGET_SHUFFLE"]:
         condition = f"{condition}_shuffled"
     elif config["ALIGN_DISTANCE"] == "linear_cka" and condition != "none":
         condition = f"{condition}_cka"
