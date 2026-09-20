@@ -160,6 +160,15 @@ def make_checkpoint_callback(config, run):
                 ],
                 "oracle_distortion_coef": config["ORACLE_DISTORTION_COEF"],
                 "oracle_fisher_ridge": config["ORACLE_FISHER_RIDGE"],
+                "oracle_reference_multiplier": config[
+                    "ORACLE_REFERENCE_MULTIPLIER"
+                ],
+                "oracle_reference_horizon": config[
+                    "ORACLE_REFERENCE_HORIZON"
+                ],
+                "oracle_reference_baseline": config[
+                    "ORACLE_REFERENCE_BASELINE"
+                ],
                 "align_target_shuffle": config["ALIGN_TARGET_SHUFFLE"],
                 "condition": config.get("EXPERIMENT_CONDITION", ""),
                 "matrix_profile": config.get("MATRIX_PROFILE", ""),
@@ -376,6 +385,20 @@ class Transition(NamedTuple):
     avail_actions: jnp.ndarray
 
 
+class OracleReferenceTransition(NamedTuple):
+    """Compact transition stored for the independent oracle rollout."""
+
+    global_done: jnp.ndarray
+    done: jnp.ndarray
+    action: jnp.ndarray
+    reward: jnp.ndarray
+    baseline: jnp.ndarray
+    log_prob: jnp.ndarray
+    obs: jnp.ndarray
+    alive_mask: jnp.ndarray
+    avail_actions: jnp.ndarray
+
+
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
     # print('batchify', x.shape)
@@ -465,55 +488,126 @@ def categorical_latent_score(
 
 
 def oracle_latent_distortion(
-    scores,
+    reference_scores,
     reference_advantage,
+    reference_return,
+    reference_mask,
+    reference_importance_weight,
+    critic_scores,
     critic_advantage,
-    mask,
+    critic_mask,
+    critic_importance_weight,
     fisher_ridge,
 ):
-    """Compute sum_i (g_ref-g_gae)^T (F_i+xi I)^-1 (g_ref-g_gae).
+    """Compare a large independent MC reference with the PPO minibatch GAE.
 
-    Inputs use the leading agent axis.  Both scalar learning signals are
-    explicitly stop-gradient quantities; the objective differentiates only
-    through the current actor latent scores (and therefore only into actor
-    parameters).  ``reference_advantage`` is the baseline-free, complete MC
-    return-to-go used as the policy-gradient reference signal.
+    Reference and critic samples are deliberately separate and may have
+    different time/batch dimensions after the leading agent axis.  The
+    reference Fisher is estimated only from the larger independent rollout.
+    All returns/advantages/masks are stop-gradient; gradients flow through the
+    current actor latent scores and importance ratios only.
     """
 
     reference_advantage = jax.lax.stop_gradient(reference_advantage)
+    reference_return = jax.lax.stop_gradient(reference_return)
+    reference_mask = jax.lax.stop_gradient(
+        reference_mask.astype(reference_scores.dtype)
+    )
     critic_advantage = jax.lax.stop_gradient(critic_advantage)
-    mask = jax.lax.stop_gradient(mask.astype(scores.dtype))
+    critic_mask = jax.lax.stop_gradient(critic_mask.astype(critic_scores.dtype))
 
-    def per_agent(agent_scores, agent_reference, agent_critic, agent_mask):
-        flat_scores = agent_scores.reshape((-1, agent_scores.shape[-1]))
+    def per_agent(
+        agent_reference_scores,
+        agent_reference,
+        agent_return,
+        agent_reference_mask,
+        agent_reference_weight,
+        agent_critic_scores,
+        agent_critic,
+        agent_critic_mask,
+        agent_critic_weight,
+    ):
+        flat_reference_scores = agent_reference_scores.reshape(
+            (-1, agent_reference_scores.shape[-1])
+        )
         flat_reference = agent_reference.reshape((-1,))
-        flat_critic = agent_critic.reshape((-1,))
-        flat_mask = agent_mask.reshape((-1,))
-        count = flat_mask.sum()
-        denominator = jnp.maximum(count, 1.0)
-        weighted_scores = flat_scores * flat_mask[:, None]
+        flat_return = agent_return.reshape((-1,))
+        flat_reference_mask = agent_reference_mask.reshape((-1,))
+        flat_reference_weight = agent_reference_weight.reshape((-1,))
+        reference_count = flat_reference_mask.sum()
+        reference_denominator = jnp.maximum(reference_count, 1.0)
+        weighted_reference_scores = flat_reference_scores * (
+            flat_reference_mask * flat_reference_weight
+        )[:, None]
         g_reference = (
-            weighted_scores * flat_reference[:, None]
-        ).sum(axis=0) / denominator
-        g_critic = (
-            weighted_scores * flat_critic[:, None]
-        ).sum(axis=0) / denominator
-        fisher = weighted_scores.T @ flat_scores / denominator
+            weighted_reference_scores * flat_reference[:, None]
+        ).sum(axis=0) / reference_denominator
+        fisher = (
+            weighted_reference_scores.T @ flat_reference_scores
+            / reference_denominator
+        )
         fisher = 0.5 * (fisher + fisher.T)
+
+        flat_critic_scores = agent_critic_scores.reshape(
+            (-1, agent_critic_scores.shape[-1])
+        )
+        flat_critic = agent_critic.reshape((-1,))
+        flat_critic_mask = agent_critic_mask.reshape((-1,))
+        flat_critic_weight = agent_critic_weight.reshape((-1,))
+        critic_count = flat_critic_mask.sum()
+        critic_denominator = jnp.maximum(critic_count, 1.0)
+        weighted_critic_scores = flat_critic_scores * (
+            flat_critic_mask * flat_critic_weight
+        )[:, None]
+        g_critic = (
+            weighted_critic_scores * flat_critic[:, None]
+        ).sum(axis=0) / critic_denominator
+
         delta = g_reference - g_critic
         ridge_matrix = fisher + fisher_ridge * jnp.eye(
             fisher.shape[0], dtype=fisher.dtype
         )
         solution = jnp.linalg.solve(ridge_matrix, delta)
         distortion = jnp.maximum(delta @ solution, 0.0)
-        distortion = jnp.where(count > 0, distortion, 0.0)
-        return distortion, count, g_reference, g_critic
+        distortion = jnp.where(
+            (reference_count > 0) & (critic_count > 0), distortion, 0.0
+        )
 
-    distortion, count, g_reference, g_critic = jax.vmap(per_agent)(
-        scores,
+        def masked_std(values):
+            mean = (values * flat_reference_mask).sum() / reference_denominator
+            variance = (
+                jnp.square(values - mean) * flat_reference_mask
+            ).sum() / reference_denominator
+            return jnp.sqrt(jnp.maximum(variance, 0.0))
+
+        return (
+            distortion,
+            reference_count,
+            critic_count,
+            g_reference,
+            g_critic,
+            masked_std(flat_return),
+            masked_std(flat_reference),
+        )
+
+    (
+        distortion,
+        reference_count,
+        critic_count,
+        g_reference,
+        g_critic,
+        reference_return_std,
+        reference_advantage_std,
+    ) = jax.vmap(per_agent)(
+        reference_scores,
         reference_advantage,
+        reference_return,
+        reference_mask,
+        reference_importance_weight,
+        critic_scores,
         critic_advantage,
-        mask,
+        critic_mask,
+        critic_importance_weight,
     )
     reference_norm = jnp.sqrt(jnp.square(g_reference).sum())
     critic_norm = jnp.sqrt(jnp.square(g_critic).sum())
@@ -521,13 +615,25 @@ def oracle_latent_distortion(
     return {
         "epsilon_lat": distortion.sum(),
         "epsilon_lat_per_agent": distortion,
-        "valid_samples": count.sum(),
-        "valid_samples_per_agent": count,
+        "valid_samples": reference_count.sum(),
+        "valid_samples_per_agent": reference_count,
+        "reference_valid_samples": reference_count.sum(),
+        "reference_valid_samples_per_agent": reference_count,
+        "critic_valid_samples": critic_count.sum(),
+        "critic_valid_samples_per_agent": critic_count,
+        "reference_to_critic_sample_ratio": (
+            reference_count.sum() / jnp.maximum(critic_count.sum(), 1.0)
+        ),
         "reference_gradient_norm": reference_norm,
         "critic_gradient_norm": critic_norm,
         "reference_critic_gradient_cosine": (
             (g_reference * g_critic).sum() / cosine_denominator
         ),
+        "reference_mc_return_std": reference_return_std.mean(),
+        "reference_baselined_advantage_std": reference_advantage_std.mean(),
+        "reference_baseline_variance_reduction": 1.0
+        - jnp.square(reference_advantage_std.mean())
+        / jnp.maximum(jnp.square(reference_return_std.mean()), 1e-12),
     }
 
 
@@ -849,8 +955,15 @@ def make_train(
     config.setdefault("ORACLE_LATENT_DISTORTION", False)
     config.setdefault("ORACLE_DISTORTION_COEF", 0.0)
     config.setdefault("ORACLE_FISHER_RIDGE", 1e-3)
+    config.setdefault("ORACLE_REFERENCE_MULTIPLIER", 4)
+    config.setdefault("ORACLE_REFERENCE_BASELINE", "frozen_critic")
+    config.setdefault("ORACLE_REFERENCE_SEED_OFFSET", 900_000)
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
+    config["ORACLE_REFERENCE_HORIZON"] = (
+        int(config["ORACLE_REFERENCE_MULTIPLIER"]) * int(config["NUM_STEPS"])
+        + int(env.max_steps)
+    )
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -884,6 +997,14 @@ def make_train(
         raise ValueError("ORACLE_DISTORTION_COEF must be nonnegative.")
     if float(config["ORACLE_FISHER_RIDGE"]) <= 0:
         raise ValueError("ORACLE_FISHER_RIDGE must be positive.")
+    if int(config["ORACLE_REFERENCE_MULTIPLIER"]) < 2:
+        raise ValueError("ORACLE_REFERENCE_MULTIPLIER must be at least 2.")
+    if config["ORACLE_REFERENCE_BASELINE"] not in {"frozen_critic", "zero"}:
+        raise ValueError(
+            "ORACLE_REFERENCE_BASELINE must be 'frozen_critic' or 'zero'."
+        )
+    if int(config["ORACLE_REFERENCE_SEED_OFFSET"]) <= 0:
+        raise ValueError("ORACLE_REFERENCE_SEED_OFFSET must be positive.")
     if config["ORACLE_LATENT_DISTORTION"]:
         if not config["MATCHED_COMPARISON"]:
             raise ValueError(
@@ -1077,6 +1198,154 @@ def make_train(
         cr_init_hstate = ScannedRNN.initialize_carry(
             config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"]
         )
+
+        def collect_oracle_reference(train_states, reference_rng):
+            """Collect a fresh, independent, high-sample reference rollout.
+
+            The actor and critic parameters are frozen at the beginning of the
+            PPO update.  The horizon guarantees at least
+            ``ORACLE_REFERENCE_MULTIPLIER * NUM_STEPS`` complete transitions
+            per environment: an unfinished suffix is shorter than
+            ``env.max_steps + 1`` and is removed below.
+            """
+
+            actor_train_state, critic_train_state = train_states
+            reference_rng, reset_key = jax.random.split(reference_rng)
+            reset_rngs = jax.random.split(reset_key, config["NUM_ENVS"])
+            reference_obs, reference_env_state = jax.vmap(
+                env.reset, in_axes=(0,)
+            )(reset_rngs)
+            reference_actor_hstate = ScannedRNN.initialize_carry(
+                config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"]
+            )
+            reference_critic_hstate = ScannedRNN.initialize_carry(
+                config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"]
+            )
+            reference_initial_actor_hstate = reference_actor_hstate
+            reference_last_done = jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
+
+            def reference_env_step(reference_state, unused):
+                (
+                    reference_env_state,
+                    last_obs,
+                    last_done,
+                    actor_hstate,
+                    critic_hstate,
+                    step_rng,
+                ) = reference_state
+
+                step_rng, action_key = jax.random.split(step_rng)
+                avail_actions = jax.vmap(env.get_avail_actions)(
+                    reference_env_state.env_state
+                )
+                avail_actions = jax.lax.stop_gradient(
+                    batchify(avail_actions, env.agents, config["NUM_ACTORS"])
+                )
+                obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+                actor_hstate_by_agent = actor_hstate.reshape(
+                    (
+                        env.num_agents,
+                        config["NUM_ENVS"],
+                        config["GRU_HIDDEN_DIM"],
+                    )
+                )
+                actor_inputs = (
+                    obs_batch.reshape((env.num_agents, config["NUM_ENVS"], -1))[
+                        :, None, ...
+                    ],
+                    last_done.reshape((env.num_agents, config["NUM_ENVS"]))[
+                        :, None, ...
+                    ],
+                    avail_actions.reshape((env.num_agents, config["NUM_ENVS"], -1)),
+                )
+                actor_rngs = jax.random.split(action_key, env.num_agents)
+
+                def apply_and_sample(params, hidden, inputs, sample_rng):
+                    hidden, pi, _ = actor_network.apply(params, hidden, inputs)
+                    action = pi.sample(seed=sample_rng)
+                    return hidden, action, pi.log_prob(action)
+
+                actor_hstate, action, log_prob = jax.vmap(
+                    apply_and_sample,
+                    in_axes=(0, 0, 0, 0),
+                )(
+                    actor_train_state.params,
+                    actor_hstate_by_agent,
+                    actor_inputs,
+                    actor_rngs,
+                )
+                action = action.reshape((1, config["NUM_ACTORS"]))
+                log_prob = log_prob.reshape((1, config["NUM_ACTORS"]))
+                actor_hstate = actor_hstate.reshape(
+                    (config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+                )
+
+                world_state = last_obs["world_state"].swapaxes(0, 1).reshape(
+                    (config["NUM_ACTORS"], -1)
+                )
+                critic_hstate, baseline_value, _ = critic_network.apply(
+                    critic_train_state.params,
+                    critic_hstate,
+                    (world_state[None, :], last_done[None, :]),
+                )
+                baseline_value = baseline_value.squeeze()
+                if config["ORACLE_REFERENCE_BASELINE"] == "zero":
+                    baseline_value = jnp.zeros_like(baseline_value)
+
+                env_action = unbatchify(
+                    action, env.agents, config["NUM_ENVS"], env.num_agents
+                )
+                env_action = {key: value.squeeze() for key, value in env_action.items()}
+                step_rng, environment_key = jax.random.split(step_rng)
+                environment_rngs = jax.random.split(
+                    environment_key, config["NUM_ENVS"]
+                )
+                next_obs, next_env_state, reward, done, _ = jax.vmap(
+                    env.step, in_axes=(0, 0, 0)
+                )(environment_rngs, reference_env_state, env_action)
+                done_batch = batchify(
+                    done, env.agents, config["NUM_ACTORS"]
+                ).squeeze()
+                alive_mask = jnp.sum(avail_actions, axis=-1) > 1
+                transition = OracleReferenceTransition(
+                    jnp.tile(done["__all__"], env.num_agents),
+                    last_done,
+                    action.squeeze(),
+                    batchify(
+                        reward, env.agents, config["NUM_ACTORS"]
+                    ).squeeze(),
+                    baseline_value,
+                    log_prob.squeeze(),
+                    obs_batch,
+                    alive_mask,
+                    avail_actions,
+                )
+                next_state = (
+                    next_env_state,
+                    next_obs,
+                    done_batch,
+                    actor_hstate,
+                    critic_hstate,
+                    step_rng,
+                )
+                return next_state, transition
+
+            reference_state = (
+                reference_env_state,
+                reference_obs,
+                reference_last_done,
+                reference_actor_hstate,
+                reference_critic_hstate,
+                reference_rng,
+            )
+            _, reference_traj = jax.lax.scan(
+                reference_env_step,
+                reference_state,
+                None,
+                config["ORACLE_REFERENCE_HORIZON"],
+            )
+            reference_traj = jax.tree.map(jax.lax.stop_gradient, reference_traj)
+            return reference_initial_actor_hstate, reference_traj
 
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
@@ -1305,15 +1574,52 @@ def make_train(
                 return advantages, advantages + traj_batch.value
 
             advantages, targets = _calculate_gae(traj_batch, last_val)
-            # The oracle reference never bootstraps at the rollout boundary.
-            # Only transitions whose episode termination is observed within
-            # this rollout are retained by reference_valid.
-            reference_advantages, reference_valid = complete_mc_return_to_go(
-                traj_batch.reward,
-                traj_batch.global_done,
-                config["GAMMA"],
-            )
             advantages = jax.lax.stop_gradient(advantages)
+
+            if config["ORACLE_LATENT_DISTORTION"]:
+                # Derive an independent deterministic stream without consuming
+                # the PPO runner RNG.  Matched baseline and oracle runs therefore
+                # keep the same PPO sampling stream until their policies diverge.
+                reference_rng = jax.random.fold_in(
+                    rng,
+                    jnp.asarray(
+                        config["ORACLE_REFERENCE_SEED_OFFSET"], dtype=jnp.uint32
+                    )
+                    + update_steps.astype(jnp.uint32),
+                )
+                reference_initial_hstate, reference_traj = (
+                    collect_oracle_reference(train_states, reference_rng)
+                )
+                reference_returns, reference_valid = complete_mc_return_to_go(
+                    reference_traj.reward,
+                    reference_traj.global_done,
+                    config["GAMMA"],
+                )
+                reference_advantages = (
+                    reference_returns - reference_traj.baseline
+                )
+            else:
+                # Static dummy data keep the ordinary MAPPO code path unchanged
+                # and avoid collecting any extra environment interactions.
+                reference_initial_hstate = initial_hstates[0]
+                reference_traj = OracleReferenceTransition(
+                    traj_batch.global_done,
+                    traj_batch.done,
+                    traj_batch.action,
+                    traj_batch.reward,
+                    jnp.zeros_like(traj_batch.value),
+                    traj_batch.log_prob,
+                    traj_batch.obs,
+                    traj_batch.alive_mask,
+                    traj_batch.avail_actions,
+                )
+                reference_returns = jnp.zeros_like(traj_batch.reward)
+                reference_advantages = jnp.zeros_like(traj_batch.reward)
+                reference_valid = jnp.zeros_like(
+                    traj_batch.global_done, dtype=bool
+                )
+
+            reference_returns = jax.lax.stop_gradient(reference_returns)
             reference_advantages = jax.lax.stop_gradient(reference_advantages)
             reference_valid = jax.lax.stop_gradient(reference_valid)
 
@@ -1327,6 +1633,9 @@ def make_train(
                         traj_batch,
                         advantages,
                         targets,
+                        reference_initial_hstate,
+                        reference_traj,
+                        reference_returns,
                         reference_advantages,
                         reference_valid,
                     ) = batch_info
@@ -1386,6 +1695,32 @@ def make_train(
                             actor_score,
                         )
 
+                    def _reference_score_fn(
+                        actor_params, init_hstate, reference_traj
+                    ):
+                        _, pi, actor_latent = actor_network.apply(
+                            actor_params,
+                            init_hstate.squeeze(),
+                            (
+                                reference_traj.obs,
+                                reference_traj.done,
+                                reference_traj.avail_actions,
+                            ),
+                        )
+                        current_log_prob = pi.log_prob(reference_traj.action)
+                        importance_weight = jnp.exp(
+                            current_log_prob - reference_traj.log_prob
+                        )
+                        policy_params = actor_params["params"]
+                        actor_score = categorical_latent_score(
+                            actor_latent,
+                            reference_traj.action,
+                            reference_traj.avail_actions,
+                            policy_params["Dense_1"],
+                            policy_params["Dense_2"],
+                        )
+                        return actor_score, importance_weight
+
                     def _critic_loss_fn(
                         critic_params, init_hstate, traj_batch, targets
                     ):
@@ -1431,6 +1766,19 @@ def make_train(
                         actor_batch = jax.tree.map(split_agents, traj_batch)
                         actor_hstates = split_agents(ac_init_hstate)
                         actor_advantages = split_agents(actor_advantages)
+                        reference_actor_batch = jax.tree.map(
+                            split_agents, reference_traj
+                        )
+                        reference_actor_hstates = split_agents(
+                            reference_initial_hstate
+                        )
+                        reference_returns_by_agent = split_agents(
+                            reference_returns
+                        )
+                        reference_advantages_by_agent = split_agents(
+                            reference_advantages
+                        )
+                        reference_valid_by_agent = split_agents(reference_valid)
                         parameter_axis = (
                             None if config["ACTOR_PARAMETER_SHARING"] else 0
                         )
@@ -1581,21 +1929,49 @@ def make_train(
                                 "reference_gradient_norm": oracle_zero,
                                 "critic_gradient_norm": oracle_zero,
                                 "reference_critic_gradient_cosine": oracle_zero,
+                                "reference_valid_samples": oracle_zero,
+                                "reference_valid_samples_per_agent": jnp.zeros(
+                                    (env.num_agents,), dtype=actor_latent.dtype
+                                ),
+                                "critic_valid_samples": oracle_zero,
+                                "critic_valid_samples_per_agent": jnp.zeros(
+                                    (env.num_agents,), dtype=actor_latent.dtype
+                                ),
+                                "reference_to_critic_sample_ratio": oracle_zero,
+                                "reference_mc_return_std": oracle_zero,
+                                "reference_baselined_advantage_std": oracle_zero,
+                                "reference_baseline_variance_reduction": oracle_zero,
                             }
                             if config["ORACLE_LATENT_DISTORTION"]:
-                                oracle_scores = actor_aux[6]
-                                oracle_reference = split_agents(
-                                    reference_advantages
+                                (
+                                    reference_scores,
+                                    reference_importance_weight,
+                                ) = jax.vmap(
+                                    _reference_score_fn,
+                                    in_axes=(parameter_axis, 0, 0),
+                                )(
+                                    actor_params,
+                                    reference_actor_hstates,
+                                    reference_actor_batch,
                                 )
-                                oracle_critic = split_agents(advantages)
-                                oracle_mask = split_agents(
-                                    traj_batch.alive_mask & reference_valid
+                                critic_scores = actor_aux[6]
+                                critic_importance_weight = actor_aux[2]
+                                critic_advantage = split_agents(advantages)
+                                critic_mask = split_agents(traj_batch.alive_mask)
+                                reference_mask = (
+                                    reference_actor_batch.alive_mask
+                                    & reference_valid_by_agent
                                 )
                                 oracle_statistics = oracle_latent_distortion(
-                                    oracle_scores,
-                                    oracle_reference,
-                                    oracle_critic,
-                                    oracle_mask,
+                                    reference_scores,
+                                    reference_advantages_by_agent,
+                                    reference_returns_by_agent,
+                                    reference_mask,
+                                    reference_importance_weight,
+                                    critic_scores,
+                                    critic_advantage,
+                                    critic_mask,
+                                    critic_importance_weight,
                                     config["ORACLE_FISHER_RIDGE"],
                                 )
                             total_loss = (
@@ -1777,6 +2153,18 @@ def make_train(
                             "reference_gradient_norm": zero,
                             "critic_gradient_norm": zero,
                             "reference_critic_gradient_cosine": zero,
+                            "reference_valid_samples": zero,
+                            "reference_valid_samples_per_agent": jnp.zeros(
+                                (env.num_agents,), dtype=zero.dtype
+                            ),
+                            "critic_valid_samples": zero,
+                            "critic_valid_samples_per_agent": jnp.zeros(
+                                (env.num_agents,), dtype=zero.dtype
+                            ),
+                            "reference_to_critic_sample_ratio": zero,
+                            "reference_mc_return_std": zero,
+                            "reference_baselined_advantage_std": zero,
+                            "reference_baseline_variance_reduction": zero,
                         }
                         actor_cross_grads = jax.tree.map(jnp.zeros_like, actor_grads)
                         critic_cross_grads = jax.tree.map(jnp.zeros_like, critic_grads)
@@ -1826,6 +2214,18 @@ def make_train(
                             "reference_gradient_norm": zero,
                             "critic_gradient_norm": zero,
                             "reference_critic_gradient_cosine": zero,
+                            "reference_valid_samples": zero,
+                            "reference_valid_samples_per_agent": jnp.zeros(
+                                (env.num_agents,), dtype=zero.dtype
+                            ),
+                            "critic_valid_samples": zero,
+                            "critic_valid_samples_per_agent": jnp.zeros(
+                                (env.num_agents,), dtype=zero.dtype
+                            ),
+                            "reference_to_critic_sample_ratio": zero,
+                            "reference_mc_return_std": zero,
+                            "reference_baselined_advantage_std": zero,
+                            "reference_baseline_variance_reduction": zero,
                         }
                         actor_cross_grads = jax.tree.map(jnp.zeros_like, actor_grads)
                         critic_cross_grads = jax.tree.map(jnp.zeros_like, critic_grads)
@@ -1926,6 +2326,15 @@ def make_train(
                         ]
                         * oracle_statistics["epsilon_lat"],
                         "oracle_valid_samples": oracle_statistics["valid_samples"],
+                        "oracle_reference_valid_samples": oracle_statistics[
+                            "reference_valid_samples"
+                        ],
+                        "oracle_critic_valid_samples": oracle_statistics[
+                            "critic_valid_samples"
+                        ],
+                        "oracle_reference_to_critic_sample_ratio": oracle_statistics[
+                            "reference_to_critic_sample_ratio"
+                        ],
                         "oracle_reference_gradient_norm": oracle_statistics[
                             "reference_gradient_norm"
                         ],
@@ -1934,6 +2343,15 @@ def make_train(
                         ],
                         "oracle_reference_critic_gradient_cosine": oracle_statistics[
                             "reference_critic_gradient_cosine"
+                        ],
+                        "oracle_reference_mc_return_std": oracle_statistics[
+                            "reference_mc_return_std"
+                        ],
+                        "oracle_reference_baselined_advantage_std": oracle_statistics[
+                            "reference_baselined_advantage_std"
+                        ],
+                        "oracle_reference_baseline_variance_reduction": oracle_statistics[
+                            "reference_baseline_variance_reduction"
                         ],
                         "containment_similarity": containment_statistics[
                             "similarity"
@@ -2044,6 +2462,11 @@ def make_train(
                             loss_info[f"oracle_valid_samples_agent_{agent_idx}"] = (
                                 oracle_statistics["valid_samples_per_agent"][agent_idx]
                             )
+                            loss_info[
+                                f"oracle_critic_valid_samples_agent_{agent_idx}"
+                            ] = oracle_statistics["critic_valid_samples_per_agent"][
+                                agent_idx
+                            ]
 
                     return (actor_train_state, critic_train_state), loss_info
 
@@ -2053,6 +2476,9 @@ def make_train(
                     traj_batch,
                     advantages,
                     targets,
+                    reference_initial_hstate,
+                    reference_traj,
+                    reference_returns,
                     reference_advantages,
                     reference_valid,
                     rng,
@@ -2063,6 +2489,10 @@ def make_train(
                     lambda x: jnp.reshape(x, (1, config["NUM_ACTORS"], -1)),
                     init_hstates,
                 )
+                reference_initial_hstate = jnp.reshape(
+                    reference_initial_hstate,
+                    (1, config["NUM_ACTORS"], -1),
+                )
 
                 batch = (
                     init_hstates[0],
@@ -2070,6 +2500,9 @@ def make_train(
                     traj_batch,
                     advantages.squeeze(),
                     targets.squeeze(),
+                    reference_initial_hstate,
+                    reference_traj,
+                    reference_returns.squeeze(),
                     reference_advantages.squeeze(),
                     reference_valid.squeeze(),
                 )
@@ -2141,6 +2574,9 @@ def make_train(
                     traj_batch,
                     advantages,
                     targets,
+                    reference_initial_hstate.squeeze(axis=0),
+                    reference_traj,
+                    reference_returns,
                     reference_advantages,
                     reference_valid,
                     rng,
@@ -2153,6 +2589,9 @@ def make_train(
                 traj_batch,
                 advantages,
                 targets,
+                reference_initial_hstate,
+                reference_traj,
+                reference_returns,
                 reference_advantages,
                 reference_valid,
                 rng,
@@ -2188,6 +2627,20 @@ def make_train(
                     "env_step": (metric["update_steps"] + 1)
                     * config["NUM_ENVS"]
                     * config["NUM_STEPS"],
+                    "ppo_env_step": (metric["update_steps"] + 1)
+                    * config["NUM_ENVS"]
+                    * config["NUM_STEPS"],
+                    "oracle_env_step": (metric["update_steps"] + 1)
+                    * config["NUM_ENVS"]
+                    * config["ORACLE_REFERENCE_HORIZON"]
+                    * int(config["ORACLE_LATENT_DISTORTION"]),
+                    "total_env_step": (metric["update_steps"] + 1)
+                    * config["NUM_ENVS"]
+                    * (
+                        config["NUM_STEPS"]
+                        + config["ORACLE_REFERENCE_HORIZON"]
+                        * int(config["ORACLE_LATENT_DISTORTION"])
+                    ),
                     **metric["loss"],
                     **metric["shuffle"],
                 }
@@ -2293,6 +2746,9 @@ def main(config):
     config.setdefault("ORACLE_LATENT_DISTORTION", False)
     config.setdefault("ORACLE_DISTORTION_COEF", 0.0)
     config.setdefault("ORACLE_FISHER_RIDGE", 1e-3)
+    config.setdefault("ORACLE_REFERENCE_MULTIPLIER", 4)
+    config.setdefault("ORACLE_REFERENCE_BASELINE", "frozen_critic")
+    config.setdefault("ORACLE_REFERENCE_SEED_OFFSET", 900_000)
     config.setdefault("METRICS_JSONL", "")
     if not config.get("GIT_COMMIT"):
         try:

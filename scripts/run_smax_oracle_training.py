@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROTOCOL_VERSION = "smax-nps-oracle-latent-distortion-v1.0"
+PROTOCOL_VERSION = "smax-nps-independent-mc-oracle-v2.0"
 
 
 @dataclass(frozen=True)
@@ -81,6 +81,9 @@ def command(repo, run_root, args, task):
         f"ORACLE_LATENT_DISTORTION={'true' if oracle else 'false'}",
         f"ORACLE_DISTORTION_COEF={args.oracle_coef if oracle else 0}",
         f"ORACLE_FISHER_RIDGE={args.fisher_ridge}",
+        f"ORACLE_REFERENCE_MULTIPLIER={args.reference_multiplier}",
+        f"ORACLE_REFERENCE_BASELINE={args.reference_baseline}",
+        f"ORACLE_REFERENCE_SEED_OFFSET={args.reference_seed_offset}",
         f"TOTAL_TIMESTEPS={args.total_timesteps}",
         f"UPDATE_EPOCHS={args.update_epochs}",
         f"LR={args.learning_rate}",
@@ -110,6 +113,13 @@ def main():
     )
     parser.add_argument("--oracle-coef", type=float, required=True)
     parser.add_argument("--fisher-ridge", type=float, default=1e-3)
+    parser.add_argument("--reference-multiplier", type=int, default=4)
+    parser.add_argument(
+        "--reference-baseline",
+        choices=("frozen_critic", "zero"),
+        default="frozen_critic",
+    )
+    parser.add_argument("--reference-seed-offset", type=int, default=900_000)
     parser.add_argument("--total-timesteps", type=int, default=10_000_000)
     parser.add_argument("--checkpoint-interval", type=int, default=1_000_000)
     parser.add_argument("--update-epochs", type=int, default=4)
@@ -125,6 +135,10 @@ def main():
         parser.error(f"Conditions must be a subset of {sorted(allowed)}")
     if args.oracle_coef <= 0 or args.fisher_ridge <= 0:
         parser.error("Oracle coefficient and Fisher ridge must be positive")
+    if args.reference_multiplier < 2:
+        parser.error("--reference-multiplier must be at least 2")
+    if args.reference_seed_offset <= 0:
+        parser.error("--reference-seed-offset must be positive")
     if args.max_runs_per_gpu < 1:
         parser.error("--max-runs-per-gpu must be positive")
 
@@ -157,10 +171,14 @@ def main():
         "conditions": list(args.conditions),
         "oracle_distortion_coef": args.oracle_coef,
         "fisher_ridge_absolute": args.fisher_ridge,
+        "reference_multiplier": args.reference_multiplier,
+        "reference_baseline": args.reference_baseline,
+        "reference_seed_offset": args.reference_seed_offset,
         "total_timesteps": args.total_timesteps,
         "update_epochs": args.update_epochs,
         "learning_rate": args.learning_rate,
-        "reference_signal": "complete_discounted_mc_return_to_go_no_baseline",
+        "reference_signal": "independent_complete_mc_return_minus_action_independent_baseline",
+        "reference_sampling": "fresh_frozen_preupdate_policy_rollouts",
         "critic_signal": "unnormalized_training_gae",
         "signals_are_stop_gradient": True,
     }

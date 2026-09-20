@@ -26,12 +26,15 @@
 "ALIGN_CONTAINMENT_MIN_GROUP_SAMPLES": 64
 "ALIGNMENT_COEF": 0.1
 "ALIGN_GRADIENT_CALIBRATION": False
-# Oracle condition: minimize the Fisher-weighted mismatch between the
-# baseline-free complete-MC policy-gradient reference and raw training GAE.
-# Both scalar signals are stop-gradient; only actor latent scores are updated.
+# Oracle condition: compare raw training GAE with a larger, independently
+# collected complete-MC reference.  The frozen pre-update critic is used only
+# as an action-independent control variate; all scalar signals are stop-gradient.
 "ORACLE_LATENT_DISTORTION": False
 "ORACLE_DISTORTION_COEF": 0.0
 "ORACLE_FISHER_RIDGE": 0.001
+"ORACLE_REFERENCE_MULTIPLIER": 4
+"ORACLE_REFERENCE_BASELINE": "frozen_critic" # frozen_critic | zero
+"ORACLE_REFERENCE_SEED_OFFSET": 900000
 "ALIGN_TARGET_SHUFFLE": False
 "ALIGN_TARGET_SHUFFLE_SCOPE": "same_agent_env_time"
 "ALIGN_SHUFFLE_SEED_OFFSET": 700000

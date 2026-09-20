@@ -1,33 +1,111 @@
-# SMAX oracle latent-distortion training
+# SMAX independent-reference oracle training
 
-This protocol compares matched NPS MAPPO against MAPPO with the additional
+The v2 protocol compares matched NPS MAPPO against MAPPO with the additional
 objective
 
 \[
 \epsilon_{\mathrm{Lat}}
-=\sum_i (g_i^{\mathrm{MC}}-g_i^{\mathrm{GAE}})^\top
-(F_i+\xi I)^{-1}(g_i^{\mathrm{MC}}-g_i^{\mathrm{GAE}}).
+=\sum_i (g_i^{\mathrm{ref}}-g_i^{\mathrm{GAE}})^\top
+(F_i^{\mathrm{ref}}+\xi I)^{-1}
+(g_i^{\mathrm{ref}}-g_i^{\mathrm{GAE}}).
 \]
 
-At every rollout, `g_MC` uses baseline-free discounted Monte Carlo return to
-go and `g_GAE` uses the unnormalized GAE reconstructed by the training critic.
-Only transitions with an observed episode termination inside the current
-rollout are used; the incomplete suffix is never bootstrapped. Both scalar
-signals are explicitly stop-gradient. The oracle objective differentiates
-only through the current actor latent score `d log pi(a|z) / dz`.
+The two estimates no longer reuse the same rollout:
 
-## 1. Reward-free coefficient calibration
+- `g_GAE` uses the ordinary PPO minibatch and its raw, unnormalised training
+  GAE.
+- Before each PPO update, `g_ref` uses fresh environments sampled by the frozen
+  pre-update policy. The default horizon guarantees at least four times as many
+  complete reference transitions in every minibatch.
+- Reference returns never bootstrap. The unfinished final episode in every
+  reference environment is masked out.
+- The default reference signal is `G_MC - V_old(s)`. `V_old` is the frozen
+  pre-update centralized critic and is never fitted on the reference rollout.
+  It is action-independent, so it is a control variate rather than a bootstrap.
+- MC returns, the frozen baseline, and raw GAE are all stop-gradient.
+- The reference Fisher is estimated only from the independent reference data.
+- Old-policy importance ratios keep the fixed rollout valid across PPO epochs.
 
-The pilot uses one rollout, zero learning rate, and no return-based model
-selection. It selects the coefficient whose oracle/PPO actor-gradient norm
-ratio is 0.1.
+The run logs `ppo_env_step`, `oracle_env_step`, and `total_env_step` separately.
+Performance plots may use `ppo_env_step`, but compute/sample-cost comparisons
+must also report `total_env_step`.
+
+## Smoke test
+
+Use a new output root; v1 artifacts and coefficients are incompatible.
 
 ```bash
 cd ~/JaxMARL
+git pull --ff-only
 conda activate jaxmarl
 unset LD_LIBRARY_PATH
 
-export ORACLE_ROOT="/home/data/zeshenghong/JaxMARL/smax_oracle_10m_vs_11m"
+export SMOKE_ROOT="/home/data/zeshenghong/JaxMARL/smax_oracle_independent_ref_smoke_v2"
+mkdir -p "$SMOKE_ROOT"
+
+nohup python scripts/run_smax_oracle_training.py \
+  --run-root "$SMOKE_ROOT" \
+  --map-name 10m_vs_11m \
+  --seeds 1 \
+  --conditions none,oracle_latent_distortion \
+  --oracle-coef 1 \
+  --fisher-ridge 0.001 \
+  --reference-multiplier 4 \
+  --reference-baseline frozen_critic \
+  --total-timesteps 16384 \
+  --update-epochs 1 \
+  --gpus 0,1 \
+  --max-runs-per-gpu 1 \
+  --wandb-mode disabled \
+  > "$SMOKE_ROOT/training.stdout" 2>&1 &
+
+echo "Smoke manager PID: $!"
+watch -n 5 "python scripts/monitor_smax_oracle_training.py --run-root '$SMOKE_ROOT'"
+```
+
+After completion, audit the estimator:
+
+```bash
+python - "$SMOKE_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+path = next((root / "metrics").glob("*oracle_latent_distortion*.jsonl"))
+row = json.loads(path.read_text().splitlines()[-1])
+for key in (
+    "oracle_reference_valid_samples",
+    "oracle_critic_valid_samples",
+    "oracle_reference_to_critic_sample_ratio",
+    "oracle_reference_mc_return_std",
+    "oracle_reference_baselined_advantage_std",
+    "oracle_reference_baseline_variance_reduction",
+    "oracle_epsilon_lat",
+    "oracle_actor_to_rl_grad_ratio_mean",
+    "ppo_env_step",
+    "oracle_env_step",
+    "total_env_step",
+):
+    print(f"{key}: {row[key]}")
+PY
+```
+
+The smoke test passes only if both runs finish, the reference/critic effective
+sample ratio is at least four, and all oracle metrics are finite. A negative
+variance-reduction value is allowed diagnostically—it means the frozen critic
+is a poor control variate at that checkpoint and the `zero` baseline should be
+retained as an ablation.
+
+## Coefficient pilot
+
+Do not reuse the v1 coefficient. First run the v2 estimator with coefficient
+one, zero learning rate, and one update. The resulting gradient ratio is a
+scale diagnostic, not a theoretically privileged target. If a coefficient is
+selected, report the chosen target ratio and include a small sensitivity sweep.
+
+```bash
+export ORACLE_ROOT="/home/data/zeshenghong/JaxMARL/smax_oracle_10m_vs_11m_v2"
 export PILOT_ROOT="$ORACLE_ROOT/gradient_calibration"
 mkdir -p "$PILOT_ROOT"
 
@@ -37,6 +115,8 @@ nohup python scripts/run_smax_oracle_training.py \
   --seeds 9001 \
   --conditions oracle_latent_distortion \
   --oracle-coef 1 \
+  --reference-multiplier 4 \
+  --reference-baseline frozen_critic \
   --total-timesteps 16384 \
   --update-epochs 1 \
   --learning-rate 0 \
@@ -44,54 +124,4 @@ nohup python scripts/run_smax_oracle_training.py \
   --max-runs-per-gpu 1 \
   --wandb-mode disabled \
   > "$PILOT_ROOT/launcher.stdout" 2>&1 &
-
-wait $!
-
-python scripts/select_smax_oracle_coef.py \
-  --metrics "$PILOT_ROOT/metrics/SMAX-ORACLE-10m_vs_11m-nps-oracle_latent_distortion-seed9001.jsonl" \
-  --output "$PILOT_ROOT/oracle_gradient_calibration.json" \
-  --target-gradient-ratio 0.1
-```
-
-## 2. Four-seed comparison
-
-```bash
-export FORMAL_ROOT="$ORACLE_ROOT/formal_4seed"
-export ORACLE_COEF="$(python - "$PILOT_ROOT/oracle_gradient_calibration.json" <<'PY'
-import json
-import sys
-print(json.load(open(sys.argv[1]))["oracle_distortion_coef"])
-PY
-)"
-
-mkdir -p "$FORMAL_ROOT"
-
-nohup python scripts/run_smax_oracle_training.py \
-  --run-root "$FORMAL_ROOT" \
-  --map-name 10m_vs_11m \
-  --seeds 1-4 \
-  --conditions none,oracle_latent_distortion \
-  --oracle-coef "$ORACLE_COEF" \
-  --fisher-ridge 0.001 \
-  --total-timesteps 10000000 \
-  --gpus 0,1,2,3 \
-  --max-runs-per-gpu 2 \
-  --project jaxmarl-smax-10m-vs-11m-oracle \
-  > "$FORMAL_ROOT/training.stdout" 2>&1 &
-```
-
-Monitor all eight runs:
-
-```bash
-watch -n 5 "python scripts/monitor_smax_oracle_training.py --run-root '$FORMAL_ROOT'"
-```
-
-In W&B, filter `MAP_NAME=10m_vs_11m`, group by
-`EXPERIMENT_CONDITION`, use `env_step` on the x-axis, and compare `returns` or
-`win_rate`. The two groups are `none` and `oracle_latent_distortion`.
-
-After all runs finish, generate the matched two-condition figure and its CSV:
-
-```bash
-python scripts/plot_smax_oracle_training.py --run-root "$FORMAL_ROOT"
 ```

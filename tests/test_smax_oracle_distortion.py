@@ -46,20 +46,45 @@ def test_latent_score_matches_autodiff():
 
 
 def test_reference_and_gae_are_stop_gradient_but_scores_are_trainable():
-    scores = jnp.asarray([[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]]])
-    reference = jnp.asarray([[[1.0, 2.0, 3.0]]])
-    critic = jnp.asarray([[[0.5, 1.0, 1.5]]])
-    mask = jnp.ones((1, 1, 3), dtype=bool)
-
-    def loss(s, r, a):
-        return oracle_latent_distortion(s, r, a, mask, 1e-3)["epsilon_lat"]
-
-    score_grad, reference_grad, critic_grad = jax.grad(loss, argnums=(0, 1, 2))(
-        scores, reference, critic
+    reference_scores = jnp.asarray(
+        [[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, -0.2]]]]
     )
-    assert np.isfinite(np.asarray(score_grad)).all()
-    assert np.linalg.norm(np.asarray(score_grad)) > 0
+    critic_scores = jnp.asarray([[[[1.0, 0.0], [0.0, 1.0]]]])
+    reference = jnp.asarray([[[1.0, 2.0, 3.0, -1.0]]])
+    returns = reference + 0.25
+    critic = jnp.asarray([[[0.5, 1.0]]])
+    reference_mask = jnp.ones((1, 1, 4), dtype=bool)
+    critic_mask = jnp.ones((1, 1, 2), dtype=bool)
+    reference_weight = jnp.ones_like(reference)
+    critic_weight = jnp.ones_like(critic)
+
+    def loss(rs, cs, r, ret, a):
+        return oracle_latent_distortion(
+            rs,
+            r,
+            ret,
+            reference_mask,
+            reference_weight,
+            cs,
+            a,
+            critic_mask,
+            critic_weight,
+            1e-3,
+        )["epsilon_lat"]
+
+    (
+        reference_score_grad,
+        critic_score_grad,
+        reference_grad,
+        return_grad,
+        critic_grad,
+    ) = jax.grad(loss, argnums=(0, 1, 2, 3, 4))(
+        reference_scores, critic_scores, reference, returns, critic
+    )
+    assert np.linalg.norm(np.asarray(reference_score_grad)) > 0
+    assert np.linalg.norm(np.asarray(critic_score_grad)) > 0
     np.testing.assert_array_equal(np.asarray(reference_grad), np.zeros_like(reference))
+    np.testing.assert_array_equal(np.asarray(return_grad), np.zeros_like(returns))
     np.testing.assert_array_equal(np.asarray(critic_grad), np.zeros_like(critic))
 
 
@@ -67,5 +92,37 @@ def test_distortion_is_zero_when_reference_matches_critic():
     scores = jnp.arange(24, dtype=jnp.float32).reshape((2, 2, 3, 2)) / 10
     signal = jnp.arange(12, dtype=jnp.float32).reshape((2, 2, 3))
     mask = jnp.ones((2, 2, 3), dtype=bool)
-    result = oracle_latent_distortion(scores, signal, signal, mask, 1e-3)
+    weight = jnp.ones_like(signal)
+    result = oracle_latent_distortion(
+        scores,
+        signal,
+        signal,
+        mask,
+        weight,
+        scores,
+        signal,
+        mask,
+        weight,
+        1e-3,
+    )
     np.testing.assert_allclose(np.asarray(result["epsilon_lat"]), 0.0, atol=1e-7)
+
+
+def test_reference_and_critic_can_use_different_sample_counts():
+    reference_scores = jnp.ones((2, 7, 5, 3))
+    critic_scores = jnp.ones((2, 2, 5, 3))
+    reference_signal = jnp.ones((2, 7, 5))
+    critic_signal = jnp.ones((2, 2, 5))
+    result = oracle_latent_distortion(
+        reference_scores,
+        reference_signal,
+        reference_signal,
+        jnp.ones_like(reference_signal, dtype=bool),
+        jnp.ones_like(reference_signal),
+        critic_scores,
+        critic_signal,
+        jnp.ones_like(critic_signal, dtype=bool),
+        jnp.ones_like(critic_signal),
+        1e-3,
+    )
+    assert float(result["reference_to_critic_sample_ratio"]) == pytest.approx(3.5)
