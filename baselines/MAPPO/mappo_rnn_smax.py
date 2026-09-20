@@ -458,6 +458,63 @@ def complete_mc_return_to_go(reward, global_done, gamma):
     return jax.lax.stop_gradient(returns), jax.lax.stop_gradient(valid)
 
 
+def crossfit_linear_reference_baseline(
+    returns,
+    frozen_critic_value,
+    mask,
+    num_agents,
+    num_envs,
+    ridge=1e-6,
+):
+    """Two-fold cross-fitted affine baseline built from pre-action values.
+
+    Environment indices define independent folds.  For each agent, an affine
+    map from the frozen pre-update critic value to complete MC return is fitted
+    on one fold and evaluated on the other.  Thus a held-out transition's
+    baseline never uses its own action or return.  The slope naturally shrinks
+    toward zero when the initial critic has no predictive signal.
+    """
+
+    time_steps = returns.shape[0]
+    returns_by_env = returns.reshape((time_steps, num_agents, num_envs))
+    values_by_env = frozen_critic_value.reshape(
+        (time_steps, num_agents, num_envs)
+    )
+    mask_by_env = mask.reshape((time_steps, num_agents, num_envs)).astype(
+        returns.dtype
+    )
+    fold_a = (jnp.arange(num_envs) % 2 == 0)[None, None, :]
+    fold_b = ~fold_a
+
+    def fit_on_apply_to(train_fold, test_fold):
+        train_mask = mask_by_env * train_fold.astype(returns.dtype)
+        count = jnp.maximum(train_mask.sum(axis=(0, 2)), 1.0)
+        mean_value = (
+            (values_by_env * train_mask).sum(axis=(0, 2)) / count
+        )
+        mean_return = (
+            (returns_by_env * train_mask).sum(axis=(0, 2)) / count
+        )
+        centered_value = values_by_env - mean_value[None, :, None]
+        centered_return = returns_by_env - mean_return[None, :, None]
+        covariance = (
+            centered_value * centered_return * train_mask
+        ).sum(axis=(0, 2))
+        value_variance = (
+            jnp.square(centered_value) * train_mask
+        ).sum(axis=(0, 2))
+        slope = covariance / (value_variance + ridge * count)
+        intercept = mean_return - slope * mean_value
+        prediction = (
+            intercept[None, :, None]
+            + slope[None, :, None] * values_by_env
+        )
+        return prediction * test_fold.astype(returns.dtype)
+
+    baseline = fit_on_apply_to(fold_a, fold_b) + fit_on_apply_to(fold_b, fold_a)
+    return jax.lax.stop_gradient(baseline.reshape(returns.shape))
+
+
 def categorical_latent_score(
     actor_latent,
     action,
@@ -956,7 +1013,7 @@ def make_train(
     config.setdefault("ORACLE_DISTORTION_COEF", 0.0)
     config.setdefault("ORACLE_FISHER_RIDGE", 1e-3)
     config.setdefault("ORACLE_REFERENCE_MULTIPLIER", 4)
-    config.setdefault("ORACLE_REFERENCE_BASELINE", "frozen_critic")
+    config.setdefault("ORACLE_REFERENCE_BASELINE", "crossfit_linear_critic")
     config.setdefault("ORACLE_REFERENCE_SEED_OFFSET", 900_000)
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
@@ -999,9 +1056,14 @@ def make_train(
         raise ValueError("ORACLE_FISHER_RIDGE must be positive.")
     if int(config["ORACLE_REFERENCE_MULTIPLIER"]) < 2:
         raise ValueError("ORACLE_REFERENCE_MULTIPLIER must be at least 2.")
-    if config["ORACLE_REFERENCE_BASELINE"] not in {"frozen_critic", "zero"}:
+    if config["ORACLE_REFERENCE_BASELINE"] not in {
+        "crossfit_linear_critic",
+        "frozen_critic",
+        "zero",
+    }:
         raise ValueError(
-            "ORACLE_REFERENCE_BASELINE must be 'frozen_critic' or 'zero'."
+            "ORACLE_REFERENCE_BASELINE must be 'crossfit_linear_critic', "
+            "'frozen_critic', or 'zero'."
         )
     if int(config["ORACLE_REFERENCE_SEED_OFFSET"]) <= 0:
         raise ValueError("ORACLE_REFERENCE_SEED_OFFSET must be positive.")
@@ -1595,6 +1657,20 @@ def make_train(
                     reference_traj.global_done,
                     config["GAMMA"],
                 )
+                if (
+                    config["ORACLE_REFERENCE_BASELINE"]
+                    == "crossfit_linear_critic"
+                ):
+                    fitted_baseline = crossfit_linear_reference_baseline(
+                        reference_returns,
+                        reference_traj.baseline,
+                        reference_valid & reference_traj.alive_mask,
+                        env.num_agents,
+                        config["NUM_ENVS"],
+                    )
+                    reference_traj = reference_traj._replace(
+                        baseline=fitted_baseline
+                    )
                 reference_advantages = (
                     reference_returns - reference_traj.baseline
                 )
@@ -2747,7 +2823,7 @@ def main(config):
     config.setdefault("ORACLE_DISTORTION_COEF", 0.0)
     config.setdefault("ORACLE_FISHER_RIDGE", 1e-3)
     config.setdefault("ORACLE_REFERENCE_MULTIPLIER", 4)
-    config.setdefault("ORACLE_REFERENCE_BASELINE", "frozen_critic")
+    config.setdefault("ORACLE_REFERENCE_BASELINE", "crossfit_linear_critic")
     config.setdefault("ORACLE_REFERENCE_SEED_OFFSET", 900_000)
     config.setdefault("METRICS_JSONL", "")
     if not config.get("GIT_COMMIT"):

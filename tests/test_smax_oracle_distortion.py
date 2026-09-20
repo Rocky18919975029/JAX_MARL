@@ -11,6 +11,7 @@ pytest.importorskip("wandb")
 from baselines.MAPPO.mappo_rnn_smax import (
     categorical_latent_score,
     complete_mc_return_to_go,
+    crossfit_linear_reference_baseline,
     oracle_latent_distortion,
 )
 
@@ -43,6 +44,27 @@ def test_latent_score_matches_autodiff():
     expected = jax.grad(log_probability)(latent)
     actual = categorical_latent_score(latent, action, available, hidden, logits)
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6, atol=1e-6)
+
+
+def test_crossfit_baseline_uses_other_environment_fold():
+    # The same affine relation holds in both folds, so cross-fitting recovers it
+    # exactly without using a held-out environment's own returns.
+    values = jnp.arange(24, dtype=jnp.float32).reshape((3, 2, 4))
+    returns = 2.0 + 3.0 * values
+    mask = jnp.ones_like(returns, dtype=bool)
+    flat_returns = returns.reshape((3, 8))
+    flat_values = values.reshape((3, 8))
+    flat_mask = mask.reshape((3, 8))
+    baseline = crossfit_linear_reference_baseline(
+        flat_returns,
+        flat_values,
+        flat_mask,
+        num_agents=2,
+        num_envs=4,
+    )
+    np.testing.assert_allclose(
+        np.asarray(baseline), np.asarray(flat_returns), rtol=1e-5, atol=1e-5
+    )
 
 
 def test_reference_and_gae_are_stop_gradient_but_scores_are_trainable():

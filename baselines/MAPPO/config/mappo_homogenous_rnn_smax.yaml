@@ -33,7 +33,7 @@
 "ORACLE_DISTORTION_COEF": 0.0
 "ORACLE_FISHER_RIDGE": 0.001
 "ORACLE_REFERENCE_MULTIPLIER": 4
-"ORACLE_REFERENCE_BASELINE": "frozen_critic" # frozen_critic | zero
+"ORACLE_REFERENCE_BASELINE": "crossfit_linear_critic" # crossfit_linear_critic | frozen_critic | zero
 "ORACLE_REFERENCE_SEED_OFFSET": 900000
 "ALIGN_TARGET_SHUFFLE": False
 "ALIGN_TARGET_SHUFFLE_SCOPE": "same_agent_env_time"

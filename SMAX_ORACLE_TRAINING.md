@@ -19,9 +19,11 @@ The two estimates no longer reuse the same rollout:
   complete reference transitions in every minibatch.
 - Reference returns never bootstrap. The unfinished final episode in every
   reference environment is masked out.
-- The default reference signal is `G_MC - V_old(s)`. `V_old` is the frozen
-  pre-update centralized critic and is never fitted on the reference rollout.
-  It is action-independent, so it is a control variate rather than a bootstrap.
+- The default reference signal is `G_MC - b_cf(s)`. The baseline is an affine
+  calibration of the frozen pre-update centralized critic, fitted with two-fold
+  cross-fitting across independent environments. A held-out transition never
+  helps fit its own baseline. The baseline is action-independent, so it is a
+  control variate rather than a bootstrap.
 - MC returns, the frozen baseline, and raw GAE are all stop-gradient.
 - The reference Fisher is estimated only from the independent reference data.
 - Old-policy importance ratios keep the fixed rollout valid across PPO epochs.
@@ -40,7 +42,7 @@ git pull --ff-only
 conda activate jaxmarl
 unset LD_LIBRARY_PATH
 
-export SMOKE_ROOT="/home/data/zeshenghong/JaxMARL/smax_oracle_independent_ref_smoke_v2"
+export SMOKE_ROOT="/home/data/zeshenghong/JaxMARL/smax_oracle_independent_ref_smoke_v2p1"
 mkdir -p "$SMOKE_ROOT"
 
 nohup python scripts/run_smax_oracle_training.py \
@@ -51,7 +53,7 @@ nohup python scripts/run_smax_oracle_training.py \
   --oracle-coef 1 \
   --fisher-ridge 0.001 \
   --reference-multiplier 4 \
-  --reference-baseline frozen_critic \
+  --reference-baseline crossfit_linear_critic \
   --total-timesteps 16384 \
   --update-epochs 1 \
   --gpus 0,1 \
@@ -116,7 +118,7 @@ nohup python scripts/run_smax_oracle_training.py \
   --conditions oracle_latent_distortion \
   --oracle-coef 1 \
   --reference-multiplier 4 \
-  --reference-baseline frozen_critic \
+  --reference-baseline crossfit_linear_critic \
   --total-timesteps 16384 \
   --update-epochs 1 \
   --learning-rate 0 \

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROTOCOL_VERSION = "smax-nps-independent-mc-oracle-v2.0"
+PROTOCOL_VERSION = "smax-nps-independent-mc-oracle-v2.1"
 
 
 @dataclass(frozen=True)
@@ -116,8 +116,8 @@ def main():
     parser.add_argument("--reference-multiplier", type=int, default=4)
     parser.add_argument(
         "--reference-baseline",
-        choices=("frozen_critic", "zero"),
-        default="frozen_critic",
+        choices=("crossfit_linear_critic", "frozen_critic", "zero"),
+        default="crossfit_linear_critic",
     )
     parser.add_argument("--reference-seed-offset", type=int, default=900_000)
     parser.add_argument("--total-timesteps", type=int, default=10_000_000)
