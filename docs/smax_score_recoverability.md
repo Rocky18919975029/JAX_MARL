@@ -1,52 +1,81 @@
-# SMAX score recoverability
+# SMAX nonlinear policy-score recoverability, v2
 
-This is a frozen-policy, final-checkpoint-only measurement for the NPS runs on
-`10m_vs_11m`, `3s5z_vs_3s6z`, and `smacv2_10_units`.  It does not alter MAPPO
-training or backpropagate into an actor or critic.
+This is an **offline measurement** of frozen NPS MAPPO checkpoints, not an
+auxiliary training loss. It evaluates `none`, C→A LN-MSE and C→A Linear CKA
+separately on `10m_vs_11m`, `3s5z_vs_3s6z` and `smacv2_10_units`.
+Tasks are never pooled.
 
-For every task, condition, seed, and agent slot, the collector saves the
-128-dimensional actor and critic GRU outputs, the sampled action, the SMAX
-available-action mask, and the exact gradient of the masked categorical log
-probability with respect to the actor GRU output.  The measurement then:
+## Matched checkpoints
 
-1. makes one deterministic 75/25 split by complete episode;
-2. estimates the empirical Fisher from fit episodes only;
-3. uses the fit Fisher to whiten fit and test policy scores;
-4. trains an independent fixed-capacity probe per agent from standardized
-   critic latent plus one-hot action to the whitened score;
-5. reports vector squared error divided by held-out whitened-score energy.
+For each task, the launcher finds a complete three-condition × four-seed
+training-budget cohort. It intersects the **actually saved checkpoint steps**
+of all 12 runs and selects distinct common steps nearest 25%, 50%, 75% and
+100% of that task's budget. It refuses a nearest step more than 12.5% of the
+budget from its requested fraction. `protocol.json` records requested and
+actual steps; no checkpoints are interpolated and different conditions are
+never compared at different steps. The final step uses each run's `final`
+checkpoint.
 
-The frozen defaults are 512 evaluation episodes, upper limits of 16,384 fit
-and 4,096 test transitions per agent, `xi=1e-3`, and a one-hidden-layer
-256-unit MLP trained for 2,000 Adam steps. The launcher first collects every
-selected run, counts valid transitions in the fit/test episodes, and chooses
-the minimum available count within each task, capped at those limits. Every
-condition and seed in that task then uses the same exact number of samples.
-The realized counts and full per-agent census are saved in
-`RUN_ROOT/sample_counts.json`. All conditions within a task use the same
-environment reset seed, episode split, probe initialization, and optimization
-schedule. RL parameters and collected arrays are detached.
+Each checkpoint is frozen and independently rolled out for 1,024 stochastic
+episodes, using the same reset-key seed within a task. Complete episodes are
+assigned 70% fit, 15% validation and 15% test by one deterministic split.
+There is no episode overlap. At each task/step, all conditions/seeds use the
+same number of sampled valid transitions per agent, chosen from the smallest
+available split count and capped at 16,384/4,096/4,096. The census is saved
+in `sample_counts.json`. The same on-policy episodes also provide the
+stochastic episode return plotted next to recoverability.
 
-The launcher recursively discovers the largest complete final-checkpoint
-`none` / `c_to_a_mse` / `c_to_a_cka` NPS cohort for each task:
+## Score and probe
+
+The collector saves actor/critic GRU latents, the sampled action, the exact
+SMAX invalid-action mask, and the exact gradient of masked actor log-prob
+with respect to actor latent. Per agent, only fit scores estimate the Fisher
+matrix. A fixed ridge-regularized inverse square root whitens fit,
+validation and test scores alike. Critic latents use fit-only mean and
+standard deviation; the action is one-hot encoded.
+
+Each agent has an independent residual MLP:
+
+`Dense(256) → ReLU → [Dense(256) → ReLU → Dense(256) + skip → ReLU] × 3 → Dense(128)`.
+
+All cells use Adam at `1e-3`, batch size 512 and at most 5,000 steps.
+Validation error is checked every 100 steps, with patience of 10 checks.
+The best validation-selected weights are saved independently for each agent;
+the test split is not used for model selection. Training, validation and
+test normalized errors, score energies, Fisher spectrum, best steps and
+estimator-failure flags are saved for audit. **Test errors are never clipped
+to 1.** Values above 1 mean the finite trained estimator did worse than the
+zero predictor; they are flagged for investigation, not interpreted as the
+theoretical infimum.
+
+## Run
+
+Use a fresh root; v1 final-only results are incompatible:
 
 ```bash
+cd ~/JaxMARL
+git pull --ff-only
+conda activate jaxmarl
+unset LD_LIBRARY_PATH
+
+export REC_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/score_recoverability_resmlp_v2
 python scripts/run_smax_score_recoverability.py \
-  --matrix-root /path/containing/all/smax/runs \
-  --run-root /path/for/score_recoverability \
+  --matrix-root /home/data/zeshenghong/JaxMARL/h1_smax_runs \
+  --run-root "$REC_ROOT" \
   --gpus 0,1,2,3 \
   --max-runs-per-gpu 1
 ```
 
-Monitor all 36 cells with:
+Monitor with:
 
 ```bash
-watch -n 10 python scripts/monitor_smax_score_recoverability.py \
-  --run-root /path/for/score_recoverability
+watch -n 10 python scripts/monitor_smax_score_recoverability.py --run-root "$REC_ROOT"
 ```
 
-The launcher resumes from cached collections after a failed probe fit. It
-automatically writes task-separated CSV tables and both combined
-and per-task PNG/PDF figures under `RUN_ROOT/analysis`.  Tasks are never pooled.
-The 95% confidence intervals bootstrap training seeds; the four-seed case uses
-all `4^4` ordered ordinary-bootstrap resamples.
+After all cells complete, `analysis/<task>/return-vs-score-recoverability.png`
+shows return and normalized test error at the matched checkpoints. Tables
+`agent_level.csv`, `seed_checkpoint_level.csv` and
+`task_condition_checkpoint_summary.csv` are generated both globally and
+separately by task. The 95% confidence intervals bootstrap training seeds,
+not agents or episodes. The protocol uses a nonlinear empirical estimator
+and does not claim to attain the unrestricted theoretical infimum.

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run final-checkpoint SMAX score recoverability for three NPS conditions."""
+"""Run matched-checkpoint residual-MLP score recoverability for NPS SMAX."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -49,24 +50,124 @@ def parse_items(raw, cast=str):
     return tuple(cast(item.strip()) for item in raw.split(",") if item.strip())
 
 
+def checkpoint_catalog(source):
+    """Read real saved steps from one completed training run."""
+
+    result = {}
+    for path in sorted(source.checkpoint.parent.glob("*/metadata.json")):
+        checkpoint = path.parent
+        if not (checkpoint / "model.safetensors").is_file():
+            continue
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        if metadata.get("is_initial"):
+            continue
+        raw = metadata.get("nominal_env_step", metadata.get("env_step"))
+        try:
+            step = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if 0 < step <= source.budget:
+            # Prefer the final checkpoint over a same-step periodic alias.
+            if step not in result or checkpoint.name == "final":
+                result[step] = checkpoint.resolve()
+    if source.budget not in result:
+        raise RuntimeError(
+            f"Missing final checkpoint at budget {source.budget}: {source.checkpoint}"
+        )
+    return result
+
+
+def select_matched_checkpoints(sources, fractions, max_deviation=0.125):
+    """Select four *identical saved steps* across all cells within each task."""
+
+    if (
+        not fractions
+        or fractions[-1] != 1.0
+        or any(not 0 < value <= 1 for value in fractions)
+        or tuple(sorted(set(fractions))) != tuple(fractions)
+    ):
+        raise ValueError("Checkpoint fractions must be increasing and end at 1")
+    by_task = {}
+    for source in sources:
+        by_task.setdefault(source.task, []).append(source)
+    plan = {}
+    paths = {}
+    for task, task_sources in by_task.items():
+        budgets = {source.budget for source in task_sources}
+        if len(budgets) != 1:
+            raise RuntimeError(f"{task} has mismatched training budgets: {budgets}")
+        budget = budgets.pop()
+        catalogs = {source.key: checkpoint_catalog(source) for source in task_sources}
+        common = set.intersection(*(set(catalog) for catalog in catalogs.values()))
+        if len(common) < len(fractions):
+            raise RuntimeError(
+                f"{task} has only {len(common)} common saved steps; "
+                f"need {len(fractions)}: {sorted(common)}"
+            )
+        selected = []
+        previous = 0
+        for index, fraction in enumerate(fractions):
+            remaining = len(fractions) - index - 1
+            eligible = [
+                step
+                for step in common
+                if step > previous
+                and sum(later > step for later in common) >= remaining
+            ]
+            if fraction == 1.0:
+                step = budget
+                if step not in eligible:
+                    raise RuntimeError(f"{task} has no matched final checkpoint")
+            else:
+                step = min(
+                    eligible, key=lambda item: (abs(item - budget * fraction), item)
+                )
+            deviation = abs(step / budget - fraction)
+            if deviation > max_deviation:
+                raise RuntimeError(
+                    f"{task}: nearest common checkpoint to {fraction:.0%} is "
+                    f"{step:,}/{budget:,} ({deviation:.1%} away); do not silently "
+                    "compare unmatched or distant checkpoints"
+                )
+            selected.append(
+                {
+                    "requested_fraction": fraction,
+                    "actual_fraction": step / budget,
+                    "env_step": step,
+                }
+            )
+            previous = step
+        plan[task] = selected
+        for source in task_sources:
+            for row in selected:
+                paths[(source.key, row["env_step"])] = catalogs[source.key][
+                    row["env_step"]
+                ]
+    return plan, paths
+
+
 def common_sample_counts(
     jobs,
     *,
     fit_fraction,
+    validation_fraction,
     split_seed,
     fit_cap,
+    validation_cap,
     test_cap,
     expected_episodes=None,
     collection_seed_base=None,
 ):
-    """Choose equal per-agent counts for every condition and seed in a task."""
+    """Choose equal counts across conditions/seeds at each task/checkpoint."""
 
     by_task = {}
     for name, source, output in jobs:
         directory = output / "collected"
-        metadata, arrays = load_diagnostics(directory, ("active", "alive"))
+        metadata, arrays = load_diagnostics(directory, ("active", "alive", "reward"))
         if int(metadata["episodes"]) != len(arrays["active"]):
             raise RuntimeError(f"Incomplete collected episodes for {name}")
+        if arrays["reward"].shape[:2] != arrays["active"].shape:
+            raise RuntimeError(f"Collected returns are misaligned for {name}")
         if metadata.get("checkpoint") != str(source.checkpoint):
             raise RuntimeError(
                 f"Cached collection belongs to another checkpoint: {name}"
@@ -82,32 +183,50 @@ def common_sample_counts(
             raise RuntimeError(f"Cached collection has the wrong rollout seed: {name}")
         if metadata.get("array_profile") not in ("score_recoverability", None):
             raise RuntimeError(f"Cached collection has the wrong array profile: {name}")
-        fit, test = available_samples_by_agent(arrays, fit_fraction, split_seed)
-        by_task.setdefault(source.task, []).append(
+        if int(metadata.get("checkpoint_nominal_env_step") or -1) != int(
+            json.loads((source.checkpoint / "metadata.json").read_text())[
+                "nominal_env_step"
+            ]
+        ):
+            raise RuntimeError(
+                f"Cached collection has a different checkpoint step: {name}"
+            )
+        counts = available_samples_by_agent(
+            arrays, fit_fraction, validation_fraction, split_seed
+        )
+        step = int(metadata["checkpoint_nominal_env_step"])
+        by_task.setdefault((source.task, step), []).append(
             {
                 "run_name": name,
-                "fit_min": int(fit.min()),
-                "test_min": int(test.min()),
-                "fit_by_agent": fit.tolist(),
-                "test_by_agent": test.tolist(),
+                **{f"{part}_min": int(values.min()) for part, values in counts.items()},
+                **{
+                    f"{part}_by_agent": values.tolist()
+                    for part, values in counts.items()
+                },
             }
         )
     chosen = {}
-    for task, census in by_task.items():
-        fit_available = min(item["fit_min"] for item in census)
-        test_available = min(item["test_min"] for item in census)
-        fit_count = min(fit_cap, fit_available)
-        test_count = min(test_cap, test_available)
-        if fit_count < 128 or test_count < 32:
-            raise RuntimeError(
-                f"{task} has too few eligible transitions for a probe: "
-                f"fit={fit_available}, test={test_available}; collect more episodes"
+    for (task, step), census in by_task.items():
+        available = {
+            part: min(item[f"{part}_min"] for item in census)
+            for part in ("fit", "validation", "test")
+        }
+        counts = {
+            part: min(cap, available[part])
+            for part, cap in (
+                ("fit", fit_cap),
+                ("validation", validation_cap),
+                ("test", test_cap),
             )
-        chosen[task] = {
-            "fit_samples_per_agent": fit_count,
-            "test_samples_per_agent": test_count,
-            "fit_available_min": fit_available,
-            "test_available_min": test_available,
+        }
+        if counts["fit"] < 128 or min(counts["validation"], counts["test"]) < 32:
+            raise RuntimeError(
+                f"{task} step {step:,} has too few eligible transitions: "
+                f"{available}; collect more episodes"
+            )
+        chosen.setdefault(task, {})[str(step)] = {
+            **{f"{part}_samples_per_agent": count for part, count in counts.items()},
+            **{f"{part}_available_min": count for part, count in available.items()},
             "census": census,
         }
     return chosen
@@ -121,19 +240,28 @@ def main():
     parser.add_argument("--seeds", default="1,2,3,4")
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--max-runs-per-gpu", type=int, default=1)
-    parser.add_argument("--episodes", type=int, default=512)
+    parser.add_argument("--episodes", type=int, default=1024)
     parser.add_argument("--collection-batch-size", type=int, default=64)
     parser.add_argument("--collection-seed-base", type=int, default=730000)
-    parser.add_argument("--fit-fraction", type=float, default=0.75)
+    parser.add_argument("--fit-fraction", type=float, default=0.70)
+    parser.add_argument("--validation-fraction", type=float, default=0.15)
+    parser.add_argument("--checkpoint-fractions", default="0.25,0.5,0.75,1.0")
+    parser.add_argument(
+        "--max-checkpoint-fraction-deviation", type=float, default=0.125
+    )
     parser.add_argument("--split-seed", type=int, default=20260923)
     parser.add_argument("--sampling-seed", type=int, default=20260924)
     parser.add_argument("--fit-samples-per-agent", type=int, default=16384)
+    parser.add_argument("--validation-samples-per-agent", type=int, default=4096)
     parser.add_argument("--test-samples-per-agent", type=int, default=4096)
     parser.add_argument("--fisher-ridge", type=float, default=1e-3)
     parser.add_argument("--probe-hidden-dim", type=int, default=256)
-    parser.add_argument("--probe-steps", type=int, default=2000)
+    parser.add_argument("--probe-residual-blocks", type=int, default=3)
+    parser.add_argument("--probe-steps", type=int, default=5000)
     parser.add_argument("--probe-batch-size", type=int, default=512)
     parser.add_argument("--probe-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--probe-validation-interval", type=int, default=100)
+    parser.add_argument("--probe-patience-evaluations", type=int, default=10)
     parser.add_argument("--probe-seed", type=int, default=20260925)
     parser.add_argument("--cpu-threads-per-worker", type=int, default=0)
     parser.add_argument("--skip-analysis", action="store_true")
@@ -143,6 +271,7 @@ def main():
     tasks = parse_items(args.tasks)
     seeds = parse_items(args.seeds, int)
     gpu_ids = parse_items(args.gpus)
+    fractions = parse_items(args.checkpoint_fractions, float)
     if not tasks or set(tasks) - set(TASKS):
         parser.error(f"--tasks must be drawn from {TASKS}")
     if not seeds or len(set(seeds)) != len(seeds):
@@ -151,10 +280,34 @@ def main():
         parser.error("--gpus must contain unique GPU IDs")
     if args.max_runs_per_gpu <= 0:
         parser.error("--max-runs-per-gpu must be positive")
-    if args.episodes < 2 or not 0 < args.fit_fraction < 1:
-        parser.error("episode count and fit fraction are invalid")
+    if (
+        args.episodes < 7
+        or not 0 < args.fit_fraction < 1
+        or not 0 < args.validation_fraction < 1 - args.fit_fraction
+    ):
+        parser.error("episodes and 70/15/15-style fractions are invalid")
     if args.fisher_ridge <= 0:
         parser.error("--fisher-ridge must be positive")
+    if args.max_checkpoint_fraction_deviation < 0:
+        parser.error("--max-checkpoint-fraction-deviation must be nonnegative")
+    if (
+        min(
+            args.fit_samples_per_agent,
+            args.validation_samples_per_agent,
+            args.test_samples_per_agent,
+            args.probe_hidden_dim,
+            args.probe_residual_blocks,
+            args.probe_steps,
+            args.probe_batch_size,
+            args.probe_validation_interval,
+            args.probe_patience_evaluations,
+        )
+        <= 0
+        or args.probe_learning_rate <= 0
+    ):
+        parser.error(
+            "Probe capacities, counts and optimization settings must be positive"
+        )
 
     sources = discover_sources(args.matrix_root.expanduser().resolve())
     selected, audit = choose_complete_cohorts(sources, seeds, CONDITIONS)
@@ -182,19 +335,33 @@ def main():
         raise RuntimeError(
             f"No complete final-checkpoint NPS cohort for {missing}; audit={relevant}"
         )
+    checkpoint_plan, checkpoint_paths = select_matched_checkpoints(
+        selected_sources,
+        fractions,
+        max_deviation=args.max_checkpoint_fraction_deviation,
+    )
+    checkpoint_sources = [
+        replace(
+            source,
+            checkpoint=checkpoint_paths[(source.key, row["env_step"])],
+        )
+        for source in selected_sources
+        for row in checkpoint_plan[source.task]
+    ]
 
     root = args.run_root.expanduser().resolve()
     for name in ("runs", "logs", "status", "analysis"):
         (root / name).mkdir(parents=True, exist_ok=True)
     protocol = {
-        "schema_version": 1,
-        "protocol": "smax-score-recoverability-v1.0",
+        "schema_version": 2,
+        "protocol": "smax-score-recoverability-resmlp-v2.0",
         "matrix_root": str(args.matrix_root.expanduser().resolve()),
         "tasks": list(tasks),
         "conditions": list(CONDITIONS),
         "seeds": list(seeds),
         "actor_parameterization": "nps",
         "selected_budgets": {task: selected[(task, "nps")] for task in tasks},
+        "checkpoint_plan": checkpoint_plan,
         "sources": [
             {
                 "task": source.task,
@@ -203,23 +370,28 @@ def main():
                 "budget": source.budget,
                 "checkpoint": str(source.checkpoint),
             }
-            for source in selected_sources
+            for source in checkpoint_sources
         ],
         "episodes": args.episodes,
         "collection_batch_size": args.collection_batch_size,
         "collection_seed_base": args.collection_seed_base,
         "collection_seed_policy": "same_seed_within_task",
         "fit_fraction": args.fit_fraction,
+        "validation_fraction": args.validation_fraction,
         "split_seed": args.split_seed,
         "sampling_seed": args.sampling_seed,
         "fit_samples_per_agent": args.fit_samples_per_agent,
+        "validation_samples_per_agent": args.validation_samples_per_agent,
         "test_samples_per_agent": args.test_samples_per_agent,
         "fisher_ridge_absolute": args.fisher_ridge,
         "fisher_source": "fit_split_only",
         "probe_hidden_dim": args.probe_hidden_dim,
+        "probe_residual_blocks": args.probe_residual_blocks,
         "probe_steps": args.probe_steps,
         "probe_batch_size": args.probe_batch_size,
         "probe_learning_rate": args.probe_learning_rate,
+        "probe_validation_interval": args.probe_validation_interval,
+        "probe_patience_evaluations": args.probe_patience_evaluations,
         "probe_seed": args.probe_seed,
     }
     protocol_path = root / "protocol.json"
@@ -233,9 +405,21 @@ def main():
         atomic_json(protocol_path, protocol)
 
     all_jobs = []
-    for source in selected_sources:
-        output = root / "runs" / source.task / source.condition / f"seed_{source.seed}"
-        name = f"{source.task}--{source.condition}--seed{source.seed}"
+    for source in checkpoint_sources:
+        step = int(
+            json.loads((source.checkpoint / "metadata.json").read_text())[
+                "nominal_env_step"
+            ]
+        )
+        output = (
+            root
+            / "runs"
+            / source.task
+            / source.condition
+            / f"seed_{source.seed}"
+            / f"step_{step:012d}"
+        )
+        name = f"{source.task}--{source.condition}--seed{source.seed}--step{step}"
         all_jobs.append((name, source, output))
     collect_jobs = [
         job
@@ -244,7 +428,7 @@ def main():
     ]
     probe_jobs = [job for job in all_jobs if not (job[2] / "summary.json").is_file()]
     print(
-        f"selected={len(selected_sources)} collect_pending={len(collect_jobs)} "
+        f"selected={len(checkpoint_sources)} collect_pending={len(collect_jobs)} "
         f"probe_pending={len(probe_jobs)} "
         f"tasks={','.join(tasks)}",
         flush=True,
@@ -252,7 +436,8 @@ def main():
     for task in tasks:
         print(
             f"cohort {task}: nps budget={selected[(task, 'nps')]:,} "
-            f"runs={len(CONDITIONS) * len(seeds)}",
+            f"runs={len(CONDITIONS) * len(seeds) * len(fractions)} "
+            f"matched_steps={[row['env_step'] for row in checkpoint_plan[task]]}",
             flush=True,
         )
     for name, source, output in probe_jobs:
@@ -298,6 +483,11 @@ def main():
                 active = sum(item[1] == gpu for item in running.values())
                 while pending[gpu] and active < args.max_runs_per_gpu:
                     name, source, output = pending[gpu].popleft()
+                    step = int(
+                        json.loads((source.checkpoint / "metadata.json").read_text())[
+                            "nominal_env_step"
+                        ]
+                    )
                     output.mkdir(parents=True, exist_ok=True)
                     log_path = root / "logs" / f"{name}.log"
                     handle = log_path.open("a", encoding="utf-8")
@@ -318,19 +508,33 @@ def main():
                         str(task_seed(args.collection_seed_base, source.task)),
                         "--fit-fraction",
                         str(args.fit_fraction),
+                        "--validation-fraction",
+                        str(args.validation_fraction),
                         "--split-seed",
                         str(args.split_seed),
                         "--sampling-seed",
                         str(args.sampling_seed),
                         "--fit-samples-per-agent",
                         str(
-                            sample_counts[source.task]["fit_samples_per_agent"]
+                            sample_counts[source.task][str(step)][
+                                "fit_samples_per_agent"
+                            ]
                             if sample_counts is not None
                             else args.fit_samples_per_agent
                         ),
+                        "--validation-samples-per-agent",
+                        str(
+                            sample_counts[source.task][str(step)][
+                                "validation_samples_per_agent"
+                            ]
+                            if sample_counts is not None
+                            else args.validation_samples_per_agent
+                        ),
                         "--test-samples-per-agent",
                         str(
-                            sample_counts[source.task]["test_samples_per_agent"]
+                            sample_counts[source.task][str(step)][
+                                "test_samples_per_agent"
+                            ]
                             if sample_counts is not None
                             else args.test_samples_per_agent
                         ),
@@ -338,12 +542,18 @@ def main():
                         str(args.fisher_ridge),
                         "--probe-hidden-dim",
                         str(args.probe_hidden_dim),
+                        "--probe-residual-blocks",
+                        str(args.probe_residual_blocks),
                         "--probe-steps",
                         str(args.probe_steps),
                         "--probe-batch-size",
                         str(args.probe_batch_size),
                         "--probe-learning-rate",
                         str(args.probe_learning_rate),
+                        "--probe-validation-interval",
+                        str(args.probe_validation_interval),
+                        "--probe-patience-evaluations",
+                        str(args.probe_patience_evaluations),
                         "--probe-seed",
                         str(args.probe_seed),
                     ]
@@ -413,8 +623,10 @@ def main():
     sample_counts = common_sample_counts(
         all_jobs,
         fit_fraction=args.fit_fraction,
+        validation_fraction=args.validation_fraction,
         split_seed=args.split_seed,
         fit_cap=args.fit_samples_per_agent,
+        validation_cap=args.validation_samples_per_agent,
         test_cap=args.test_samples_per_agent,
         expected_episodes=args.episodes,
         collection_seed_base=args.collection_seed_base,
@@ -428,17 +640,23 @@ def main():
     else:
         atomic_json(counts_path, sample_counts)
     for task in tasks:
-        chosen = sample_counts[task]
-        log(
-            f"{task} common fit={chosen['fit_samples_per_agent']:,} "
-            f"test={chosen['test_samples_per_agent']:,} valid transitions per agent"
-        )
+        for step, chosen in sample_counts[task].items():
+            log(
+                f"{task} step={int(step):,} common fit={chosen['fit_samples_per_agent']:,} "
+                f"validation={chosen['validation_samples_per_agent']:,} "
+                f"test={chosen['test_samples_per_agent']:,} valid transitions per agent"
+            )
     for _, source, output in all_jobs:
         summary_path = output / "summary.json"
         if summary_path.is_file():
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            chosen = sample_counts[source.task]
-            for key in ("fit_samples_per_agent", "test_samples_per_agent"):
+            step = int(summary["checkpoint_env_step"])
+            chosen = sample_counts[source.task][str(step)]
+            for key in (
+                "fit_samples_per_agent",
+                "validation_samples_per_agent",
+                "test_samples_per_agent",
+            ):
                 if int(summary[key]) != chosen[key]:
                     raise RuntimeError(
                         f"Existing probe result used a different sample count: {summary_path}"

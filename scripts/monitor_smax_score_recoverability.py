@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show all SMAX score-recoverability collection/probe jobs."""
+"""Show every task/condition/seed/checkpoint recoverability job."""
 
 from __future__ import annotations
 
@@ -18,23 +18,32 @@ def main():
     for task in protocol["tasks"]:
         for condition in protocol["conditions"]:
             for seed in protocol["seeds"]:
-                name = f"{task}--{condition}--seed{seed}"
-                output = root / "runs" / task / condition / f"seed_{seed}"
-                status_path = root / "status" / f"{name}.json"
-                progress_path = output / "progress.json"
-                if (output / "summary.json").is_file():
-                    status, stage = "COMPLETED", "completed"
-                elif status_path.is_file():
-                    payload = json.loads(status_path.read_text(encoding="utf-8"))
-                    status = str(payload.get("status", "unknown")).upper()
-                    stage = "starting"
-                    if progress_path.is_file():
-                        stage = json.loads(
-                            progress_path.read_text(encoding="utf-8")
-                        ).get("stage", stage)
-                else:
-                    status, stage = "PENDING", "waiting"
-                rows.append((status, stage, task, condition, seed))
+                for checkpoint in protocol["checkpoint_plan"][task]:
+                    step = int(checkpoint["env_step"])
+                    name = f"{task}--{condition}--seed{seed}--step{step}"
+                    output = (
+                        root
+                        / "runs"
+                        / task
+                        / condition
+                        / f"seed_{seed}"
+                        / f"step_{step:012d}"
+                    )
+                    status_path = root / "status" / f"{name}.json"
+                    progress_path = output / "progress.json"
+                    if (output / "summary.json").is_file():
+                        status, stage = "COMPLETED", "completed"
+                    elif status_path.is_file():
+                        payload = json.loads(status_path.read_text(encoding="utf-8"))
+                        status = str(payload.get("status", "unknown")).upper()
+                        stage = "starting"
+                        if progress_path.is_file():
+                            stage = json.loads(
+                                progress_path.read_text(encoding="utf-8")
+                            ).get("stage", stage)
+                    else:
+                        status, stage = "PENDING", "waiting"
+                    rows.append((status, stage, task, condition, seed, step))
     counts = {
         state: sum(row[0] == state for row in rows)
         for state in ("COMPLETED", "COLLECTED", "RUNNING", "FAILED", "PENDING")
@@ -43,8 +52,11 @@ def main():
         " ".join(f"{key}={value}" for key, value in counts.items())
         + f" TOTAL={len(rows)}"
     )
-    for status, stage, task, condition, seed in rows:
-        print(f"{status:9s} {stage:16s} {task:20s} " f"{condition:12s} seed={seed}")
+    for status, stage, task, condition, seed, step in rows:
+        print(
+            f"{status:9s} {stage:16s} {task:20s} "
+            f"{condition:12s} seed={seed} step={step:,}"
+        )
     launcher = root / "launcher.log"
     if launcher.is_file():
         print("\nLatest launcher events:")

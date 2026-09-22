@@ -22,19 +22,24 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--stage", choices=("all", "collect", "probe"), default="all")
-    parser.add_argument("--episodes", type=int, default=512)
+    parser.add_argument("--episodes", type=int, default=1024)
     parser.add_argument("--collection-batch-size", type=int, default=64)
     parser.add_argument("--collection-seed", type=int, required=True)
-    parser.add_argument("--fit-fraction", type=float, default=0.75)
+    parser.add_argument("--fit-fraction", type=float, default=0.70)
+    parser.add_argument("--validation-fraction", type=float, default=0.15)
     parser.add_argument("--split-seed", type=int, default=20260923)
     parser.add_argument("--sampling-seed", type=int, default=20260924)
     parser.add_argument("--fit-samples-per-agent", type=int, default=16384)
+    parser.add_argument("--validation-samples-per-agent", type=int, default=4096)
     parser.add_argument("--test-samples-per-agent", type=int, default=4096)
     parser.add_argument("--fisher-ridge", type=float, default=1e-3)
     parser.add_argument("--probe-hidden-dim", type=int, default=256)
-    parser.add_argument("--probe-steps", type=int, default=2000)
+    parser.add_argument("--probe-residual-blocks", type=int, default=3)
+    parser.add_argument("--probe-steps", type=int, default=5000)
     parser.add_argument("--probe-batch-size", type=int, default=512)
     parser.add_argument("--probe-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--probe-validation-interval", type=int, default=100)
+    parser.add_argument("--probe-patience-evaluations", type=int, default=10)
     parser.add_argument("--probe-seed", type=int, default=20260925)
     return parser.parse_args()
 
@@ -115,15 +120,20 @@ def main():
         diagnostics,
         output,
         fit_fraction=args.fit_fraction,
+        validation_fraction=args.validation_fraction,
         split_seed=args.split_seed,
         sampling_seed=args.sampling_seed,
         fit_samples_per_agent=args.fit_samples_per_agent,
+        validation_samples_per_agent=args.validation_samples_per_agent,
         test_samples_per_agent=args.test_samples_per_agent,
         fisher_ridge=args.fisher_ridge,
         probe_hidden_dim=args.probe_hidden_dim,
+        probe_residual_blocks=args.probe_residual_blocks,
         probe_steps=args.probe_steps,
         probe_batch_size=args.probe_batch_size,
         probe_learning_rate=args.probe_learning_rate,
+        probe_validation_interval=args.probe_validation_interval,
+        probe_patience_evaluations=args.probe_patience_evaluations,
         probe_seed=args.probe_seed,
     )
     write_progress(

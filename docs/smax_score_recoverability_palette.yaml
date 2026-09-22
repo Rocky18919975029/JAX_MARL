@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "palette_id": "smax-score-recoverability-v2",
+  "paper_id": "actor-critic-compatibility",
+  "status": "frozen",
+  "description": "Stable conditions across all three task-separated recoverability figures.",
+  "semantic": {
+    "canvas": "#FFFFFF",
+    "ink": "#172033",
+    "muted": "#5B6472",
+    "stroke": "#D9D9D9",
+    "neutral": "#333333",
+    "accent": "#0072B2",
+    "secondary": "#D55E00"
+  },
+  "chart_roles": {
+    "isolated": "#333333",
+    "c_to_a_linear_cka": "#0072B2",
+    "c_to_a_ln_mse": "#D55E00",
+    "zero_predictor": "#777777"
+  },
+  "rules": {
+    "same_condition_same_color_across_tasks": true,
+    "line_style_and_marker_redundancy": true,
+    "background_policy": "white"
+  }
+}

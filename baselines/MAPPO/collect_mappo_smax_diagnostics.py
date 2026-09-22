@@ -43,6 +43,7 @@ SCORE_RECOVERABILITY_ARRAYS = frozenset(
         "actor_latent",
         "critic_latent",
         "actor_score",
+        "reward",
     }
 )
 

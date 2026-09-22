@@ -1,0 +1,41 @@
+claim: "Score recoverability and stochastic return are measured at the same matched checkpoints, separately for each SMAX task."
+five_second_takeaway: "Compare whether the condition with higher return also has lower held-out score-prediction error as training progresses."
+audience: "multi-agent reinforcement learning researchers"
+venue:
+  name: "ICLR-style double-column manuscript"
+  layout: "double-column"
+  target_width_mm: 178
+academic_style:
+  policy: "scientific-figure-design/assets/academic-style.yaml"
+  exceptions: []
+paper_palette:
+  path: "smax_score_recoverability_palette.yaml"
+  palette_id: "smax-score-recoverability-v2"
+  status: "frozen"
+figure_archetype: "aligned training curves"
+comparison_objects: ["Isolated", "C→A LN-MSE", "C→A Linear CKA"]
+visual_anchor:
+  type: "zero predictor"
+  label: "normalized error = 1"
+reading_order: "return on the left, recoverability on the right; training steps shared"
+panels:
+  - id: "a"
+    purpose: "stochastic on-policy episode return"
+  - id: "b"
+    purpose: "held-out normalized score recoverability error"
+semantic_encodings:
+  color: {"Isolated": "neutral", "LN-MSE": "orange", "Linear CKA": "blue"}
+  shape: {"Isolated": "circle", "LN-MSE": "triangle", "Linear CKA": "square"}
+  line_style: {"Isolated": "dashed", "LN-MSE": "dash-dot", "Linear CKA": "solid"}
+accessibility:
+  grayscale_redundancy: "distinct line styles and markers"
+  color_vision_strategy: "color is not the only condition cue"
+provenance:
+  data: "frozen checkpoint stochastic rollouts, v2 task-condition-seed-step CSV"
+  visual_elements: "Matplotlib-generated axes and vector text; no third-party assets"
+deliverables:
+  editable_source: "scripts/analyze_smax_score_recoverability.py"
+  vector_master: "analysis/<task>/return-vs-score-recoverability.svg"
+  pdf_master: "analysis/<task>/return-vs-score-recoverability.pdf"
+  png_preview: "analysis/<task>/return-vs-score-recoverability.png"
+caption_draft: "Task-separated stochastic return and held-out normalized policy-score recoverability at four matched saved checkpoints. Lines show four-seed means, shading shows 95% bootstrap confidence intervals, and the horizontal line marks the zero-predictor error of 1."
