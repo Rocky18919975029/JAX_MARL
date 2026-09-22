@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Display all ShadowHandOver HAPPO/MAPPO/MADPO run progress."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+from experiments.harl_dexhands.protocol import (  # noqa: E402
+    ALGORITHMS,
+    parse_csv,
+    parse_seeds,
+    task_matrix,
+)
+
+
+def bar(progress: float, width: int = 28) -> str:
+    filled = min(width, max(0, round(width * progress)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def load_rows(
+    root: Path,
+    algorithms: tuple[str, ...],
+    seeds: tuple[int, ...],
+    *,
+    div_coef: float = 1000.0,
+    div_weight: float = 0.05,
+    div_sigma: float = 1.0,
+    div_max_samples: int = 1024,
+) -> list[dict]:
+    rows = []
+    for task in task_matrix(
+        algorithms,
+        seeds,
+        div_coef=div_coef,
+        div_weight=div_weight,
+        div_sigma=div_sigma,
+        div_max_samples=div_max_samples,
+    ):
+        path = root / "status" / f"{task.name}.json"
+        if not path.is_file():
+            rows.append(
+                {"name": task.name, "status": "pending", "steps": 0, "total": 0}
+            )
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        state = str(payload.get("status", "unknown"))
+        total = int(payload.get("total_env_steps", 0))
+        steps = int(payload.get("env_steps", 0))
+        if state == "completed":
+            steps = total
+        rows.append(
+            {"name": task.name, "status": state, "steps": steps, "total": total}
+        )
+    return rows
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--algorithms", default="happo,mappo,madpo")
+    parser.add_argument("--seeds", default="1-4")
+    parser.add_argument("--div-coef", type=float, default=1000.0)
+    parser.add_argument("--div-weight", type=float, default=0.05)
+    parser.add_argument("--div-sigma", type=float, default=1.0)
+    parser.add_argument("--div-max-samples", type=int, default=1024)
+    args = parser.parse_args()
+    algorithms = parse_csv(args.algorithms, ALGORITHMS)
+    seeds = parse_seeds(args.seeds)
+    root = args.run_root.expanduser().resolve()
+    rows = load_rows(
+        root,
+        algorithms,
+        seeds,
+        div_coef=args.div_coef,
+        div_weight=args.div_weight,
+        div_sigma=args.div_sigma,
+        div_max_samples=args.div_max_samples,
+    )
+    counts = {
+        state: sum(row["status"] == state for row in rows)
+        for state in ("completed", "running", "failed", "pending")
+    }
+    print(
+        f"DONE={counts['completed']} RUNNING={counts['running']} "
+        f"FAILED={counts['failed']} PENDING={counts['pending']} TOTAL={len(rows)}\n"
+    )
+    for row in rows:
+        progress = row["steps"] / row["total"] if row["total"] else 0.0
+        print(
+            f"{row['status'].upper():9s} [{bar(progress)}] {progress:7.2%} "
+            f"{row['steps']:>11,}/{row['total']:,}  {row['name']}"
+        )
+    launcher = root / "launcher.log"
+    if launcher.is_file():
+        print("\nLatest launcher events:")
+        print("\n".join(launcher.read_text(encoding="utf-8").splitlines()[-12:]))
+
+
+if __name__ == "__main__":
+    main()
