@@ -3,6 +3,7 @@ import json
 import numpy as np
 
 from scripts.analyze_smax_three_condition_suite import (
+    CONDITIONS_BY_DIRECTION,
     CONDITIONS,
     Source,
     aggregate_table,
@@ -20,8 +21,8 @@ def make_source(tmp_path, task, budget, condition, seed, actor_parameterization=
     )
     final = run / "final"
     final.mkdir(parents=True)
-    mode = "none" if condition == "none" else "c_to_a"
-    distance = "linear_cka" if condition == "c_to_a_cka" else "ln_mse"
+    mode = "none" if condition == "none" else condition.rsplit("_", 1)[0]
+    distance = "linear_cka" if condition.endswith("_cka") else "ln_mse"
     metadata = {
         "map_name": task,
         "seed": seed,
@@ -60,10 +61,16 @@ def make_source(tmp_path, task, budget, condition, seed, actor_parameterization=
     )
 
 
-def complete_matrix(tmp_path, task, budget, actor_parameterization="nps"):
+def complete_matrix(
+    tmp_path,
+    task,
+    budget,
+    actor_parameterization="nps",
+    conditions=CONDITIONS,
+):
     return {
         source.key: source
-        for condition in CONDITIONS
+        for condition in conditions
         for seed in (1, 2, 3, 4)
         for source in (
             make_source(
@@ -92,6 +99,15 @@ def test_discovers_arbitrary_tasks_for_ps_and_nps(tmp_path):
     assert set(discovered) == set(expected)
 
 
+def test_discovers_a_to_c_mse_and_cka(tmp_path):
+    conditions = CONDITIONS_BY_DIRECTION["a_to_c"]
+    expected = complete_matrix(
+        tmp_path, "custom_map", 100, conditions=conditions
+    )
+    discovered = discover_sources(tmp_path)
+    assert set(discovered) == set(expected)
+
+
 def test_selects_largest_complete_budget_per_task(tmp_path):
     sources = complete_matrix(tmp_path / "short", "map", 100)
     sources.update(complete_matrix(tmp_path / "long", "map", 200))
@@ -99,6 +115,21 @@ def test_selects_largest_complete_budget_per_task(tmp_path):
     selected, audit = choose_complete_cohorts(sources, (1, 2, 3, 4))
     assert selected == {("map", "nps"): 100}
     assert any(row["training_budget_env_steps"] == 200 and not row["complete"] for row in audit)
+
+
+def test_selects_a_to_c_cohort_without_using_c_to_a_runs(tmp_path):
+    a_to_c = CONDITIONS_BY_DIRECTION["a_to_c"]
+    sources = complete_matrix(tmp_path / "a-to-c", "map", 100, conditions=a_to_c)
+    sources.update(complete_matrix(tmp_path / "c-to-a", "map", 200))
+    selected, audit = choose_complete_cohorts(
+        sources, (1, 2, 3, 4), conditions=a_to_c
+    )
+    assert selected == {("map", "nps"): 100}
+    long_budget = next(
+        row for row in audit if row["training_budget_env_steps"] == 200
+    )
+    assert not long_budget["complete"]
+    assert "a_to_c_cka:seed1" in long_budget["missing_runs"]
 
 
 def test_final_performance_is_mean_of_last_five_saved_checkpoints(tmp_path):

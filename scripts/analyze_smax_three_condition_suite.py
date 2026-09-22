@@ -31,21 +31,32 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import MaxNLocator, ScalarFormatter
 
 
-CONDITIONS = ("none", "c_to_a_cka", "c_to_a_mse")
+ALIGNMENT_DIRECTIONS = ("c_to_a", "a_to_c")
+CONDITIONS_BY_DIRECTION = {
+    direction: ("none", f"{direction}_cka", f"{direction}_mse")
+    for direction in ALIGNMENT_DIRECTIONS
+}
+CONDITIONS = CONDITIONS_BY_DIRECTION["c_to_a"]
 CONDITION_SPECS = {
     "none": ("none", None),
     "c_to_a_mse": ("c_to_a", "ln_mse"),
     "c_to_a_cka": ("c_to_a", "linear_cka"),
+    "a_to_c_mse": ("a_to_c", "ln_mse"),
+    "a_to_c_cka": ("a_to_c", "linear_cka"),
 }
 DISPLAY = {
     "none": "Isolated",
     "c_to_a_cka": "C → A (Linear CKA)",
     "c_to_a_mse": "C → A (LN-MSE)",
+    "a_to_c_cka": "A → C (Linear CKA)",
+    "a_to_c_mse": "A → C (LN-MSE)",
 }
 STYLE = {
     "none": ("#333333", (0, (5, 2)), "o"),
     "c_to_a_cka": ("#0072B2", "-", "s"),
     "c_to_a_mse": ("#D55E00", "-.", "^"),
+    "a_to_c_cka": ("#0072B2", "-", "s"),
+    "a_to_c_mse": ("#D55E00", "-.", "^"),
 }
 
 
@@ -188,7 +199,7 @@ def discover_sources(matrix_root: Path):
     return sources
 
 
-def choose_complete_cohorts(sources, seeds):
+def choose_complete_cohorts(sources, seeds, conditions=CONDITIONS):
     """Choose the largest complete budget for every task/parameterization."""
     cell_budgets = defaultdict(set)
     for task, actor_parameterization, budget, _, _ in sources:
@@ -200,7 +211,7 @@ def choose_complete_cohorts(sources, seeds):
         for budget in sorted(cell_budgets[(task, actor_parameterization)]):
             missing = [
                 f"{condition}:seed{seed}"
-                for condition in CONDITIONS
+                for condition in conditions
                 for seed in seeds
                 if (
                     task,
@@ -216,8 +227,8 @@ def choose_complete_cohorts(sources, seeds):
                     "task": task,
                     "actor_parameterization": actor_parameterization,
                     "training_budget_env_steps": budget,
-                    "n_expected_runs": len(CONDITIONS) * len(seeds),
-                    "n_complete_runs": len(CONDITIONS) * len(seeds) - len(missing),
+                    "n_expected_runs": len(conditions) * len(seeds),
+                    "n_complete_runs": len(conditions) * len(seeds) - len(missing),
                     "complete": not missing,
                     "selected": False,
                     "missing_runs": ";".join(missing),
@@ -403,7 +414,9 @@ def exact_bootstrap_mean_ci(values):
     return float(values.mean()), float(low), float(high)
 
 
-def aggregate_table(task, actor_parameterization, budget, rows, seeds):
+def aggregate_table(
+    task, actor_parameterization, budget, rows, seeds, conditions=CONDITIONS
+):
     baseline = {
         row["seed"]: row for row in rows if row["condition"] == "none"
     }
@@ -414,7 +427,7 @@ def aggregate_table(task, actor_parameterization, budget, rows, seeds):
         "win_rate_auc",
         "final_win_rate_last5_ckpt",
     )
-    for condition in CONDITIONS:
+    for condition in conditions:
         selected = sorted(
             (row for row in rows if row["condition"] == condition),
             key=lambda row: row["seed"],
@@ -459,11 +472,17 @@ def aggregate_table(task, actor_parameterization, budget, rows, seeds):
 
 
 def aggregate_curves(
-    task, actor_parameterization, budget, histories, seeds, points=201
+    task,
+    actor_parameterization,
+    budget,
+    histories,
+    seeds,
+    points=201,
+    conditions=CONDITIONS,
 ):
     grid = np.linspace(0, budget, points, dtype=np.float64)
     rows = []
-    for condition in CONDITIONS:
+    for condition in conditions:
         values = []
         for seed in seeds:
             key = (task, actor_parameterization, budget, condition, seed)
@@ -488,7 +507,15 @@ def aggregate_curves(
     return rows
 
 
-def plot_task(task, actor_parameterization, budget, curve_rows, output):
+def plot_task(
+    task,
+    actor_parameterization,
+    budget,
+    curve_rows,
+    output,
+    conditions=CONDITIONS,
+    alignment_direction="c_to_a",
+):
     style = {
         "font.family": "sans-serif",
         "font.sans-serif": ["DejaVu Sans", "Arial", "Liberation Sans"],
@@ -506,7 +533,7 @@ def plot_task(task, actor_parameterization, budget, curve_rows, output):
     with plt.rc_context(style):
         figure, axis = plt.subplots(figsize=(7.2, 4.45))
         handles = []
-        for condition in CONDITIONS:
+        for condition in conditions:
             color, linestyle, marker = STYLE[condition]
             selected = sorted(
                 (row for row in curve_rows if row["condition"] == condition),
@@ -566,8 +593,10 @@ def plot_task(task, actor_parameterization, budget, curve_rows, output):
             handlelength=2.8,
         )
         figure.tight_layout(pad=0.8)
+        direction_slug = alignment_direction.replace("_", "-")
         stem = output / (
-            f"smax-{task}-{actor_parameterization}-three-condition-learning-curve"
+            f"smax-{task}-{actor_parameterization}-{direction_slug}-"
+            "three-condition-learning-curve"
         )
         figure.savefig(stem.with_suffix(".png"), dpi=400, bbox_inches="tight")
         figure.savefig(stem.with_suffix(".pdf"), bbox_inches="tight")
@@ -588,6 +617,11 @@ def main():
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--seeds", type=parse_seeds, default=(1, 2, 3, 4))
     parser.add_argument("--final-checkpoints", type=int, default=5)
+    parser.add_argument(
+        "--alignment-direction",
+        choices=ALIGNMENT_DIRECTIONS,
+        default="c_to_a",
+    )
     parser.add_argument("--wandb-entity")
     parser.add_argument("--refresh-wandb", action="store_true")
     args = parser.parse_args()
@@ -597,8 +631,11 @@ def main():
     matrix_root = args.matrix_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    conditions = CONDITIONS_BY_DIRECTION[args.alignment_direction]
     sources = discover_sources(matrix_root)
-    selected, cohort_audit = choose_complete_cohorts(sources, args.seeds)
+    selected, cohort_audit = choose_complete_cohorts(
+        sources, args.seeds, conditions=conditions
+    )
     write_csv(
         output_root / "cohort_audit.csv",
         cohort_audit,
@@ -630,7 +667,7 @@ def main():
     issues = []
     selected_sources = {}
     for (task, actor_parameterization), budget in sorted(selected.items()):
-        for condition in CONDITIONS:
+        for condition in conditions:
             for seed in args.seeds:
                 key = (task, actor_parameterization, budget, condition, seed)
                 source = sources[key]
@@ -681,7 +718,8 @@ def main():
     manifest = {
         "schema_version": 1,
         "matrix_root": str(matrix_root),
-        "conditions": list(CONDITIONS),
+        "alignment_direction": args.alignment_direction,
+        "conditions": list(conditions),
         "seeds": list(args.seeds),
         "tasks_are_never_pooled": True,
         "parameterizations_are_never_pooled": True,
@@ -703,7 +741,7 @@ def main():
         task_output = output_root / task / actor_parameterization
         task_output.mkdir(parents=True, exist_ok=True)
         rows = []
-        for condition in CONDITIONS:
+        for condition in conditions:
             for seed in args.seeds:
                 key = (task, actor_parameterization, budget, condition, seed)
                 rows.append(
@@ -714,7 +752,12 @@ def main():
                     )
                 )
         summary = aggregate_table(
-            task, actor_parameterization, budget, rows, args.seeds
+            task,
+            actor_parameterization,
+            budget,
+            rows,
+            args.seeds,
+            conditions=conditions,
         )
         curves = aggregate_curves(
             task,
@@ -722,19 +765,27 @@ def main():
             budget,
             histories,
             args.seeds,
+            conditions=conditions,
         )
         write_csv(task_output / "seed_metrics.csv", rows)
         write_csv(task_output / "summary.csv", summary)
         write_csv(task_output / "learning_curve.csv", curves)
         stem = plot_task(
-            task, actor_parameterization, budget, curves, task_output
+            task,
+            actor_parameterization,
+            budget,
+            curves,
+            task_output,
+            conditions=conditions,
+            alignment_direction=args.alignment_direction,
         )
         task_manifest = {
             "schema_version": 1,
             "task": task,
             "actor_parameterization": actor_parameterization,
             "training_budget_env_steps": budget,
-            "conditions": list(CONDITIONS),
+            "alignment_direction": args.alignment_direction,
+            "conditions": list(conditions),
             "seeds": list(args.seeds),
             "table": str(task_output / "summary.csv"),
             "seed_metrics": str(task_output / "seed_metrics.csv"),
