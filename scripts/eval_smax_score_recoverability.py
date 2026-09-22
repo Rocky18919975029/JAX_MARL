@@ -21,6 +21,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--stage", choices=("all", "collect", "probe"), default="all")
     parser.add_argument("--episodes", type=int, default=512)
     parser.add_argument("--collection-batch-size", type=int, default=64)
     parser.add_argument("--collection-seed", type=int, required=True)
@@ -71,7 +72,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     progress = output / "progress.json"
     summary = output / "summary.json"
-    if summary.is_file():
+    if summary.is_file() and args.stage != "collect":
         print(summary)
         return
 
@@ -79,6 +80,10 @@ def main():
     metadata_path = diagnostics / "metadata.json"
     if metadata_path.is_file():
         validate_collection(metadata_path, checkpoint_dir, args)
+    elif args.stage == "probe":
+        raise FileNotFoundError(
+            f"Collection is required before probe fitting: {metadata_path}"
+        )
     else:
         write_progress(progress, "collecting", checkpoint=str(checkpoint_dir))
         command = [
@@ -99,6 +104,11 @@ def main():
         ]
         subprocess.run(command, cwd=REPO_ROOT, check=True)
         validate_collection(metadata_path, checkpoint_dir, args)
+
+    if args.stage == "collect":
+        write_progress(progress, "collected", checkpoint=str(checkpoint_dir))
+        print(metadata_path)
+        return
 
     write_progress(progress, "fitting_probes", checkpoint=str(checkpoint_dir))
     _, protocol = measure_score_recoverability(

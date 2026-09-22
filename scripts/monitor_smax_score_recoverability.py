@@ -37,7 +37,7 @@ def main():
                 rows.append((status, stage, task, condition, seed))
     counts = {
         state: sum(row[0] == state for row in rows)
-        for state in ("COMPLETED", "RUNNING", "FAILED", "PENDING")
+        for state in ("COMPLETED", "COLLECTED", "RUNNING", "FAILED", "PENDING")
     }
     print(
         " ".join(f"{key}={value}" for key, value in counts.items())

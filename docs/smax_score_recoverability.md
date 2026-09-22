@@ -16,11 +16,16 @@ probability with respect to the actor GRU output.  The measurement then:
    critic latent plus one-hot action to the whitened score;
 5. reports vector squared error divided by held-out whitened-score energy.
 
-The frozen defaults are 512 evaluation episodes, 16,384 fit and 4,096 test
-transitions per agent, `xi=1e-3`, and a one-hidden-layer 256-unit MLP trained
-for 2,000 Adam steps.  All conditions within a task use the same environment
-reset seed, episode split, exact sample counts, probe initialization, and
-optimization schedule.  RL parameters and collected arrays are detached.
+The frozen defaults are 512 evaluation episodes, upper limits of 16,384 fit
+and 4,096 test transitions per agent, `xi=1e-3`, and a one-hidden-layer
+256-unit MLP trained for 2,000 Adam steps. The launcher first collects every
+selected run, counts valid transitions in the fit/test episodes, and chooses
+the minimum available count within each task, capped at those limits. Every
+condition and seed in that task then uses the same exact number of samples.
+The realized counts and full per-agent census are saved in
+`RUN_ROOT/sample_counts.json`. All conditions within a task use the same
+environment reset seed, episode split, probe initialization, and optimization
+schedule. RL parameters and collected arrays are detached.
 
 The launcher recursively discovers the largest complete final-checkpoint
 `none` / `c_to_a_mse` / `c_to_a_cka` NPS cohort for each task:
@@ -40,7 +45,8 @@ watch -n 10 python scripts/monitor_smax_score_recoverability.py \
   --run-root /path/for/score_recoverability
 ```
 
-The launcher automatically writes task-separated CSV tables and both combined
+The launcher resumes from cached collections after a failed probe fit. It
+automatically writes task-separated CSV tables and both combined
 and per-task PNG/PDF figures under `RUN_ROOT/analysis`.  Tasks are never pooled.
 The 95% confidence intervals bootstrap training seeds; the four-seed case uses
 all `4^4` ordered ordinary-bootstrap resamples.

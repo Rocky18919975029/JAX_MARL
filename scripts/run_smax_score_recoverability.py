@@ -23,6 +23,8 @@ from scripts.analyze_smax_three_condition_suite import (
     choose_complete_cohorts,
     discover_sources,
 )
+from scripts.h1_diagnostic_data import load_diagnostics
+from scripts.smax_score_recoverability import available_samples_by_agent
 
 
 TASKS = ("10m_vs_11m", "3s5z_vs_3s6z", "smacv2_10_units")
@@ -45,6 +47,70 @@ def atomic_json(path: Path, payload):
 
 def parse_items(raw, cast=str):
     return tuple(cast(item.strip()) for item in raw.split(",") if item.strip())
+
+
+def common_sample_counts(
+    jobs,
+    *,
+    fit_fraction,
+    split_seed,
+    fit_cap,
+    test_cap,
+    expected_episodes=None,
+    collection_seed_base=None,
+):
+    """Choose equal per-agent counts for every condition and seed in a task."""
+
+    by_task = {}
+    for name, source, output in jobs:
+        directory = output / "collected"
+        metadata, arrays = load_diagnostics(directory, ("active", "alive"))
+        if int(metadata["episodes"]) != len(arrays["active"]):
+            raise RuntimeError(f"Incomplete collected episodes for {name}")
+        if metadata.get("checkpoint") != str(source.checkpoint):
+            raise RuntimeError(
+                f"Cached collection belongs to another checkpoint: {name}"
+            )
+        if (
+            expected_episodes is not None
+            and int(metadata["episodes"]) != expected_episodes
+        ):
+            raise RuntimeError(f"Cached collection has the wrong episode count: {name}")
+        if collection_seed_base is not None and int(
+            metadata["diagnostic_seed"]
+        ) != task_seed(collection_seed_base, source.task):
+            raise RuntimeError(f"Cached collection has the wrong rollout seed: {name}")
+        if metadata.get("array_profile") not in ("score_recoverability", None):
+            raise RuntimeError(f"Cached collection has the wrong array profile: {name}")
+        fit, test = available_samples_by_agent(arrays, fit_fraction, split_seed)
+        by_task.setdefault(source.task, []).append(
+            {
+                "run_name": name,
+                "fit_min": int(fit.min()),
+                "test_min": int(test.min()),
+                "fit_by_agent": fit.tolist(),
+                "test_by_agent": test.tolist(),
+            }
+        )
+    chosen = {}
+    for task, census in by_task.items():
+        fit_available = min(item["fit_min"] for item in census)
+        test_available = min(item["test_min"] for item in census)
+        fit_count = min(fit_cap, fit_available)
+        test_count = min(test_cap, test_available)
+        if fit_count < 128 or test_count < 32:
+            raise RuntimeError(
+                f"{task} has too few eligible transitions for a probe: "
+                f"fit={fit_available}, test={test_available}; collect more episodes"
+            )
+        chosen[task] = {
+            "fit_samples_per_agent": fit_count,
+            "test_samples_per_agent": test_count,
+            "fit_available_min": fit_available,
+            "test_available_min": test_available,
+            "census": census,
+        }
+    return chosen
 
 
 def main():
@@ -166,14 +232,20 @@ def main():
     else:
         atomic_json(protocol_path, protocol)
 
-    jobs = []
+    all_jobs = []
     for source in selected_sources:
         output = root / "runs" / source.task / source.condition / f"seed_{source.seed}"
         name = f"{source.task}--{source.condition}--seed{source.seed}"
-        if not (output / "summary.json").is_file():
-            jobs.append((name, source, output))
+        all_jobs.append((name, source, output))
+    collect_jobs = [
+        job
+        for job in all_jobs
+        if not (job[2] / "collected" / "metadata.json").is_file()
+    ]
+    probe_jobs = [job for job in all_jobs if not (job[2] / "summary.json").is_file()]
     print(
-        f"selected={len(selected_sources)} pending={len(jobs)} "
+        f"selected={len(selected_sources)} collect_pending={len(collect_jobs)} "
+        f"probe_pending={len(probe_jobs)} "
         f"tasks={','.join(tasks)}",
         flush=True,
     )
@@ -183,7 +255,7 @@ def main():
             f"runs={len(CONDITIONS) * len(seeds)}",
             flush=True,
         )
-    for name, source, output in jobs:
+    for name, source, output in probe_jobs:
         print(f"{name}: {source.checkpoint} -> {output}", flush=True)
     if args.dry_run:
         return
@@ -192,9 +264,6 @@ def main():
     cpu_threads = args.cpu_threads_per_worker or max(
         1, (os.cpu_count() or slots) // slots
     )
-    pending = {gpu: deque() for gpu in gpu_ids}
-    for index, job in enumerate(jobs):
-        pending[gpu_ids[index % len(gpu_ids)]].append(job)
     launcher_log = root / "launcher.log"
 
     def log(message):
@@ -204,7 +273,6 @@ def main():
         with launcher_log.open("a", encoding="utf-8") as file:
             file.write(line + "\n")
 
-    running = {}
     stopping = False
 
     def stop(_signum, _frame):
@@ -213,110 +281,170 @@ def main():
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    failures = 0
-    while any(pending.values()) or running:
-        if stopping:
-            for process, _, _, handle in running.values():
-                process.terminate()
+
+    def run_stage(stage, jobs, sample_counts=None):
+        pending = {gpu: deque() for gpu in gpu_ids}
+        for index, job in enumerate(jobs):
+            pending[gpu_ids[index % len(gpu_ids)]].append(job)
+        running = {}
+        failures = 0
+        while any(pending.values()) or running:
+            if stopping:
+                for process, _, _, handle in running.values():
+                    process.terminate()
+                    handle.close()
+                raise SystemExit(130)
+            for gpu in gpu_ids:
+                active = sum(item[1] == gpu for item in running.values())
+                while pending[gpu] and active < args.max_runs_per_gpu:
+                    name, source, output = pending[gpu].popleft()
+                    output.mkdir(parents=True, exist_ok=True)
+                    log_path = root / "logs" / f"{name}.log"
+                    handle = log_path.open("a", encoding="utf-8")
+                    command = [
+                        sys.executable,
+                        str(REPO_ROOT / "scripts/eval_smax_score_recoverability.py"),
+                        "--checkpoint",
+                        str(source.checkpoint),
+                        "--output-dir",
+                        str(output),
+                        "--stage",
+                        stage,
+                        "--episodes",
+                        str(args.episodes),
+                        "--collection-batch-size",
+                        str(args.collection_batch_size),
+                        "--collection-seed",
+                        str(task_seed(args.collection_seed_base, source.task)),
+                        "--fit-fraction",
+                        str(args.fit_fraction),
+                        "--split-seed",
+                        str(args.split_seed),
+                        "--sampling-seed",
+                        str(args.sampling_seed),
+                        "--fit-samples-per-agent",
+                        str(
+                            sample_counts[source.task]["fit_samples_per_agent"]
+                            if sample_counts is not None
+                            else args.fit_samples_per_agent
+                        ),
+                        "--test-samples-per-agent",
+                        str(
+                            sample_counts[source.task]["test_samples_per_agent"]
+                            if sample_counts is not None
+                            else args.test_samples_per_agent
+                        ),
+                        "--fisher-ridge",
+                        str(args.fisher_ridge),
+                        "--probe-hidden-dim",
+                        str(args.probe_hidden_dim),
+                        "--probe-steps",
+                        str(args.probe_steps),
+                        "--probe-batch-size",
+                        str(args.probe_batch_size),
+                        "--probe-learning-rate",
+                        str(args.probe_learning_rate),
+                        "--probe-seed",
+                        str(args.probe_seed),
+                    ]
+                    environment = dict(os.environ)
+                    environment.pop("LD_LIBRARY_PATH", None)
+                    environment.update(
+                        {
+                            "CUDA_VISIBLE_DEVICES": gpu,
+                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                            "JAX_ENABLE_X64": "false",
+                            "OMP_NUM_THREADS": str(cpu_threads),
+                            "OPENBLAS_NUM_THREADS": str(cpu_threads),
+                            "MKL_NUM_THREADS": str(cpu_threads),
+                            "NUMEXPR_NUM_THREADS": str(cpu_threads),
+                        }
+                    )
+                    process = subprocess.Popen(
+                        command,
+                        cwd=REPO_ROOT,
+                        env=environment,
+                        stdout=handle,
+                        stderr=subprocess.STDOUT,
+                    )
+                    running[process.pid] = (process, gpu, name, handle)
+                    atomic_json(
+                        root / "status" / f"{name}.json",
+                        {
+                            "status": "running",
+                            "stage": stage,
+                            "pid": process.pid,
+                            "gpu": gpu,
+                            "run_name": name,
+                            "output_dir": str(output),
+                        },
+                    )
+                    log(f"GPU {gpu} START {stage} {name} pid={process.pid}")
+                    active += 1
+            finished = [
+                pid for pid, item in running.items() if item[0].poll() is not None
+            ]
+            for pid in finished:
+                process, gpu, name, handle = running.pop(pid)
                 handle.close()
-            raise SystemExit(130)
-        for gpu in gpu_ids:
-            active = sum(item[1] == gpu for item in running.values())
-            while pending[gpu] and active < args.max_runs_per_gpu:
-                name, source, output = pending[gpu].popleft()
-                output.mkdir(parents=True, exist_ok=True)
-                log_path = root / "logs" / f"{name}.log"
-                handle = log_path.open("w", encoding="utf-8")
-                command = [
-                    sys.executable,
-                    str(REPO_ROOT / "scripts/eval_smax_score_recoverability.py"),
-                    "--checkpoint",
-                    str(source.checkpoint),
-                    "--output-dir",
-                    str(output),
-                    "--episodes",
-                    str(args.episodes),
-                    "--collection-batch-size",
-                    str(args.collection_batch_size),
-                    "--collection-seed",
-                    str(task_seed(args.collection_seed_base, source.task)),
-                    "--fit-fraction",
-                    str(args.fit_fraction),
-                    "--split-seed",
-                    str(args.split_seed),
-                    "--sampling-seed",
-                    str(args.sampling_seed),
-                    "--fit-samples-per-agent",
-                    str(args.fit_samples_per_agent),
-                    "--test-samples-per-agent",
-                    str(args.test_samples_per_agent),
-                    "--fisher-ridge",
-                    str(args.fisher_ridge),
-                    "--probe-hidden-dim",
-                    str(args.probe_hidden_dim),
-                    "--probe-steps",
-                    str(args.probe_steps),
-                    "--probe-batch-size",
-                    str(args.probe_batch_size),
-                    "--probe-learning-rate",
-                    str(args.probe_learning_rate),
-                    "--probe-seed",
-                    str(args.probe_seed),
-                ]
-                environment = dict(os.environ)
-                environment.pop("LD_LIBRARY_PATH", None)
-                environment.update(
+                succeeded = process.returncode == 0
+                failures += int(not succeeded)
+                status_path = root / "status" / f"{name}.json"
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+                payload.update(
                     {
-                        "CUDA_VISIBLE_DEVICES": gpu,
-                        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                        "JAX_ENABLE_X64": "false",
-                        "OMP_NUM_THREADS": str(cpu_threads),
-                        "OPENBLAS_NUM_THREADS": str(cpu_threads),
-                        "MKL_NUM_THREADS": str(cpu_threads),
-                        "NUMEXPR_NUM_THREADS": str(cpu_threads),
+                        "status": (
+                            ("collected" if stage == "collect" else "completed")
+                            if succeeded
+                            else "failed"
+                        ),
+                        "exit_code": process.returncode,
                     }
                 )
-                process = subprocess.Popen(
-                    command,
-                    cwd=REPO_ROOT,
-                    env=environment,
-                    stdout=handle,
-                    stderr=subprocess.STDOUT,
-                )
-                running[process.pid] = (process, gpu, name, handle)
-                atomic_json(
-                    root / "status" / f"{name}.json",
-                    {
-                        "status": "running",
-                        "pid": process.pid,
-                        "gpu": gpu,
-                        "run_name": name,
-                        "output_dir": str(output),
-                    },
-                )
-                log(f"GPU {gpu} START {name} pid={process.pid}")
-                active += 1
-        finished = [pid for pid, item in running.items() if item[0].poll() is not None]
-        for pid in finished:
-            process, gpu, name, handle = running.pop(pid)
-            handle.close()
-            succeeded = process.returncode == 0
-            failures += int(not succeeded)
-            status_path = root / "status" / f"{name}.json"
-            payload = json.loads(status_path.read_text(encoding="utf-8"))
-            payload.update(
-                {
-                    "status": "completed" if succeeded else "failed",
-                    "exit_code": process.returncode,
-                }
+                atomic_json(status_path, payload)
+                log(f"GPU {gpu} END   {stage} {name} status={process.returncode}")
+            if not finished:
+                time.sleep(1)
+        log(f"{stage} stage finished; failures={failures}")
+        if failures:
+            raise SystemExit(1)
+
+    run_stage("collect", collect_jobs)
+    sample_counts = common_sample_counts(
+        all_jobs,
+        fit_fraction=args.fit_fraction,
+        split_seed=args.split_seed,
+        fit_cap=args.fit_samples_per_agent,
+        test_cap=args.test_samples_per_agent,
+        expected_episodes=args.episodes,
+        collection_seed_base=args.collection_seed_base,
+    )
+    counts_path = root / "sample_counts.json"
+    if counts_path.is_file():
+        if json.loads(counts_path.read_text(encoding="utf-8")) != sample_counts:
+            raise RuntimeError(
+                f"Collected sample census changed from the frozen one: {counts_path}"
             )
-            atomic_json(status_path, payload)
-            log(f"GPU {gpu} END   {name} status={process.returncode}")
-        if not finished:
-            time.sleep(1)
-    log(f"recoverability jobs finished; failures={failures}")
-    if failures:
-        raise SystemExit(1)
+    else:
+        atomic_json(counts_path, sample_counts)
+    for task in tasks:
+        chosen = sample_counts[task]
+        log(
+            f"{task} common fit={chosen['fit_samples_per_agent']:,} "
+            f"test={chosen['test_samples_per_agent']:,} valid transitions per agent"
+        )
+    for _, source, output in all_jobs:
+        summary_path = output / "summary.json"
+        if summary_path.is_file():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            chosen = sample_counts[source.task]
+            for key in ("fit_samples_per_agent", "test_samples_per_agent"):
+                if int(summary[key]) != chosen[key]:
+                    raise RuntimeError(
+                        f"Existing probe result used a different sample count: {summary_path}"
+                    )
+    run_stage("probe", probe_jobs, sample_counts)
+    log("recoverability jobs finished; failures=0")
     if not args.skip_analysis:
         subprocess.run(
             [

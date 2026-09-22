@@ -85,18 +85,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def arrays_for_profile(arrays, profile):
-    if profile == "full":
-        return arrays
-    if profile == "score_recoverability":
-        return {
-            name: value
-            for name, value in arrays.items()
-            if name in SCORE_RECOVERABILITY_ARRAYS
-        }
-    raise ValueError(f"Unknown array profile: {profile}")
-
-
 def dense(params, value):
     return value @ params["kernel"] + params["bias"]
 
@@ -364,8 +352,8 @@ def main():
         arrays = {
             name: np.asarray(value).swapaxes(0, 1)[:keep]
             for name, value in records.items()
+            if args.array_profile == "full" or name in SCORE_RECOVERABILITY_ARRAYS
         }
-        arrays = arrays_for_profile(arrays, args.array_profile)
         arrays["reset_key"] = np.asarray(reset_keys)[:keep]
         if args.array_profile == "full":
             initial_unit_types = arrays["state_unit_types"][:, 0]

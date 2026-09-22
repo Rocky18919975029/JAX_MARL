@@ -51,6 +51,20 @@ def episode_fit_mask(episode_count: int, fit_fraction: float, seed: int) -> np.n
     return mask
 
 
+def available_samples_by_agent(arrays, fit_fraction: float, split_seed: int):
+    """Count eligible fit/test transitions without inspecting their values."""
+
+    active = np.asarray(arrays["active"], dtype=bool)
+    alive = np.asarray(arrays["alive"], dtype=bool)
+    if active.ndim != 2 or alive.ndim != 3 or alive.shape[:2] != active.shape:
+        raise ValueError("Expected active[episode,time] and alive[episode,time,agent]")
+    fit_episode = episode_fit_mask(len(active), fit_fraction, split_seed)
+    valid = active[:, :, None] & alive
+    fit = valid[fit_episode].sum(axis=(0, 1)).astype(np.int64)
+    test = valid[~fit_episode].sum(axis=(0, 1)).astype(np.int64)
+    return fit, test
+
+
 def fisher_whiten(
     fit_scores: np.ndarray,
     test_scores: np.ndarray,
