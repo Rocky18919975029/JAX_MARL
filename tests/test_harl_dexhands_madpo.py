@@ -135,3 +135,15 @@ def test_reference_fork_is_not_vendored_or_used_as_runtime():
     assert not (ROOT / "third_party" / "MADPO").exists()
     source = RUN_MATRIX.read_text(encoding="utf-8")
     assert 'REPO_ROOT / "third_party" / "HARL"' in source
+
+
+def test_launcher_restores_conda_runtime_library_path(monkeypatch):
+    launcher = load(RUN_MATRIX, "test_dex_launcher_environment")
+    monkeypatch.setenv("CONDA_PREFIX", "/tmp/harl-dex")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/cuda/lib64:/tmp/harl-dex/lib")
+    environment = launcher.training_environment("2")
+    assert environment["CUDA_VISIBLE_DEVICES"] == "2"
+    assert environment["LD_LIBRARY_PATH"].split(":") == [
+        "/tmp/harl-dex/lib",
+        "/opt/cuda/lib64",
+    ]

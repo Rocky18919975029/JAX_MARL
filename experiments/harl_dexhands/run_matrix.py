@@ -18,6 +18,21 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TRAIN_SCRIPT = REPO_ROOT / "experiments" / "harl_dexhands" / "train.py"
 
 
+def training_environment(gpu: str) -> dict[str, str]:
+    """Build an Isaac Gym child environment from the active Python runtime."""
+
+    environment = dict(os.environ)
+    environment["CUDA_VISIBLE_DEVICES"] = gpu
+    conda_prefix = Path(environment.get("CONDA_PREFIX", sys.prefix)).expanduser()
+    runtime_lib = str(conda_prefix / "lib")
+    current = environment.get("LD_LIBRARY_PATH", "")
+    entries = [entry for entry in current.split(os.pathsep) if entry]
+    environment["LD_LIBRARY_PATH"] = os.pathsep.join(
+        [runtime_lib, *(entry for entry in entries if entry != runtime_lib)]
+    )
+    return environment
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
@@ -139,8 +154,7 @@ def main() -> None:
             if args.dry_run:
                 event("COMMAND " + " ".join(command))
                 continue
-            environment = dict(os.environ)
-            environment["CUDA_VISIBLE_DEVICES"] = gpu
+            environment = training_environment(gpu)
             output = root / "logs" / f"{task.name}.log"
             with output.open("w", encoding="utf-8") as log:
                 result = subprocess.run(
