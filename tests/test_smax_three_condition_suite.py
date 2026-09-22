@@ -3,10 +3,12 @@ import json
 import numpy as np
 
 from scripts.analyze_smax_three_condition_suite import (
+    BOOTSTRAP_CI_METHOD,
     CONDITIONS_BY_DIRECTION,
     CONDITIONS,
     Source,
     aggregate_table,
+    bootstrap_resample_count,
     checkpoint_steps,
     choose_complete_cohorts,
     discover_sources,
@@ -16,8 +18,10 @@ from scripts.analyze_smax_three_condition_suite import (
 
 
 def make_source(tmp_path, task, budget, condition, seed, actor_parameterization="nps"):
-    run = tmp_path / "checkpoints" / (
-        f"{task}-{actor_parameterization}-{budget}-{condition}-seed{seed}"
+    run = (
+        tmp_path
+        / "checkpoints"
+        / (f"{task}-{actor_parameterization}-{budget}-{condition}-seed{seed}")
     )
     final = run / "final"
     final.mkdir(parents=True)
@@ -101,9 +105,7 @@ def test_discovers_arbitrary_tasks_for_ps_and_nps(tmp_path):
 
 def test_discovers_a_to_c_mse_and_cka(tmp_path):
     conditions = CONDITIONS_BY_DIRECTION["a_to_c"]
-    expected = complete_matrix(
-        tmp_path, "custom_map", 100, conditions=conditions
-    )
+    expected = complete_matrix(tmp_path, "custom_map", 100, conditions=conditions)
     discovered = discover_sources(tmp_path)
     assert set(discovered) == set(expected)
 
@@ -114,20 +116,18 @@ def test_selects_largest_complete_budget_per_task(tmp_path):
     sources.pop(("map", "nps", 200, "c_to_a_cka", 4))
     selected, audit = choose_complete_cohorts(sources, (1, 2, 3, 4))
     assert selected == {("map", "nps"): 100}
-    assert any(row["training_budget_env_steps"] == 200 and not row["complete"] for row in audit)
+    assert any(
+        row["training_budget_env_steps"] == 200 and not row["complete"] for row in audit
+    )
 
 
 def test_selects_a_to_c_cohort_without_using_c_to_a_runs(tmp_path):
     a_to_c = CONDITIONS_BY_DIRECTION["a_to_c"]
     sources = complete_matrix(tmp_path / "a-to-c", "map", 100, conditions=a_to_c)
     sources.update(complete_matrix(tmp_path / "c-to-a", "map", 200))
-    selected, audit = choose_complete_cohorts(
-        sources, (1, 2, 3, 4), conditions=a_to_c
-    )
+    selected, audit = choose_complete_cohorts(sources, (1, 2, 3, 4), conditions=a_to_c)
     assert selected == {("map", "nps"): 100}
-    long_budget = next(
-        row for row in audit if row["training_budget_env_steps"] == 200
-    )
+    long_budget = next(row for row in audit if row["training_budget_env_steps"] == 200)
     assert not long_budget["complete"]
     assert "a_to_c_cka:seed1" in long_budget["missing_runs"]
 
@@ -154,7 +154,11 @@ def test_summary_keeps_tasks_separate_and_reports_paired_deltas():
     rows = []
     for condition in CONDITIONS:
         for seed in (1, 2, 3, 4):
-            gain = 0.2 if condition == "c_to_a_cka" else 0.1 if condition == "c_to_a_mse" else 0.0
+            gain = (
+                0.2
+                if condition == "c_to_a_cka"
+                else 0.1 if condition == "c_to_a_mse" else 0.0
+            )
             rows.append(
                 {
                     "condition": condition,
@@ -171,3 +175,15 @@ def test_summary_keeps_tasks_separate_and_reports_paired_deltas():
     assert len(table) == 3
     assert np.isclose(cka["delta_return_auc_vs_isolated_mean"], 0.2)
     assert np.isclose(cka["delta_final_return_last5_ckpt_vs_isolated_mean"], 0.2)
+    assert cka["ci_method"] == BOOTSTRAP_CI_METHOD
+    assert cka["uncertainty_unit"] == "training_seed"
+    assert cka["confidence_level"] == 0.95
+    assert cka["bootstrap_resamples"] == 4**4
+    assert "return_auc_ci95_low" in cka
+    assert "return_auc_ci95_high" in cka
+    assert "delta_return_auc_vs_isolated_ci95_low" in cka
+    assert "delta_return_auc_vs_isolated_ci95_high" in cka
+
+
+def test_exact_bootstrap_enumerates_all_ordered_four_seed_resamples():
+    assert bootstrap_resample_count(4) == 256

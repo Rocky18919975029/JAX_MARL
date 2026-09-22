@@ -7,7 +7,9 @@ selects its largest complete training budget.  It never pools maps or PS/NPS.
 
 Sample efficiency is the time-normalised return AUC over the selected training
 budget.  Final performance is computed within each seed by averaging return at
-the last five saved checkpoints, then aggregated across training seeds.
+the last five saved checkpoints, then aggregated across training seeds. All
+95% confidence intervals use an ordinary percentile bootstrap over training
+seeds. For the four-seed protocol, all 4^4 ordered resamples are enumerated.
 """
 
 from __future__ import annotations
@@ -58,6 +60,9 @@ STYLE = {
     "a_to_c_cka": ("#0072B2", "-", "s"),
     "a_to_c_mse": ("#D55E00", "-.", "^"),
 }
+BOOTSTRAP_UNIT = "training_seed"
+BOOTSTRAP_CI_METHOD = "exact ordinary-bootstrap percentile 95% CI"
+CONFIDENCE_LEVEL = 0.95
 
 
 @dataclass(frozen=True)
@@ -239,9 +244,10 @@ def choose_complete_cohorts(sources, seeds, conditions=CONDITIONS):
         if complete_budgets:
             selected[(task, actor_parameterization)] = max(complete_budgets)
     for row in audit:
-        row["selected"] = selected.get(
-            (row["task"], row["actor_parameterization"])
-        ) == row["training_budget_env_steps"]
+        row["selected"] = (
+            selected.get((row["task"], row["actor_parameterization"]))
+            == row["training_budget_env_steps"]
+        )
     return selected, audit
 
 
@@ -253,9 +259,11 @@ def read_history_cache(path: Path):
                 {
                     "env_step": int(float(row["env_step"])),
                     "returns": float(row["returns"]),
-                    "win_rate": float(row["win_rate"])
-                    if row.get("win_rate") not in (None, "")
-                    else math.nan,
+                    "win_rate": (
+                        float(row["win_rate"])
+                        if row.get("win_rate") not in (None, "")
+                        else math.nan
+                    ),
                 }
             )
     return rows
@@ -377,9 +385,9 @@ def seed_metrics(source, history, final_checkpoint_count):
         "return_auc": normalized_auc(history, "returns", source.budget),
         "final_return_last5_ckpt": float(np.mean(final_returns)),
         "win_rate_auc": normalized_auc(history, "win_rate", source.budget),
-        "final_win_rate_last5_ckpt": float(np.mean(final_win_rates))
-        if final_win_rates is not None
-        else math.nan,
+        "final_win_rate_last5_ckpt": (
+            float(np.mean(final_win_rates)) if final_win_rates is not None else math.nan
+        ),
         "final_checkpoint_count": final_checkpoint_count,
         "final_checkpoint_steps": ";".join(map(str, final_steps)),
         "wandb_project": source.project,
@@ -414,12 +422,16 @@ def exact_bootstrap_mean_ci(values):
     return float(values.mean()), float(low), float(high)
 
 
+def bootstrap_resample_count(sample_count):
+    """Return the number of ordered resamples used by the exact bootstrap."""
+
+    return int(sample_count) ** int(sample_count)
+
+
 def aggregate_table(
     task, actor_parameterization, budget, rows, seeds, conditions=CONDITIONS
 ):
-    baseline = {
-        row["seed"]: row for row in rows if row["condition"] == "none"
-    }
+    baseline = {row["seed"]: row for row in rows if row["condition"] == "none"}
     table = []
     metrics = (
         "return_auc",
@@ -448,6 +460,10 @@ def aggregate_table(
             ),
             "final_checkpoint_definition": "per-seed mean over last 5 saved checkpoints",
             "auc_definition": "trapezoidal return integral divided by env-step budget",
+            "uncertainty_unit": BOOTSTRAP_UNIT,
+            "ci_method": BOOTSTRAP_CI_METHOD,
+            "confidence_level": CONFIDENCE_LEVEL,
+            "bootstrap_resamples": bootstrap_resample_count(len(selected)),
         }
         for metric in metrics:
             values = np.asarray([row[metric] for row in selected], dtype=np.float64)
@@ -502,6 +518,10 @@ def aggregate_curves(
                     "ci95_low": low,
                     "ci95_high": high,
                     "n_seeds": len(seeds),
+                    "uncertainty_unit": BOOTSTRAP_UNIT,
+                    "ci_method": BOOTSTRAP_CI_METHOD,
+                    "confidence_level": CONFIDENCE_LEVEL,
+                    "bootstrap_resamples": bootstrap_resample_count(len(seeds)),
                 }
             )
     return rows
@@ -585,6 +605,7 @@ def plot_task(
         axis.spines["right"].set_visible(False)
         axis.legend(
             handles=handles,
+            title="Mean and bootstrapped 95% CI",
             loc="best",
             frameon=True,
             fancybox=False,
@@ -716,7 +737,7 @@ def main():
         )
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "matrix_root": str(matrix_root),
         "alignment_direction": args.alignment_direction,
         "conditions": list(conditions),
@@ -730,7 +751,12 @@ def main():
             "within each seed, followed by aggregation across seeds"
         ),
         "curve_center": "mean across four training seeds",
-        "curve_interval": "exact ordinary-bootstrap percentile 95% CI",
+        "uncertainty_unit": BOOTSTRAP_UNIT,
+        "confidence_level": CONFIDENCE_LEVEL,
+        "bootstrap_method": BOOTSTRAP_CI_METHOD,
+        "bootstrap_resamples_per_estimate": bootstrap_resample_count(len(args.seeds)),
+        "curve_interval": BOOTSTRAP_CI_METHOD,
+        "table_interval": BOOTSTRAP_CI_METHOD,
         "selected_cohorts": {
             f"{task}|{actor_parameterization}": budget
             for (task, actor_parameterization), budget in selected.items()
@@ -780,13 +806,19 @@ def main():
             alignment_direction=args.alignment_direction,
         )
         task_manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "task": task,
             "actor_parameterization": actor_parameterization,
             "training_budget_env_steps": budget,
             "alignment_direction": args.alignment_direction,
             "conditions": list(conditions),
             "seeds": list(args.seeds),
+            "uncertainty_unit": BOOTSTRAP_UNIT,
+            "confidence_level": CONFIDENCE_LEVEL,
+            "bootstrap_method": BOOTSTRAP_CI_METHOD,
+            "bootstrap_resamples_per_estimate": bootstrap_resample_count(
+                len(args.seeds)
+            ),
             "table": str(task_output / "summary.csv"),
             "seed_metrics": str(task_output / "seed_metrics.csv"),
             "curve": str(task_output / "learning_curve.csv"),
