@@ -117,10 +117,26 @@ def parse_bool(value):
 def classify_condition(metadata, config):
     mode = metadata.get("align_mode", config.get("ALIGN_MODE"))
     distance = metadata.get("align_distance", config.get("ALIGN_DISTANCE", "ln_mse"))
+    # ALIGN_MODE=none does not imply an isolated MAPPO baseline: score-recovery
+    # and oracle interventions deliberately disable latent alignment too.
+    auxiliary_flags = (
+        ("score_recovery", "SCORE_RECOVERY"),
+        ("actor_score_recovery", "ACTOR_SCORE_RECOVERY"),
+        ("oracle_latent_distortion", "ORACLE_LATENT_DISTORTION"),
+        ("align_target_shuffle", "ALIGN_TARGET_SHUFFLE"),
+    )
+    if any(
+        parse_bool(metadata.get(metadata_key, config.get(config_key))) is True
+        for metadata_key, config_key in auxiliary_flags
+    ):
+        return None
+    declared = metadata.get("condition") or config.get("EXPERIMENT_CONDITION")
     for condition, (expected_mode, expected_distance) in CONDITION_SPECS.items():
         if mode == expected_mode and (
             expected_distance is None or distance == expected_distance
         ):
+            if declared and declared not in {condition, expected_mode}:
+                return None
             return condition
     return None
 

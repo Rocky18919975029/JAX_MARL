@@ -14,7 +14,9 @@ of all 12 runs and selects distinct common steps nearest 25%, 50%, 75% and
 budget from its requested fraction. `protocol.json` records requested and
 actual steps; no checkpoints are interpolated and different conditions are
 never compared at different steps. The final step uses each run's `final`
-checkpoint.
+checkpoint. An isolated source must have the actual `none` experiment label
+and no score-recovery, oracle, or shuffled-target auxiliary objective;
+`ALIGN_MODE=none` alone is not sufficient.
 
 Each checkpoint is frozen and independently rolled out for 1,024 stochastic
 episodes, using the same reset-key seed within a task. Complete episodes are

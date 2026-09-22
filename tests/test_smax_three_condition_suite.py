@@ -110,6 +110,39 @@ def test_discovers_a_to_c_mse_and_cka(tmp_path):
     assert set(discovered) == set(expected)
 
 
+def test_rejects_non_isolated_interventions_with_align_mode_none(tmp_path):
+    isolated = make_source(tmp_path / "isolated", "map", 100, "none", 1)
+    for name, flag, declared in (
+        ("critic-recovery", "SCORE_RECOVERY", "score_recovery"),
+        ("actor-recovery", "ACTOR_SCORE_RECOVERY", "actor_score_recovery"),
+        ("oracle", "ORACLE_LATENT_DISTORTION", "oracle_latent_distortion"),
+        ("shuffled", "ALIGN_TARGET_SHUFFLE", "none_shuffled"),
+    ):
+        run = tmp_path / name / "checkpoints" / name / "final"
+        run.mkdir(parents=True)
+        metadata = json.loads((isolated.checkpoint / "metadata.json").read_text())
+        metadata["condition"] = declared
+        metadata[flag.lower()] = True
+        (run / "metadata.json").write_text(json.dumps(metadata))
+        config = json.loads((isolated.checkpoint / "config.json").read_text())
+        config[flag] = True
+        config["EXPERIMENT_CONDITION"] = declared
+        (run / "config.json").write_text(json.dumps(config))
+        (run / "model.safetensors").write_bytes(b"model")
+    discovered = discover_sources(tmp_path)
+    assert set(discovered) == {isolated.key}
+    assert discovered[isolated.key].checkpoint == isolated.checkpoint
+
+
+def test_rejects_condition_label_mismatch_without_auxiliary_flags(tmp_path):
+    source = make_source(tmp_path, "map", 100, "none", 1)
+    metadata_path = source.checkpoint / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["condition"] = "score_recovery"
+    metadata_path.write_text(json.dumps(metadata))
+    assert discover_sources(tmp_path) == {}
+
+
 def test_selects_largest_complete_budget_per_task(tmp_path):
     sources = complete_matrix(tmp_path / "short", "map", 100)
     sources.update(complete_matrix(tmp_path / "long", "map", 200))

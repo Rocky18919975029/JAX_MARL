@@ -369,6 +369,9 @@ def main():
                 "seed": source.seed,
                 "budget": source.budget,
                 "checkpoint": str(source.checkpoint),
+                "run_name": source.run_name,
+                "project": source.project,
+                "protocol_version": source.protocol_version,
             }
             for source in checkpoint_sources
         ],

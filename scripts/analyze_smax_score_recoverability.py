@@ -100,15 +100,24 @@ def collect(run_root: Path):
                         missing.append(f"{task}:{condition}:seed{seed}:step{step}")
                         continue
                     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                    if (
-                        summary["protocol"] != protocol["protocol"]
-                        or int(summary["checkpoint_env_step"]) != step
-                        or summary["task"] != task
-                        or summary["condition"] != condition
-                        or int(summary["training_seed"]) != seed
-                    ):
+                    expected_provenance = {
+                        "protocol": protocol["protocol"],
+                        "checkpoint_env_step": step,
+                        "task": task,
+                        "condition": condition,
+                        "training_seed": seed,
+                    }
+                    actual_provenance = {
+                        key: summary.get(key) for key in expected_provenance
+                    }
+                    mismatches = {
+                        key: {"expected": value, "actual": actual_provenance[key]}
+                        for key, value in expected_provenance.items()
+                        if actual_provenance[key] != value
+                    }
+                    if mismatches:
                         raise RuntimeError(
-                            f"Result provenance mismatch: {summary_path}"
+                            f"Result provenance mismatch: {summary_path}: {mismatches}"
                         )
                     seed_rows.append(
                         {
