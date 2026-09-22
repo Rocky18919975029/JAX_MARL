@@ -103,6 +103,7 @@ def make_checkpoint_callback(config, run):
         nominal_env_step,
         is_final,
         is_initial,
+        actor_recovery_params=None,
     ):
         env_step = int(np.asarray(env_step).item())
         nominal_env_step = int(np.asarray(nominal_env_step).item())
@@ -121,10 +122,10 @@ def make_checkpoint_callback(config, run):
 
         model_path = checkpoint_dir / "model.safetensors"
         temporary_model_path = checkpoint_dir / ".model.tmp.safetensors"
-        save_params(
-            {"actor": actor_params, "critic": critic_params},
-            temporary_model_path,
-        )
+        model_params = {"actor": actor_params, "critic": critic_params}
+        if actor_recovery_params is not None:
+            model_params["actor_score_recovery_head"] = actor_recovery_params
+        save_params(model_params, temporary_model_path)
         os.replace(temporary_model_path, model_path)
 
         checkpoint_config = dict(config)
@@ -168,6 +169,19 @@ def make_checkpoint_callback(config, run):
                 "score_recovery_coef": config["SCORE_RECOVERY_COEF"],
                 "score_recovery_fisher_ridge": config[
                     "SCORE_RECOVERY_FISHER_RIDGE"
+                ],
+                "actor_score_recovery": config["ACTOR_SCORE_RECOVERY"],
+                "actor_score_recovery_coef": config[
+                    "ACTOR_SCORE_RECOVERY_COEF"
+                ],
+                "actor_score_recovery_fisher_ridge": config[
+                    "ACTOR_SCORE_RECOVERY_FISHER_RIDGE"
+                ],
+                "actor_score_recovery_q_lr": config[
+                    "ACTOR_SCORE_RECOVERY_Q_LR"
+                ],
+                "actor_score_recovery_q_steps": config[
+                    "ACTOR_SCORE_RECOVERY_Q_STEPS"
                 ],
                 "oracle_reference_multiplier": config[
                     "ORACLE_REFERENCE_MULTIPLIER"
@@ -377,10 +391,11 @@ class CriticRNN(nn.Module):
 
 
 class ScoreRecoveryHead(nn.Module):
-    """Train-time critic readout; separate from the post-hoc linear probe."""
+    """Train-time score readout; separate from the post-hoc linear probe."""
 
     action_dim: int
     latent_dim: int
+    zero_output: bool = False
 
     @nn.compact
     def __call__(self, critic_latent, action):
@@ -388,7 +403,12 @@ class ScoreRecoveryHead(nn.Module):
         features = jnp.concatenate((critic_latent, one_hot), axis=-1)
         features = nn.Dense(self.latent_dim, name="Dense_0")(features)
         features = nn.relu(features)
-        return nn.Dense(self.latent_dim, name="Dense_1")(features)
+        output_init = (
+            {"kernel_init": nn.initializers.zeros, "bias_init": nn.initializers.zeros}
+            if self.zero_output
+            else {}
+        )
+        return nn.Dense(self.latent_dim, name="Dense_1", **output_init)(features)
 
 
 class Transition(NamedTuple):
@@ -1042,6 +1062,11 @@ def make_train(
     config.setdefault("SCORE_RECOVERY", False)
     config.setdefault("SCORE_RECOVERY_COEF", 0.0)
     config.setdefault("SCORE_RECOVERY_FISHER_RIDGE", 1e-3)
+    config.setdefault("ACTOR_SCORE_RECOVERY", False)
+    config.setdefault("ACTOR_SCORE_RECOVERY_COEF", 0.0)
+    config.setdefault("ACTOR_SCORE_RECOVERY_FISHER_RIDGE", 1e-3)
+    config.setdefault("ACTOR_SCORE_RECOVERY_Q_LR", 1e-3)
+    config.setdefault("ACTOR_SCORE_RECOVERY_Q_STEPS", 8)
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
     config["ORACLE_REFERENCE_HORIZON"] = (
@@ -1115,6 +1140,36 @@ def make_train(
             )
     elif float(config["SCORE_RECOVERY_COEF"]) != 0:
         raise ValueError("SCORE_RECOVERY_COEF must be zero when disabled.")
+    if (
+        not math.isfinite(float(config["ACTOR_SCORE_RECOVERY_FISHER_RIDGE"]))
+        or float(config["ACTOR_SCORE_RECOVERY_FISHER_RIDGE"]) <= 0
+    ):
+        raise ValueError("ACTOR_SCORE_RECOVERY_FISHER_RIDGE must be positive.")
+    if config["ACTOR_SCORE_RECOVERY"]:
+        if not config["MATCHED_COMPARISON"] or config["ACTOR_PARAMETER_SHARING"]:
+            raise ValueError("Actor score recovery requires matched NPS actors.")
+        if config["ALIGN_MODE"] != "none" or float(config["ALIGNMENT_COEF"]) != 0:
+            raise ValueError("Actor score recovery requires zero latent alignment.")
+        if (
+            config["SCORE_RECOVERY"]
+            or config["ORACLE_LATENT_DISTORTION"]
+            or config["ALIGN_TARGET_SHUFFLE"]
+        ):
+            raise ValueError("Actor score recovery is a standalone condition.")
+        if (
+            not math.isfinite(float(config["ACTOR_SCORE_RECOVERY_COEF"]))
+            or float(config["ACTOR_SCORE_RECOVERY_COEF"]) <= 0
+        ):
+            raise ValueError("ACTOR_SCORE_RECOVERY_COEF must be positive.")
+        if (
+            not math.isfinite(float(config["ACTOR_SCORE_RECOVERY_Q_LR"]))
+            or float(config["ACTOR_SCORE_RECOVERY_Q_LR"]) <= 0
+        ):
+            raise ValueError("ACTOR_SCORE_RECOVERY_Q_LR must be positive.")
+        if int(config["ACTOR_SCORE_RECOVERY_Q_STEPS"]) <= 0:
+            raise ValueError("ACTOR_SCORE_RECOVERY_Q_STEPS must be positive.")
+    elif float(config["ACTOR_SCORE_RECOVERY_COEF"]) != 0:
+        raise ValueError("ACTOR_SCORE_RECOVERY_COEF must be zero when disabled.")
     if config["ORACLE_LATENT_DISTORTION"]:
         if not config["MATCHED_COMPARISON"]:
             raise ValueError(
@@ -1213,6 +1268,11 @@ def make_train(
             action_dim=env.action_space(env.agents[0]).n,
             latent_dim=config["GRU_HIDDEN_DIM"],
         )
+        actor_recovery_head = ScoreRecoveryHead(
+            action_dim=env.action_space(env.agents[0]).n,
+            latent_dim=config["GRU_HIDDEN_DIM"],
+            zero_output=True,
+        )
         rng, _rng_actor, _rng_critic = jax.random.split(rng, 3)
         ac_init_x = (
             jnp.zeros(
@@ -1301,17 +1361,48 @@ def make_train(
             params=critic_network_params,
             tx=critic_tx,
         )
+        actor_recovery_train_state = None
+        if config["ACTOR_SCORE_RECOVERY"]:
+            # A separate optimizer is essential: an all-zero auxiliary critic
+            # gradient could still move critic parameters through Adam momentum.
+            # Fold-in leaves the seed-matched actor/critic initialization intact.
+            q_rngs = jax.random.split(
+                jax.random.fold_in(_rng_critic, 71227), env.num_agents
+            )
+            q_init_latent = jnp.zeros(
+                (1, config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
+            )
+            q_init_action = jnp.zeros((1, config["NUM_ENVS"]), dtype=jnp.int32)
+            q_params = jax.vmap(
+                actor_recovery_head.init, in_axes=(0, None, None)
+            )(q_rngs, q_init_latent, q_init_action)
+            q_tx = vmapped_optimizer(
+                optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                    optax.adam(config["ACTOR_SCORE_RECOVERY_Q_LR"], eps=1e-5),
+                )
+            )
+            actor_recovery_train_state = TrainState.create(
+                apply_fn=actor_recovery_head.apply,
+                params=q_params,
+                tx=q_tx,
+            )
 
         if checkpoint_callback is not None:
-            io_callback(
-                checkpoint_callback,
-                jax.ShapeDtypeStruct((), jnp.int32),
+            initial_checkpoint_args = (
                 actor_train_state.params,
                 critic_train_state.params,
                 jnp.asarray(0, dtype=jnp.int32),
                 jnp.asarray(0, dtype=jnp.int32),
                 jnp.asarray(False),
                 jnp.asarray(True),
+            )
+            if config["ACTOR_SCORE_RECOVERY"]:
+                initial_checkpoint_args += (actor_recovery_train_state.params,)
+            io_callback(
+                checkpoint_callback,
+                jax.ShapeDtypeStruct((), jnp.int32),
+                *initial_checkpoint_args,
                 ordered=True,
             )
 
@@ -1478,6 +1569,15 @@ def make_train(
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
+            (
+                train_states,
+                actor_recovery_train_state,
+                env_state,
+                last_obs,
+                last_done,
+                hstates,
+                rng,
+            ) = runner_state
 
             def _env_step(runner_state, unused):
                 train_states, env_state, last_obs, last_done, hstates, rng = (
@@ -1610,9 +1710,15 @@ def make_train(
                 )
                 return runner_state, transition
 
-            initial_hstates = runner_state[-2]
-            runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
+            initial_hstates = hstates
+            env_runner_state, traj_batch = jax.lax.scan(
+                _env_step,
+                (train_states, env_state, last_obs, last_done, hstates, rng),
+                None,
+                config["NUM_STEPS"],
+            )
+            train_states, env_state, last_obs, last_done, hstates, rng = (
+                env_runner_state
             )
 
             _, _, shuffle_audit = maybe_shuffle_targets_within_agent(
@@ -1662,8 +1768,6 @@ def make_train(
                     )
 
             # CALCULATE ADVANTAGE
-            train_states, env_state, last_obs, last_done, hstates, rng = runner_state
-
             last_world_state = last_obs["world_state"].swapaxes(0, 1)
             last_world_state = last_world_state.reshape((config["NUM_ACTORS"], -1))
 
@@ -1703,7 +1807,7 @@ def make_train(
             advantages, targets = _calculate_gae(traj_batch, last_val)
             advantages = jax.lax.stop_gradient(advantages)
 
-            if config["SCORE_RECOVERY"]:
+            if config["SCORE_RECOVERY"] or config["ACTOR_SCORE_RECOVERY"]:
                 # The actors are still the frozen pre-update rollout actors.
                 # Compute one score/Fisher target for the full rollout, then
                 # carry that fixed target through every PPO epoch/minibatch.
@@ -1729,10 +1833,20 @@ def make_train(
                     old_actor_params["Dense_1"],
                     old_actor_params["Dense_2"],
                 )
-                target_by_agent, recovery_target_audit = whiten_rollout_scores(
+                fisher_ridge = (
+                    config["ACTOR_SCORE_RECOVERY_FISHER_RIDGE"]
+                    if config["ACTOR_SCORE_RECOVERY"]
+                    else config["SCORE_RECOVERY_FISHER_RIDGE"]
+                )
+                (
+                    target_by_agent,
+                    recovery_target_audit,
+                    recovery_inverse_root,
+                ) = whiten_rollout_scores(
                     scores_by_agent,
                     agent_first(traj_batch.alive_mask),
-                    config["SCORE_RECOVERY_FISHER_RIDGE"],
+                    fisher_ridge,
+                    return_matrix=True,
                 )
                 recovery_target = target_by_agent.swapaxes(0, 1).reshape(
                     (
@@ -1756,7 +1870,77 @@ def make_train(
                     "fisher_max_eigenvalue": zero_agent,
                     "target_energy_per_agent": zero_agent,
                 }
+                recovery_inverse_root = jnp.broadcast_to(
+                    jnp.eye(1, dtype=recovery_target.dtype),
+                    (env.num_agents, 1, 1),
+                )
             recovery_target = jax.lax.stop_gradient(recovery_target)
+            recovery_inverse_root = jax.lax.stop_gradient(recovery_inverse_root)
+
+            if config["ACTOR_SCORE_RECOVERY"]:
+                # One alternating q phase per rollout: q sees only frozen
+                # pre-update critic latents and stop-gradient score targets.
+                q_latent = jax.lax.stop_gradient(
+                    agent_first(traj_batch.critic_latent_old)
+                )
+                q_action = agent_first(traj_batch.action)
+                q_valid = agent_first(traj_batch.alive_mask)
+
+                def q_agent_loss(params, latent, action, target, valid):
+                    prediction = actor_recovery_head.apply(params, latent, action)
+                    squared = jnp.sum(jnp.square(prediction - target), axis=-1)
+                    weight = valid.astype(squared.dtype)
+                    return (squared * weight).sum() / jnp.maximum(
+                        weight.sum(), 1.0
+                    )
+
+                q_grad_fn = jax.vmap(jax.value_and_grad(q_agent_loss))
+                q_fit_loss_pre = jax.vmap(q_agent_loss)(
+                    actor_recovery_train_state.params,
+                    q_latent,
+                    q_action,
+                    target_by_agent,
+                    q_valid,
+                ).mean()
+
+                def q_update_step(q_state, unused):
+                    losses, grads = q_grad_fn(
+                        q_state.params,
+                        q_latent,
+                        q_action,
+                        target_by_agent,
+                        q_valid,
+                    )
+                    return q_state.apply_gradients(grads=grads), losses.mean()
+
+                actor_recovery_train_state, _ = jax.lax.scan(
+                    q_update_step,
+                    actor_recovery_train_state,
+                    None,
+                    config["ACTOR_SCORE_RECOVERY_Q_STEPS"],
+                )
+                q_prediction = jax.vmap(actor_recovery_head.apply)(
+                    actor_recovery_train_state.params,
+                    q_latent,
+                    q_action,
+                )
+                q_post_squared = jnp.sum(
+                    jnp.square(q_prediction - target_by_agent), axis=-1
+                )
+                q_weight = q_valid.astype(q_post_squared.dtype)
+                q_fit_loss_post = (
+                    (q_post_squared * q_weight).sum(axis=(1, 2))
+                    / jnp.maximum(q_weight.sum(axis=(1, 2)), 1.0)
+                ).mean()
+                actor_recovery_teacher = jax.lax.stop_gradient(
+                    q_prediction.swapaxes(0, 1).reshape(recovery_target.shape)
+                )
+            else:
+                q_fit_loss_pre = jnp.zeros((), dtype=recovery_target.dtype)
+                q_fit_loss_post = q_fit_loss_pre
+                actor_recovery_teacher = jnp.zeros_like(
+                    traj_batch.actor_latent_old[..., :1]
+                )
 
             if config["ORACLE_LATENT_DISTORTION"]:
                 # Derive an independent deterministic stream without consuming
@@ -1835,9 +2019,17 @@ def make_train(
                         reference_advantages,
                         reference_valid,
                         recovery_target,
+                        actor_recovery_teacher,
                     ) = batch_info
 
-                    def _actor_loss_fn(actor_params, init_hstate, traj_batch, gae):
+                    def _actor_loss_fn(
+                        actor_params,
+                        init_hstate,
+                        traj_batch,
+                        gae,
+                        recovery_teacher,
+                        inverse_root,
+                    ):
                         # RERUN NETWORK
                         _, pi, actor_latent = actor_network.apply(
                             actor_params,
@@ -1870,7 +2062,10 @@ def make_train(
 
                         actor_loss = loss_actor - config["ENT_COEF"] * entropy
 
-                        if config["ORACLE_LATENT_DISTORTION"]:
+                        if (
+                            config["ORACLE_LATENT_DISTORTION"]
+                            or config["ACTOR_SCORE_RECOVERY"]
+                        ):
                             policy_params = actor_params["params"]
                             actor_score = categorical_latent_score(
                                 actor_latent,
@@ -1882,6 +2077,28 @@ def make_train(
                         else:
                             actor_score = jnp.zeros_like(actor_latent)
 
+                        actor_recovery_loss = jnp.zeros((), dtype=actor_loss.dtype)
+                        if config["ACTOR_SCORE_RECOVERY"]:
+                            # The analytic score is differentiable with respect
+                            # to current actor params (the required mixed
+                            # second derivative). M and q are frozen teachers.
+                            normalized_score = jnp.einsum(
+                                "ted,df->tef", actor_score, inverse_root
+                            )
+                            squared = jnp.sum(
+                                jnp.square(normalized_score - recovery_teacher),
+                                axis=-1,
+                            )
+                            valid = traj_batch.alive_mask.astype(squared.dtype)
+                            actor_recovery_loss = (
+                                squared * valid
+                            ).sum() / jnp.maximum(valid.sum(), 1.0)
+                            actor_loss = (
+                                actor_loss
+                                + config["ACTOR_SCORE_RECOVERY_COEF"]
+                                * actor_recovery_loss
+                            )
+
                         return actor_loss, (
                             loss_actor,
                             entropy,
@@ -1890,6 +2107,7 @@ def make_train(
                             clip_frac,
                             actor_latent,
                             actor_score,
+                            actor_recovery_loss,
                         )
 
                     def _reference_score_fn(
@@ -2000,6 +2218,9 @@ def make_train(
                         actor_batch = jax.tree.map(split_agents, traj_batch)
                         actor_hstates = split_agents(ac_init_hstate)
                         actor_advantages = split_agents(actor_advantages)
+                        actor_recovery_teachers = split_agents(
+                            actor_recovery_teacher
+                        )
                         reference_actor_batch = jax.tree.map(
                             split_agents, reference_traj
                         )
@@ -2024,12 +2245,14 @@ def make_train(
                         ):
                             actor_losses, actor_aux = jax.vmap(
                                 _actor_loss_fn,
-                                in_axes=(parameter_axis, 0, 0, 0),
+                                in_axes=(parameter_axis, 0, 0, 0, 0, 0),
                             )(
                                 actor_params,
                                 actor_hstates,
                                 actor_batch,
                                 actor_advantages,
+                                actor_recovery_teachers,
+                                recovery_inverse_root,
                             )
                             critic_rl_loss, critic_aux = _critic_loss_fn(
                                 critic_params,
@@ -2251,9 +2474,44 @@ def make_train(
                             )
                             and not config["ORACLE_LATENT_DISTORTION"]
                             and not config["SCORE_RECOVERY"]
+                            and not config["ACTOR_SCORE_RECOVERY"]
                         ):
                             actor_cross_grads = jax.tree.map(
                                 jnp.zeros_like, actor_grads
+                            )
+                            critic_cross_grads = jax.tree.map(
+                                jnp.zeros_like, critic_grads
+                            )
+                        elif config["ACTOR_SCORE_RECOVERY"]:
+                            # The q teacher and whitening matrix are already
+                            # stop-gradient. Differentiate only the actor's
+                            # score objective; the critic is absent here.
+                            def per_agent_recovery_objective(
+                                params, hidden, batch, gae, teacher, matrix
+                            ):
+                                _, auxiliary = _actor_loss_fn(
+                                    params,
+                                    hidden,
+                                    batch,
+                                    gae,
+                                    teacher,
+                                    matrix,
+                                )
+                                return (
+                                    config["ACTOR_SCORE_RECOVERY_COEF"]
+                                    * auxiliary[7]
+                                    / env.num_agents
+                                )
+
+                            actor_cross_grads = jax.vmap(
+                                jax.grad(per_agent_recovery_objective)
+                            )(
+                                actor_train_state.params,
+                                actor_hstates,
+                                actor_batch,
+                                actor_advantages,
+                                actor_recovery_teachers,
+                                recovery_inverse_root,
                             )
                             critic_cross_grads = jax.tree.map(
                                 jnp.zeros_like, critic_grads
@@ -2378,6 +2636,8 @@ def make_train(
                             ac_init_hstate,
                             traj_batch,
                             actor_advantages,
+                            actor_recovery_teacher,
+                            recovery_inverse_root[0],
                         )
                         critic_loss, critic_grads = jax.value_and_grad(
                             _critic_loss_fn, has_aux=True
@@ -2440,6 +2700,8 @@ def make_train(
                             actor_hstates,
                             actor_batch,
                             actor_advantages,
+                            split_agents(actor_recovery_teacher),
+                            recovery_inverse_root,
                         )
                         critic_loss, critic_grads = jax.value_and_grad(
                             _critic_loss_fn, has_aux=True
@@ -2577,6 +2839,35 @@ def make_train(
                         "score_recovery_fisher_max_eigenvalue": recovery_target_audit[
                             "fisher_max_eigenvalue"
                         ].max(),
+                        "actor_score_recovery_loss": actor_loss[1][7].mean(),
+                        "actor_score_recovery_objective_weighted": config[
+                            "ACTOR_SCORE_RECOVERY_COEF"
+                        ] * actor_loss[1][7].mean(),
+                        "actor_score_recovery_q_fit_loss_pre": q_fit_loss_pre,
+                        "actor_score_recovery_q_fit_loss_post": q_fit_loss_post,
+                        "actor_score_recovery_q_to_zero_baseline_ratio": (
+                            q_fit_loss_post
+                            / jnp.maximum(
+                                recovery_target_audit[
+                                    "target_energy_per_agent"
+                                ].mean(),
+                                1e-12,
+                            )
+                            if config["ACTOR_SCORE_RECOVERY"]
+                            else jnp.zeros((), dtype=actor_loss[1][7].dtype)
+                        ),
+                        "actor_score_recovery_target_energy_mean": jnp.where(
+                            config["ACTOR_SCORE_RECOVERY"],
+                            recovery_target_audit[
+                                "target_energy_per_agent"
+                            ].mean(),
+                            0.0,
+                        ),
+                        "actor_score_recovery_valid_samples": jnp.where(
+                            config["ACTOR_SCORE_RECOVERY"],
+                            traj_batch.alive_mask.sum(),
+                            0,
+                        ),
                         "entropy": actor_loss[1][1].mean(),
                         "ratio": actor_loss[1][2],
                         "approx_kl": actor_loss[1][3].mean(),
@@ -2667,6 +2958,19 @@ def make_train(
                             ).mean(),
                             0.0,
                         ),
+                        "actor_score_recovery_actor_grad_norm_mean": jnp.where(
+                            config["ACTOR_SCORE_RECOVERY"],
+                            actor_cross_grad_norms.mean(),
+                            0.0,
+                        ),
+                        "actor_score_recovery_actor_to_rl_grad_ratio_mean": jnp.where(
+                            config["ACTOR_SCORE_RECOVERY"],
+                            (
+                                actor_cross_grad_norms
+                                / jnp.maximum(actor_rl_grad_norms, 1e-12)
+                            ).mean(),
+                            0.0,
+                        ),
                         "actor_grad_norm_mean": actor_grad_norms.mean(),
                         "actor_grad_norm_max": actor_grad_norms.max(),
                         "actor_grad_norm_after_clip_mean": (
@@ -2683,6 +2987,11 @@ def make_train(
                         "critic_grad_norm": critic_grad_norm,
                         "critic_rl_grad_norm": critic_rl_grad_norm,
                         "critic_cross_grad_norm": critic_cross_grad_norm,
+                        "actor_score_recovery_critic_grad_norm": jnp.where(
+                            config["ACTOR_SCORE_RECOVERY"],
+                            critic_cross_grad_norm,
+                            0.0,
+                        ),
                         "critic_cross_to_rl_grad_ratio": critic_cross_grad_norm
                         / jnp.maximum(critic_rl_grad_norm, 1e-12),
                         "score_recovery_critic_grad_norm": jnp.where(
@@ -2777,6 +3086,7 @@ def make_train(
                     reference_advantages,
                     reference_valid,
                     recovery_target,
+                    actor_recovery_teacher,
                     rng,
                 ) = update_state
                 rng, _rng = jax.random.split(rng)
@@ -2802,6 +3112,7 @@ def make_train(
                     reference_advantages.squeeze(),
                     reference_valid.squeeze(),
                     recovery_target,
+                    actor_recovery_teacher,
                 )
                 if (
                     config["ACTOR_PARAMETER_SHARING"]
@@ -2877,6 +3188,7 @@ def make_train(
                     reference_advantages,
                     reference_valid,
                     recovery_target,
+                    actor_recovery_teacher,
                     rng,
                 )
                 return update_state, loss_info
@@ -2893,6 +3205,7 @@ def make_train(
                 reference_advantages,
                 reference_valid,
                 recovery_target,
+                actor_recovery_teacher,
                 rng,
             )
             update_state, loss_info = jax.lax.scan(
@@ -2992,15 +3305,20 @@ def make_train(
                 ) * checkpoint_interval
 
                 def save_checkpoint(_):
-                    return io_callback(
-                        checkpoint_callback,
-                        jax.ShapeDtypeStruct((), jnp.int32),
+                    checkpoint_args = (
                         train_states[0].params,
                         train_states[1].params,
                         completed_env_steps,
                         nominal_env_steps,
                         is_final,
                         jnp.asarray(False),
+                    )
+                    if config["ACTOR_SCORE_RECOVERY"]:
+                        checkpoint_args += (actor_recovery_train_state.params,)
+                    return io_callback(
+                        checkpoint_callback,
+                        jax.ShapeDtypeStruct((), jnp.int32),
+                        *checkpoint_args,
                         ordered=True,
                     )
 
@@ -3012,12 +3330,21 @@ def make_train(
                 )
 
             update_steps = update_steps + 1
-            runner_state = (train_states, env_state, last_obs, last_done, hstates, rng)
+            runner_state = (
+                train_states,
+                actor_recovery_train_state,
+                env_state,
+                last_obs,
+                last_done,
+                hstates,
+                rng,
+            )
             return (runner_state, update_steps), metric
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
             (actor_train_state, critic_train_state),
+            actor_recovery_train_state,
             env_state,
             obsv,
             jnp.zeros((config["NUM_ACTORS"]), dtype=bool),
@@ -3051,6 +3378,11 @@ def main(config):
     config.setdefault("SCORE_RECOVERY", False)
     config.setdefault("SCORE_RECOVERY_COEF", 0.0)
     config.setdefault("SCORE_RECOVERY_FISHER_RIDGE", 1e-3)
+    config.setdefault("ACTOR_SCORE_RECOVERY", False)
+    config.setdefault("ACTOR_SCORE_RECOVERY_COEF", 0.0)
+    config.setdefault("ACTOR_SCORE_RECOVERY_FISHER_RIDGE", 1e-3)
+    config.setdefault("ACTOR_SCORE_RECOVERY_Q_LR", 1e-3)
+    config.setdefault("ACTOR_SCORE_RECOVERY_Q_STEPS", 8)
     config.setdefault("METRICS_JSONL", "")
     if not config.get("GIT_COMMIT"):
         try:
@@ -3065,6 +3397,8 @@ def main(config):
     condition = config["ALIGN_MODE"]
     if config["ORACLE_LATENT_DISTORTION"]:
         condition = "oracle_latent_distortion"
+    elif config["ACTOR_SCORE_RECOVERY"]:
+        condition = "actor_score_recovery"
     elif config["SCORE_RECOVERY"]:
         condition = "score_recovery"
     elif config["ALIGN_TARGET_SHUFFLE"]:

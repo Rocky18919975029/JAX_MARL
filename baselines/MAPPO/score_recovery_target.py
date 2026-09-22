@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 
 
-def whiten_rollout_scores(scores, valid_mask, ridge):
+def whiten_rollout_scores(scores, valid_mask, ridge, *, return_matrix=False):
     """Whiten scores once per rollout, not once per PPO minibatch.
 
     ``scores`` has shape [agent, time, environment, latent] and ``valid_mask``
@@ -43,4 +43,6 @@ def whiten_rollout_scores(scores, valid_mask, ridge):
             (energy * mask).sum(axis=(1, 2)) / jnp.maximum(valid_count, 1.0)
         ),
     }
+    if return_matrix:
+        return target, audit, jax.lax.stop_gradient(inverse_root)
     return target, audit

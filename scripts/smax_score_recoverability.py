@@ -350,7 +350,9 @@ def canonical_condition(metadata):
     distance = str(metadata.get("align_distance", "ln_mse"))
     if condition == "none":
         return "none"
-    if condition in {"c_to_a_mse", "c_to_a_cka", "score_recovery"}:
+    if condition in {
+        "c_to_a_mse", "c_to_a_cka", "score_recovery", "actor_score_recovery"
+    }:
         return condition
     if condition == "c_to_a" and distance == "ln_mse":
         return "c_to_a_mse"
