@@ -113,6 +113,12 @@ def test_auc_is_time_normalised_trapezoidal_integral():
     assert np.isclose(normalized_auc(history(budget=100), "returns", 100), 0.5)
 
 
+def test_auc_supports_numpy_without_legacy_trapz(monkeypatch):
+    monkeypatch.delattr(np, "trapz", raising=False)
+    monkeypatch.setattr(np, "trapezoid", lambda y, x: 50.0, raising=False)
+    assert np.isclose(normalized_auc(history(budget=100), "returns", 100), 0.5)
+
+
 def test_summary_keeps_tasks_separate_and_reports_paired_deltas():
     rows = []
     for condition in CONDITIONS:

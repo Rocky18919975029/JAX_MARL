@@ -324,6 +324,13 @@ def interpolate_history(history, metric, steps):
     return np.interp(np.asarray(steps, dtype=np.float64), x, y)
 
 
+def trapezoidal_integral(values, grid):
+    """Integrate with either the NumPy 2.x or legacy NumPy API."""
+    if hasattr(np, "trapezoid"):
+        return np.trapezoid(values, grid)
+    return np.trapz(values, grid)
+
+
 def normalized_auc(history, metric, budget):
     finite = [row for row in history if math.isfinite(float(row[metric]))]
     if len(finite) < 2:
@@ -333,7 +340,9 @@ def normalized_auc(history, metric, budget):
     )
     grid = [0, *inner, budget]
     values = interpolate_history(finite, metric, grid)
-    return float(np.trapz(values, np.asarray(grid, dtype=np.float64)) / budget)
+    return float(
+        trapezoidal_integral(values, np.asarray(grid, dtype=np.float64)) / budget
+    )
 
 
 def seed_metrics(source, history, final_checkpoint_count):
