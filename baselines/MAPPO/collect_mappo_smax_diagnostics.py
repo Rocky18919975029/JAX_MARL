@@ -34,6 +34,17 @@ from jaxmarl.wrappers.baselines import load_params
 
 
 SCHEMA_VERSION = 2
+SCORE_RECOVERABILITY_ARRAYS = frozenset(
+    {
+        "active",
+        "alive",
+        "available_actions",
+        "action",
+        "actor_latent",
+        "critic_latent",
+        "actor_score",
+    }
+)
 
 
 def collector_provenance():
@@ -61,8 +72,29 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument(
+        "--array-profile",
+        choices=("full", "score_recoverability"),
+        default="full",
+        help=(
+            "Store the complete mechanism-diagnostic payload or only the arrays "
+            "needed by the offline score-recoverability measurement."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def arrays_for_profile(arrays, profile):
+    if profile == "full":
+        return arrays
+    if profile == "score_recoverability":
+        return {
+            name: value
+            for name, value in arrays.items()
+            if name in SCORE_RECOVERABILITY_ARRAYS
+        }
+    raise ValueError(f"Unknown array profile: {profile}")
 
 
 def dense(params, value):
@@ -333,20 +365,23 @@ def main():
             name: np.asarray(value).swapaxes(0, 1)[:keep]
             for name, value in records.items()
         }
+        arrays = arrays_for_profile(arrays, args.array_profile)
         arrays["reset_key"] = np.asarray(reset_keys)[:keep]
-        initial_unit_types = arrays["state_unit_types"][:, 0]
-        num_allies = env.num_agents
-        type_ids = np.arange(6, dtype=np.int32)
-        arrays["ally_unit_type_histogram"] = (
-            initial_unit_types[:, :num_allies, None] == type_ids
-        ).sum(axis=1, dtype=np.int32)
-        arrays["enemy_unit_type_histogram"] = (
-            initial_unit_types[:, num_allies:, None] == type_ids
-        ).sum(axis=1, dtype=np.int32)
+        if args.array_profile == "full":
+            initial_unit_types = arrays["state_unit_types"][:, 0]
+            num_allies = env.num_agents
+            type_ids = np.arange(6, dtype=np.int32)
+            arrays["ally_unit_type_histogram"] = (
+                initial_unit_types[:, :num_allies, None] == type_ids
+            ).sum(axis=1, dtype=np.int32)
+            arrays["enemy_unit_type_histogram"] = (
+                initial_unit_types[:, num_allies:, None] == type_ids
+            ).sum(axis=1, dtype=np.int32)
         arrays["diagnostic_episode_id"] = np.arange(
             episodes_written, episodes_written + keep, dtype=np.int32
         )
-        compute_complete_mc_returns(arrays, float(config["GAMMA"]))
+        if args.array_profile == "full":
+            compute_complete_mc_returns(arrays, float(config["GAMMA"]))
         shard_path = output / f"episodes_{shard_index:04d}.npz"
         np.savez_compressed(shard_path, **arrays)
         shard_metadata.append(
@@ -364,6 +399,7 @@ def main():
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "collector": "collect_mappo_smax_diagnostics.py",
+        "array_profile": args.array_profile,
         **collector_provenance(),
         "checkpoint": str(checkpoint_dir),
         "checkpoint_env_step": config.get("CHECKPOINT_ENV_STEP"),
