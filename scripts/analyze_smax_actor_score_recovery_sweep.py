@@ -45,12 +45,15 @@ def metric_summary(rows: list[dict], metric: str, budget: int) -> tuple[float, f
         raise RuntimeError(f"Fewer than two finite {metric} values")
     # Endpoint values are held constant outside the observed training-log span.
     grid = [(0, points[0][1]), *points, (budget, points[-1][1])]
-    auc = sum(
-        (right_step - left_step) * (left_value + right_value) / 2
-        for (left_step, left_value), (right_step, right_value) in zip(
-            grid, grid[1:]
+    auc = (
+        sum(
+            (right_step - left_step) * (left_value + right_value) / 2
+            for (left_step, left_value), (right_step, right_value) in zip(
+                grid, grid[1:]
+            )
         )
-    ) / budget
+        / budget
+    )
     return auc, statistics.mean(value for _, value in points[-5:])
 
 
@@ -110,11 +113,7 @@ def summarize(root: Path) -> dict:
     selection = {}
     for task in manifest["maps"]:
         task_rows = [row for row in seed_rows if row["task"] == task]
-        baseline = {
-            row["seed"]: row
-            for row in task_rows
-            if row["condition"] == "none"
-        }
+        baseline = {row["seed"]: row for row in task_rows if row["condition"] == "none"}
         if set(baseline) != set(manifest["seeds"]):
             raise RuntimeError(f"Missing paired isolated baseline for {task}")
         grouped = defaultdict(list)
@@ -145,8 +144,7 @@ def summarize(root: Path) -> dict:
                         row["win_rate_auc"] for row in cell
                     ),
                     "paired_delta_win_rate_auc_vs_none": statistics.mean(
-                        row["win_rate_auc"]
-                        - baseline[row["seed"]]["win_rate_auc"]
+                        row["win_rate_auc"] - baseline[row["seed"]]["win_rate_auc"]
                         for row in cell
                     ),
                     "mean_return_auc": statistics.mean(
@@ -156,11 +154,30 @@ def summarize(root: Path) -> dict:
                         row["return_auc"] - baseline[row["seed"]]["return_auc"]
                         for row in cell
                     ),
+                    "win_rate_auc_positive_seeds": sum(
+                        row["win_rate_auc"] > baseline[row["seed"]]["win_rate_auc"]
+                        for row in cell
+                    ),
                     "mean_win_rate_last5_logged_updates": statistics.mean(
                         row["win_rate_last5_logged_updates"] for row in cell
                     ),
+                    "paired_delta_win_rate_last5_logged_updates_vs_none": statistics.mean(
+                        row["win_rate_last5_logged_updates"]
+                        - baseline[row["seed"]]["win_rate_last5_logged_updates"]
+                        for row in cell
+                    ),
+                    "win_rate_last5_positive_seeds": sum(
+                        row["win_rate_last5_logged_updates"]
+                        > baseline[row["seed"]]["win_rate_last5_logged_updates"]
+                        for row in cell
+                    ),
                     "mean_return_last5_logged_updates": statistics.mean(
                         row["return_last5_logged_updates"] for row in cell
+                    ),
+                    "paired_delta_return_last5_logged_updates_vs_none": statistics.mean(
+                        row["return_last5_logged_updates"]
+                        - baseline[row["seed"]]["return_last5_logged_updates"]
+                        for row in cell
                     ),
                 }
             )
@@ -184,9 +201,7 @@ def summarize(root: Path) -> dict:
             "screening_seeds": list(manifest["seeds"]),
             "training_budget": manifest["budgets"][task],
             "top_candidate": best,
-            "promote_to_confirmatory": best[
-                "paired_delta_win_rate_auc_vs_none"
-            ] > 0,
+            "promote_to_confirmatory": best["paired_delta_win_rate_auc_vs_none"] > 0,
             "warning": (
                 "Exploratory training-curve selection only; evaluate the selected "
                 "setting on separate, unused seeds at the full task budget."

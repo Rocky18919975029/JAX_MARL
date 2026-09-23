@@ -47,6 +47,22 @@ def test_sweep_contains_one_isolated_run_per_task_seed_and_unique_grid():
     assert all(run.condition == "none" for run in none_only)
 
 
+def test_dense_10m_four_seed_grid_has_one_paired_baseline_per_seed():
+    runs = run_matrix(
+        ("10m_vs_11m",),
+        (1, 2, 3, 4),
+        {"10m_vs_11m": 10_000_000},
+        (3e-6, 1e-5, 2e-5, 3e-5, 5e-5),
+        (2, 4, 8),
+        (1e-3,),
+        (1e-3,),
+    )
+    assert len(runs) == 64
+    assert len({run.name for run in runs}) == 64
+    assert sum(run.condition == "none" for run in runs) == 4
+    assert all(run.steps == 10_000_000 for run in runs)
+
+
 def test_baseline_disables_all_auxiliary_losses_and_matches_ppo_settings(tmp_path):
     args = SimpleNamespace(
         update_epochs=4,
@@ -154,6 +170,13 @@ def test_analysis_selects_per_task_against_seed_paired_none(tmp_path):
     selection = summarize(tmp_path)
     assert selection["10m_vs_11m"]["top_candidate"]["coef"] == 3e-4
     assert selection["3s5z_vs_3s6z"]["top_candidate"]["coef"] == 1e-4
+    assert selection["10m_vs_11m"]["top_candidate"][
+        "paired_delta_win_rate_last5_logged_updates_vs_none"
+    ] == pytest.approx(0.2)
+    assert selection["10m_vs_11m"]["top_candidate"]["win_rate_auc_positive_seeds"] == 2
+    assert (
+        selection["3s5z_vs_3s6z"]["top_candidate"]["win_rate_last5_positive_seeds"] == 2
+    )
     for task in budgets:
         assert (tmp_path / "analysis" / task / "seed_level.csv").is_file()
         assert (tmp_path / "analysis" / task / "task_condition_summary.csv").is_file()

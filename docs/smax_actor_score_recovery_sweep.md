@@ -158,3 +158,52 @@ often span essentially the two observed seed curves and should not be cited
 as confirmatory 95% uncertainty. For a paper result, rerun the selected
 setting and a matched isolated baseline on unused seeds 1–4, then make a
 separate figure from that confirmation root.
+
+## Denser 10m_vs_11m tuning on seeds 1–4
+
+If the four-seed confirmation is inconclusive, use a **new root and W&B
+project** for a targeted full-budget grid. The five coefficients below refine
+the low-lambda region where the pilot was most promising; `q_steps=2,4,8`
+tests probe fitting strength while keeping q learning rate and Fisher ridge
+fixed. This is 5 × 3 × 4 = 60 recovery runs plus four paired isolated runs,
+each at 10M steps. The two-run-per-GPU limit means at most eight workers at
+once. Do not start this while the previous full-GPU matrix is still active.
+
+```bash
+export AREC_DETAIL_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_10m_detail_4seed_v1
+mkdir -p "$AREC_DETAIL_ROOT"
+
+python scripts/run_smax_actor_score_recovery_sweep.py \
+  --run-root "$AREC_DETAIL_ROOT" \
+  --maps 10m_vs_11m --seeds 1-4 \
+  --conditions none,actor_score_recovery \
+  --coefs 0.000003,0.00001,0.00002,0.00003,0.00005 \
+  --q-steps-grid 2,4,8 \
+  --q-learning-rates 0.001 --fisher-ridges 0.001 \
+  --total-timesteps 10000000 \
+  --gpus 0,1,2,3 --max-runs-per-gpu 2 \
+  --project jaxmarl-smax-arec-10m-detail4seed \
+  --dry-run
+
+nohup python scripts/run_smax_actor_score_recovery_sweep.py \
+  --run-root "$AREC_DETAIL_ROOT" \
+  --maps 10m_vs_11m --seeds 1-4 \
+  --conditions none,actor_score_recovery \
+  --coefs 0.000003,0.00001,0.00002,0.00003,0.00005 \
+  --q-steps-grid 2,4,8 \
+  --q-learning-rates 0.001 --fisher-ridges 0.001 \
+  --total-timesteps 10000000 \
+  --gpus 0,1,2,3 --max-runs-per-gpu 2 \
+  --project jaxmarl-smax-arec-10m-detail4seed \
+  > "$AREC_DETAIL_ROOT/launcher.stdout" 2>&1 &
+```
+
+After completion, run `analyze_smax_actor_score_recovery_sweep.py` on this
+root. Its per-task CSV now reports seed-paired AUC and last-five-logged-update
+win-rate differences against isolated, plus the number of seeds with positive
+differences. The last-five measure is **not** a held-out final-checkpoint
+evaluation. Review both AUC and final-performance columns; a large mean
+driven by one seed is not a robust win. If these four seeds are used to choose
+another hyperparameter setting, they become **tuning seeds**. Any subsequent
+unbiased confirmation requires new, unused seeds (for example 5–8); do not
+reuse seeds 1–4 to claim an independent confirmation.
