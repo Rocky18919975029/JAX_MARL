@@ -5,6 +5,10 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.analyze_smax_actor_score_recovery_sweep import metric_summary, summarize
+from scripts.plot_smax_actor_score_recovery_sweep import (
+    make_figure,
+    seed_bootstrap_curves,
+)
 from scripts.run_smax_actor_score_recovery_sweep import (
     PROTOCOL,
     command,
@@ -144,9 +148,7 @@ def test_analysis_selects_per_task_against_seed_paired_none(tmp_path):
             for step in (run.steps // 2, run.steps):
                 value = step / run.steps * 0.4 + gain + run.seed * 0.00001
                 file.write(
-                    json.dumps(
-                        {"env_step": step, "returns": value, "win_rate": value}
-                    )
+                    json.dumps({"env_step": step, "returns": value, "win_rate": value})
                     + "\n"
                 )
     selection = summarize(tmp_path)
@@ -154,6 +156,107 @@ def test_analysis_selects_per_task_against_seed_paired_none(tmp_path):
     assert selection["3s5z_vs_3s6z"]["top_candidate"]["coef"] == 1e-4
     for task in budgets:
         assert (tmp_path / "analysis" / task / "seed_level.csv").is_file()
-        assert (
-            tmp_path / "analysis" / task / "task_condition_summary.csv"
-        ).is_file()
+        assert (tmp_path / "analysis" / task / "task_condition_summary.csv").is_file()
+
+
+def test_seed_bootstrap_plot_keeps_tasks_and_baseline_separate(tmp_path):
+    pytest.importorskip("matplotlib")
+    budgets = {"10m_vs_11m": 10_000_000, "3s5z_vs_3s6z": 20_000_000}
+    runs = run_matrix(
+        tuple(budgets),
+        (9001, 9002),
+        budgets,
+        (3e-5, 1e-4, 3e-4),
+        (4, 8),
+        (1e-3,),
+        (1e-3,),
+    )
+    (tmp_path / "experiment_manifest.json").write_text(
+        json.dumps(
+            {
+                "protocol": PROTOCOL,
+                "maps": list(budgets),
+                "seeds": [9001, 9002],
+                "budgets": budgets,
+                "runs": [dict(run.__dict__, run_name=run.name) for run in runs],
+            }
+        )
+    )
+    (tmp_path / "status").mkdir()
+    (tmp_path / "metrics").mkdir()
+    for run in runs:
+        (tmp_path / "status" / f"{run.name}.json").write_text(
+            json.dumps({"status": "completed"})
+        )
+        task_offset = 0.0 if run.map_name == "10m_vs_11m" else 0.4
+        seed_offset = 0.0 if run.seed == 9001 else 0.1
+        condition_offset = (
+            0.0
+            if run.condition == "none"
+            else {3e-5: 0.02, 1e-4: 0.05, 3e-4: 0.08}[run.coef]
+        )
+        q_offset = 0.0 if run.condition == "none" else run.q_steps * 0.001
+        with (tmp_path / "metrics" / f"{run.name}.jsonl").open("w") as file:
+            for step in (run.steps // 4, run.steps // 2, 3 * run.steps // 4, run.steps):
+                value = 0.1 + task_offset + seed_offset + condition_offset + q_offset
+                file.write(json.dumps({"env_step": step, "win_rate": value}) + "\n")
+
+    manifest, rows = seed_bootstrap_curves(
+        tmp_path, bootstrap_samples=1000, bootstrap_seed=7
+    )
+    assert len(rows) == 2 * 7 * 4  # two tasks, baseline + six settings, four steps
+    first = next(
+        row
+        for row in rows
+        if row["task"] == "10m_vs_11m"
+        and row["condition"] == "none"
+        and row["env_step"] == 2_500_000
+    )
+    second = next(
+        row
+        for row in rows
+        if row["task"] == "3s5z_vs_3s6z"
+        and row["condition"] == "none"
+        and row["env_step"] == 5_000_000
+    )
+    assert manifest["seeds"] == [9001, 9002]
+    assert first["mean_win_rate"] == pytest.approx(0.15)
+    assert first["ci95_low"] == pytest.approx(0.1)
+    assert first["ci95_high"] == pytest.approx(0.2)
+    assert second["mean_win_rate"] == pytest.approx(0.55)
+    assert second["ci95_low"] == pytest.approx(0.5)
+    assert second["ci95_high"] == pytest.approx(0.6)
+
+    image = make_figure(tmp_path, bootstrap_samples=1000, bootstrap_seed=7)
+    assert image.is_file()
+    assert image.with_suffix(".pdf").is_file()
+    assert image.with_suffix(".svg").is_file()
+    assert (tmp_path / "analysis" / "10m_vs_11m" / f"{image.stem}-curves.csv").is_file()
+    assert (
+        tmp_path / "analysis" / "3s5z_vs_3s6z" / f"{image.stem}-curves.csv"
+    ).is_file()
+
+
+def test_seed_bootstrap_plot_rejects_incomplete_runs(tmp_path):
+    runs = run_matrix(
+        ("10m_vs_11m",),
+        (9001, 9002),
+        {"10m_vs_11m": 100},
+        (1e-4,),
+        (8,),
+        (1e-3,),
+        (1e-3,),
+    )
+    (tmp_path / "experiment_manifest.json").write_text(
+        json.dumps(
+            {
+                "protocol": PROTOCOL,
+                "maps": ["10m_vs_11m"],
+                "seeds": [9001, 9002],
+                "budgets": {"10m_vs_11m": 100},
+                "runs": [dict(run.__dict__, run_name=run.name) for run in runs],
+            }
+        )
+    )
+    with pytest.raises(RuntimeError, match="not completed"):
+        seed_bootstrap_curves(tmp_path, bootstrap_samples=100)

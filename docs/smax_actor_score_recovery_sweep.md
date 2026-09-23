@@ -91,3 +91,30 @@ To backfill only the full-budget isolated runs for an already-running
 single-coefficient formal matrix, use a **different root** and
 `--conditions none --seeds 1-4`; this does not touch the active actor-side
 workers. The same code's other defaults match the existing formal launcher.
+
+## One seed-aggregated sweep figure
+
+After the 28-run pilot matrix finishes, generate a single two-panel figure:
+
+```bash
+python scripts/plot_smax_actor_score_recovery_sweep.py \
+  --run-root "$AREC_SWEEP_ROOT"
+```
+
+The output is `analysis/smax-actor-score-recovery-sweep-win-rate.png`, with
+vector PDF/SVG masters and a plotted-data CSV beside it. The 10m and 3s5z
+tasks occupy separate panels and are **never averaged together**. Each panel
+contains the paired isolated baseline plus all six `(lambda, q_steps)`
+settings. Each curve is the mean over training seeds at the same exact
+`env_step`. The shaded band is a pointwise 95% percentile interval from
+20,000 resamples of whole training seeds (fixed random seed). Missing or
+non-finite steps are excluded; curves are neither smoothed nor interpolated.
+The baseline is neutral gray, lambda is encoded by color and marker, and q
+fitting steps by line style. The figure's metadata JSON records the bootstrap
+protocol.
+
+This pilot has only two seeds, so its bootstrap bands are exploratory: they
+often span essentially the two observed seed curves and should not be cited
+as confirmatory 95% uncertainty. For a paper result, rerun the selected
+setting and a matched isolated baseline on unused seeds 1–4, then make a
+separate figure from that confirmation root.
