@@ -1,0 +1,47 @@
+# Effective hyperparameter snapshot for the FIRST four-panel ARec figure.
+schema_version: 1
+figure_id: smax-arec-selected-return-curves-v1
+historical_source_root: actor_score_recovery_confirm_4seed_v1/3s5z_vs_3s6z
+map_name: 3s5z_vs_3s6z
+method: arec
+seeds: [1, 2, 3, 4]
+config:
+  LR: 0.002
+  NUM_ENVS: 128
+  NUM_STEPS: 128
+  TOTAL_TIMESTEPS: 20000000
+  FC_DIM_SIZE: 128
+  GRU_HIDDEN_DIM: 128
+  UPDATE_EPOCHS: 4
+  NUM_MINIBATCHES: 4
+  GAMMA: 0.99
+  GAE_LAMBDA: 0.95
+  CLIP_EPS: 0.2
+  SCALE_CLIP_EPS: false
+  ENT_COEF: 0.0
+  VF_COEF: 0.5
+  MAX_GRAD_NORM: 0.25
+  ACTIVATION: relu
+  OBS_WITH_AGENT_ID: true
+  ACTOR_PARAMETER_SHARING: false
+  MATCHED_COMPARISON: true
+  ALIGN_MODE: none
+  ALIGN_DISTANCE: ln_mse
+  ALIGN_DISTANCE_EPS: 0.00000001
+  ALIGNMENT_COEF: 0.0
+  ACTOR_SCORE_RECOVERY: true
+  ACTOR_SCORE_RECOVERY_COEF: 0.0003
+  ACTOR_SCORE_RECOVERY_FISHER_RIDGE: 0.001
+  ACTOR_SCORE_RECOVERY_Q_LR: 0.001
+  ACTOR_SCORE_RECOVERY_Q_STEPS: 4
+  EXPERIMENT_CONDITION: arec
+  ENV_NAME: HeuristicEnemySMAX
+  MAP_NAME: 3s5z_vs_3s6z
+  ENV_KWARGS:
+    see_enemy_actions: true
+    walls_cause_death: true
+    attack_mode: closest
+  ANNEAL_LR: true
+  SAVE_CHECKPOINTS: true
+  CHECKPOINT_INTERVAL_TIMESTEPS: 1000000
+  WANDB_UPLOAD_CHECKPOINTS: false

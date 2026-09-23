@@ -267,10 +267,13 @@ def manifest_for(root: Path, args: argparse.Namespace, runs: list[Run]) -> dict:
         "jaxmarl/environments/smax/smax_env.py",
         "scripts/smax_four_method.py",
     )
-    return {
+    tuned_paths = tuple(getattr(args, "tuned_config_paths", ()))
+    source_hashes = {name: sha256(REPO / name) for name in sources}
+    source_hashes.update({str(path.relative_to(REPO)): sha256(path) for path in tuned_paths})
+    manifest = {
         "protocol": PROTOCOL, "schema_version": 1,
         "git_commit": git_commit(),
-        "source_sha256": {name: sha256(REPO / name) for name in sources},
+        "source_sha256": source_hashes,
         "environment": environment_fingerprint(),
         "map_name": args.map_name,
         "seed_start": args.seed_start, "seed_count": args.seed_count,
@@ -286,6 +289,9 @@ def manifest_for(root: Path, args: argparse.Namespace, runs: list[Run]) -> dict:
                       command=train_command(root, args, run))
                  for run in runs],
     }
+    if tuned_paths:
+        manifest["tuned_selection"] = args.tuned_selection
+    return manifest
 
 
 def atomic_json(path: Path, payload: dict) -> None:
