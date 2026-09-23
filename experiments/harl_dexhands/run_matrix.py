@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import subprocess
@@ -16,6 +17,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TRAIN_SCRIPT = REPO_ROOT / "experiments" / "harl_dexhands" / "train.py"
+OFFICIAL_CONFIG = Path("tuned_configs/dexhands/ShadowHandOver/happo/config.json")
 
 
 def training_environment(gpu: str) -> dict[str, str]:
@@ -31,6 +33,37 @@ def training_environment(gpu: str) -> dict[str, str]:
         [runtime_lib, *(entry for entry in entries if entry != runtime_lib)]
     )
     return environment
+
+
+def freeze_manifest(root: Path, study_spec: dict, tasks: list) -> dict:
+    """Record the exact grid and reject accidental changes on resume."""
+    path = root / "experiment_manifest.json"
+    payload = {
+        "schema_version": 1,
+        "study_spec": study_spec,
+        "runs": [
+            {
+                "run_name": task.name,
+                "algorithm": task.algorithm,
+                "condition": task.condition,
+                "seed": task.seed,
+                "arec_coef": task.arec_coef if task.condition == "arec" else 0.0,
+            }
+            for task in tasks
+        ],
+    }
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != payload:
+            raise RuntimeError(
+                f"Run-root manifest differs from this launch: {path}. "
+                "Use the original grid/settings or a new run root."
+            )
+        return existing
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+    return payload
 
 
 def main() -> None:
@@ -50,7 +83,9 @@ def main() -> None:
     parser.add_argument("--div-weight", type=float, default=0.05)
     parser.add_argument("--div-sigma", type=float, default=1.0)
     parser.add_argument("--div-max-samples", type=int, default=1024)
-    parser.add_argument("--arec-coef", type=float, default=0.0001)
+    coefficient_group = parser.add_mutually_exclusive_group()
+    coefficient_group.add_argument("--arec-coef", type=float, default=0.0001)
+    coefficient_group.add_argument("--arec-coefs")
     parser.add_argument("--arec-q-steps", type=int, default=4)
     parser.add_argument("--arec-q-lr", type=float, default=0.001)
     parser.add_argument("--arec-fisher-ridge", type=float, default=0.001)
@@ -68,15 +103,29 @@ def main() -> None:
         CONDITIONS,
         PROTOCOL_VERSION,
         parse_csv,
+        parse_positive_floats,
         parse_seeds,
         task_matrix,
     )
 
     if args.max_runs_per_gpu < 1:
         raise ValueError("max-runs-per-gpu must be positive")
+    if args.max_runs_per_gpu > 2:
+        raise ValueError("ShadowHandOver is limited to two concurrent runs per GPU")
+    if args.num_env_steps is not None and args.num_env_steps <= 0:
+        raise ValueError("num-env-steps must be positive")
+    if args.n_rollout_threads is not None and args.n_rollout_threads <= 0:
+        raise ValueError("n-rollout-threads must be positive")
+    if args.arec_q_steps < 1 or args.arec_q_lr <= 0 or args.arec_fisher_ridge <= 0:
+        raise ValueError("ARec q steps/LR and Fisher ridge must be positive")
     algorithms = parse_csv(args.algorithms, ALGORITHMS)
     conditions = parse_csv(args.conditions, CONDITIONS)
     seeds = parse_seeds(args.seeds)
+    arec_coefs = (
+        (args.arec_coef,)
+        if args.arec_coefs is None
+        else parse_positive_floats(args.arec_coefs)
+    )
     gpus = tuple(piece.strip() for piece in args.gpus.split(",") if piece.strip())
     if not gpus:
         raise ValueError("Select at least one GPU")
@@ -93,9 +142,48 @@ def main() -> None:
         div_max_samples=args.div_max_samples,
         conditions=conditions,
         arec_coef=args.arec_coef,
+        arec_coefs=arec_coefs,
         arec_q_steps=args.arec_q_steps,
         arec_q_lr=args.arec_q_lr,
         arec_fisher_ridge=args.arec_fisher_ridge,
+    )
+    config_path = harl_root / OFFICIAL_CONFIG
+    config_hash = (
+        hashlib.sha256(config_path.read_bytes()).hexdigest()
+        if config_path.is_file()
+        else None
+    )
+    if not args.dry_run and config_hash is None:
+        raise FileNotFoundError(f"Missing official HARL config: {config_path}")
+    official_budget = (
+        int(json.loads(config_path.read_text())["algo_args"]["train"]["num_env_steps"])
+        if config_hash is not None
+        else 0
+    )
+    protocol_version = (
+        AREC_PROTOCOL_VERSION if "arec" in conditions else PROTOCOL_VERSION
+    )
+    freeze_manifest(
+        root,
+        {
+            "protocol_version": protocol_version,
+            "algorithms": list(algorithms),
+            "conditions": list(conditions),
+            "seeds": list(seeds),
+            "arec_coefs": list(arec_coefs),
+            "arec_q_steps": args.arec_q_steps,
+            "arec_q_lr": args.arec_q_lr,
+            "arec_fisher_ridge": args.arec_fisher_ridge,
+            "div_coef": args.div_coef,
+            "div_weight": args.div_weight,
+            "div_sigma": args.div_sigma,
+            "div_max_samples": args.div_max_samples,
+            "num_env_steps": args.num_env_steps or official_budget,
+            "n_rollout_threads": args.n_rollout_threads,
+            "harl_root": str(harl_root),
+            "official_config_sha256": config_hash,
+        },
+        tasks,
     )
 
     def is_completed(task) -> bool:
@@ -112,10 +200,11 @@ def main() -> None:
 
     pending = [task for task in tasks if not is_completed(task)]
     print(
-        f"Protocol={AREC_PROTOCOL_VERSION if 'arec' in conditions else PROTOCOL_VERSION} "
+        f"Protocol={protocol_version} "
         f"total={len(tasks)} pending={len(pending)} "
         f"algorithms={','.join(algorithms)} conditions={','.join(conditions)} "
-        f"seeds={','.join(map(str, seeds))}",
+        f"seeds={','.join(map(str, seeds))} "
+        f"arec_coefs={','.join(map(str, arec_coefs))}",
         flush=True,
     )
     slots = [gpu for gpu in gpus for _ in range(args.max_runs_per_gpu)]
@@ -123,6 +212,7 @@ def main() -> None:
     for index, task in enumerate(pending):
         queues[index % len(slots)].append(task)
     lock = threading.Lock()
+    stop_launching = threading.Event()
     launcher_log = root / "launcher.log"
 
     def event(message: str) -> None:
@@ -135,6 +225,8 @@ def main() -> None:
     def run_queue(slot: int) -> None:
         gpu = slots[slot]
         for task in queues[slot]:
+            if stop_launching.is_set():
+                return
             command = [
                 sys.executable,
                 str(TRAIN_SCRIPT),
@@ -159,7 +251,7 @@ def main() -> None:
                 "--div-max-samples",
                 str(args.div_max_samples),
                 "--arec-coef",
-                str(args.arec_coef),
+                str(task.arec_coef),
                 "--arec-q-steps",
                 str(args.arec_q_steps),
                 "--arec-q-lr",
@@ -190,6 +282,12 @@ def main() -> None:
                     stderr=subprocess.STDOUT,
                 )
             event(f"GPU {gpu} END   {task.name} status={result.returncode}")
+            if result.returncode != 0:
+                stop_launching.set()
+                event(
+                    "Stopping new launches after a failed run; completed runs are resumable"
+                )
+                return
 
     with ThreadPoolExecutor(max_workers=len(slots)) as executor:
         futures = [executor.submit(run_queue, index) for index in range(len(slots))]
@@ -202,7 +300,7 @@ def main() -> None:
             failures += int(not args.dry_run)
             continue
         try:
-            failures += json.loads(path.read_text()).get("status") == "failed"
+            failures += json.loads(path.read_text()).get("status") != "completed"
         except (OSError, ValueError):
             failures += 1
     event(f"matrix finished; failures={failures}")

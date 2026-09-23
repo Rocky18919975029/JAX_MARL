@@ -74,6 +74,38 @@ metrics and the ARec rows show a nonzero weighted loss and a q/zero ratio below
 one. ARec implementation has been unit-tested locally, but the Isaac Gym path
 must be smoke-tested on the server.
 
+### First four-seed λ grid: 48 runs
+
+After the six-run smoke test, compare each of the three original algorithms
+against ARec at `λ ∈ {3e-5, 1e-4, 3e-4}`. Thus each seed has three `none`
+baselines and nine ARec runs. All other ARec settings are fixed. Omitting the
+budget/thread overrides restores the official HAPPO protocol (50M environment
+steps, 256 rollout threads); MAPPO and MADPO still inherit that matched
+protocol, not their own tuned configs. This grid is expensive. Cap concurrency
+at **two runs per GPU** (eight across four GPUs); do not reuse the four-runs-per-
+GPU SMAX setting for Isaac Gym. The launcher stops dispatching
+new tasks after the first failure, and an identical restart resumes completed
+runs from the frozen manifest.
+
+```bash
+export DEX_AREC_GRID_ROOT=/home/data/zeshenghong/JaxMARL/harl_dexhands_shadowhandover/arec_lambda_grid_4seed_v1
+mkdir -p "$DEX_AREC_GRID_ROOT"
+nohup python experiments/harl_dexhands/run_matrix.py --run-root "$DEX_AREC_GRID_ROOT" --algorithms happo,mappo,madpo --conditions none,arec --seeds 1-4 --arec-coefs 0.00003,0.0001,0.0003 --arec-q-steps 4 --arec-q-lr 0.001 --arec-fisher-ridge 0.001 --gpus 0,1,2,3 --max-runs-per-gpu 2 --wandb-project harl-dexhands-shadowhandover-arec-grid4seed > "$DEX_AREC_GRID_ROOT/launcher.stdout" 2>&1 &
+echo "Launcher PID: $!"
+```
+
+The manifest lets the monitor show the whole grid without repeating its
+selection arguments:
+
+```bash
+watch -n 5 "python experiments/harl_dexhands/monitor.py --run-root '$DEX_AREC_GRID_ROOT'"
+```
+
+If the watcher shows `--run-root ''`, export the absolute path again in that
+terminal; shell variables do not cross terminal sessions. The output root is
+on the data disk through `/home/data`. The λ grid is an initial candidate set,
+not a claim that any coefficient is tuned or beneficial.
+
 ## Server smoke test
 
 Run from the JAX_MARL root in the existing Isaac Gym environment:

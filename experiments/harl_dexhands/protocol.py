@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +44,22 @@ def parse_seeds(value: str) -> tuple[int, ...]:
     if not seeds or len(seeds) != len(set(seeds)) or any(seed < 0 for seed in seeds):
         raise ValueError("Seeds must be a unique non-negative list or range")
     return tuple(seeds)
+
+
+def parse_positive_floats(value: str) -> tuple[float, ...]:
+    try:
+        values = tuple(float(piece.strip()) for piece in value.split(","))
+    except ValueError as error:
+        raise ValueError(
+            "Expected comma-separated positive finite coefficients"
+        ) from error
+    if (
+        not values
+        or len(values) != len(set(values))
+        or any(not math.isfinite(number) or number <= 0 for number in values)
+    ):
+        raise ValueError("Coefficients must be unique, positive, and finite")
+    return values
 
 
 def load_matched_config(
@@ -160,10 +177,18 @@ def task_matrix(
     div_max_samples: int = 1024,
     conditions: tuple[str, ...] = ("none",),
     arec_coef: float = 0.0001,
+    arec_coefs: tuple[float, ...] | None = None,
     arec_q_steps: int = 4,
     arec_q_lr: float = 0.001,
     arec_fisher_ridge: float = 0.001,
 ) -> list[Task]:
+    grid = (arec_coef,) if arec_coefs is None else arec_coefs
+    if (
+        not grid
+        or len(grid) != len(set(grid))
+        or any(not math.isfinite(coef) or coef <= 0 for coef in grid)
+    ):
+        raise ValueError("ARec coefficient grid must be unique, positive, and finite")
     return [
         Task(
             algorithm,
@@ -173,7 +198,7 @@ def task_matrix(
             div_sigma,
             div_max_samples,
             condition,
-            arec_coef,
+            coef,
             arec_q_steps,
             arec_q_lr,
             arec_fisher_ridge,
@@ -181,4 +206,5 @@ def task_matrix(
         for seed in seeds
         for algorithm in algorithms
         for condition in conditions
+        for coef in (grid if condition == "arec" else (arec_coef,))
     ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import types
 import unittest
@@ -82,6 +83,146 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(baseline[1]["model"], arec[1]["model"])
         self.assertNotIn("arec_coef", baseline[1]["algo"])
         self.assertEqual(arec[1]["algo"]["arec_coef"], 0.0001)
+
+    def test_four_seed_lambda_grid_has_twelve_runs_per_seed(self):
+        protocol = load(
+            ROOT / "experiments/harl_dexhands/protocol.py", "test_dex_arec_grid"
+        )
+        grid = protocol.parse_positive_floats("0.00003,0.0001,0.0003")
+        tasks = protocol.task_matrix(
+            protocol.ALGORITHMS,
+            (1, 2, 3, 4),
+            conditions=("none", "arec"),
+            arec_coefs=grid,
+        )
+        self.assertEqual(len(tasks), 48)
+        self.assertEqual(len({task.name for task in tasks}), 48)
+        for seed in (1, 2, 3, 4):
+            cohort = [task for task in tasks if task.seed == seed]
+            self.assertEqual(len(cohort), 12)
+            for algorithm in protocol.ALGORITHMS:
+                candidates = [task for task in cohort if task.algorithm == algorithm]
+                self.assertEqual(
+                    sum(task.condition == "none" for task in candidates), 1
+                )
+                self.assertEqual(
+                    {task.arec_coef for task in candidates if task.condition == "arec"},
+                    set(grid),
+                )
+        for invalid in ("", "1e-4,1e-4", "0,1e-4", "nan,1e-4"):
+            with self.assertRaises(ValueError):
+                protocol.parse_positive_floats(invalid)
+
+    def test_launcher_freezes_grid_and_monitor_discovers_it(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runs"
+            harl_root = Path(directory) / "harl"
+            config = (
+                harl_root / "tuned_configs/dexhands/ShadowHandOver/happo/config.json"
+            )
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps({"algo_args": {"train": {"num_env_steps": 50_000_000}}})
+            )
+            command = [
+                sys.executable,
+                str(ROOT / "experiments/harl_dexhands/run_matrix.py"),
+                "--run-root",
+                str(root),
+                "--harl-root",
+                str(harl_root),
+                "--algorithms",
+                "happo,mappo,madpo",
+                "--conditions",
+                "none,arec",
+                "--seeds",
+                "1-4",
+                "--arec-coefs",
+                "0.00003,0.0001,0.0003",
+                "--gpus",
+                "0,1,2,3",
+                "--max-runs-per-gpu",
+                "2",
+                "--dry-run",
+            ]
+            output = subprocess.run(command, check=True, capture_output=True, text=True)
+            self.assertIn("total=48", output.stdout)
+            manifest = json.loads((root / "experiment_manifest.json").read_text())
+            self.assertEqual(len(manifest["runs"]), 48)
+            self.assertEqual(manifest["study_spec"]["arec_coefs"], [3e-5, 1e-4, 3e-4])
+            self.assertEqual(output.stdout.count("--arec-coef 3e-05"), 12)
+            self.assertEqual(output.stdout.count("--arec-coef 0.0001"), 24)
+            self.assertEqual(output.stdout.count("--arec-coef 0.0003"), 12)
+            monitor = load(
+                ROOT / "experiments/harl_dexhands/monitor.py", "test_dex_arec_monitor"
+            )
+            rows = monitor.load_manifest_rows(root)
+            self.assertEqual(len(rows), 48)
+            self.assertTrue(all(row["status"] == "pending" for row in rows))
+            self.assertTrue(all(row["total"] == 50_000_000 for row in rows))
+            modified = [
+                *command[:-1],
+                "--arec-coefs",
+                "0.00001,0.0001,0.001",
+                "--dry-run",
+            ]
+            retry = subprocess.run(modified, capture_output=True, text=True)
+            self.assertNotEqual(retry.returncode, 0)
+            self.assertIn("manifest differs", retry.stderr)
+
+            overcommitted = [
+                *command[:-3],
+                "--max-runs-per-gpu",
+                "3",
+                "--dry-run",
+            ]
+            rejected = subprocess.run(overcommitted, capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("limited to two concurrent runs per GPU", rejected.stderr)
+
+    def test_launcher_stops_dispatch_after_first_failure(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runs"
+            harl_root = Path(directory) / "harl"
+            config = (
+                harl_root / "tuned_configs/dexhands/ShadowHandOver/happo/config.json"
+            )
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps({"algo_args": {"train": {"num_env_steps": 2400}}})
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "experiments/harl_dexhands/run_matrix.py"),
+                    "--run-root",
+                    str(root),
+                    "--harl-root",
+                    str(harl_root),
+                    "--algorithms",
+                    "happo,mappo,madpo",
+                    "--conditions",
+                    "none,arec",
+                    "--seeds",
+                    "1",
+                    "--arec-coefs",
+                    "0.00003,0.0001,0.0003",
+                    "--gpus",
+                    "0",
+                    "--wandb-mode",
+                    "disabled",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            events = (root / "launcher.log").read_text()
+            self.assertEqual(events.count(" START "), 1)
+            self.assertIn("Stopping new launches", events)
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")

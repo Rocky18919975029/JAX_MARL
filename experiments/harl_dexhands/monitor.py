@@ -15,6 +15,7 @@ from experiments.harl_dexhands.protocol import (  # noqa: E402
     ALGORITHMS,
     CONDITIONS,
     parse_csv,
+    parse_positive_floats,
     parse_seeds,
     task_matrix,
 )
@@ -36,6 +37,7 @@ def load_rows(
     div_max_samples: int = 1024,
     conditions: tuple[str, ...] = ("none",),
     arec_coef: float = 0.0001,
+    arec_coefs: tuple[float, ...] | None = None,
     arec_q_steps: int = 4,
     arec_q_lr: float = 0.001,
     arec_fisher_ridge: float = 0.001,
@@ -50,6 +52,7 @@ def load_rows(
         div_max_samples=div_max_samples,
         conditions=conditions,
         arec_coef=arec_coef,
+        arec_coefs=arec_coefs,
         arec_q_steps=arec_q_steps,
         arec_q_lr=arec_q_lr,
         arec_fisher_ridge=arec_fisher_ridge,
@@ -75,6 +78,30 @@ def load_rows(
     return rows
 
 
+def load_manifest_rows(root: Path) -> list[dict]:
+    """Use the launcher's frozen grid so a simple --run-root shows every run."""
+    manifest = json.loads((root / "experiment_manifest.json").read_text())
+    budget = int(manifest["study_spec"]["num_env_steps"])
+    rows = []
+    for run in manifest["runs"]:
+        name = run["run_name"]
+        path = root / "status" / f"{name}.json"
+        if not path.is_file():
+            rows.append(
+                {"name": name, "status": "pending", "steps": 0, "total": budget}
+            )
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        state = str(payload.get("status", "unknown"))
+        total = int(payload.get("total_env_steps", budget))
+        steps = total if state == "completed" else int(payload.get("env_steps", 0))
+        rows.append({"name": name, "status": state, "steps": steps, "total": total})
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
@@ -85,29 +112,41 @@ def main() -> None:
     parser.add_argument("--div-weight", type=float, default=0.05)
     parser.add_argument("--div-sigma", type=float, default=1.0)
     parser.add_argument("--div-max-samples", type=int, default=1024)
-    parser.add_argument("--arec-coef", type=float, default=0.0001)
+    coefficient_group = parser.add_mutually_exclusive_group()
+    coefficient_group.add_argument("--arec-coef", type=float, default=0.0001)
+    coefficient_group.add_argument("--arec-coefs")
     parser.add_argument("--arec-q-steps", type=int, default=4)
     parser.add_argument("--arec-q-lr", type=float, default=0.001)
     parser.add_argument("--arec-fisher-ridge", type=float, default=0.001)
+    parser.add_argument("--ignore-manifest", action="store_true")
     args = parser.parse_args()
-    algorithms = parse_csv(args.algorithms, ALGORITHMS)
-    conditions = parse_csv(args.conditions, CONDITIONS)
-    seeds = parse_seeds(args.seeds)
     root = args.run_root.expanduser().resolve()
-    rows = load_rows(
-        root,
-        algorithms,
-        seeds,
-        div_coef=args.div_coef,
-        div_weight=args.div_weight,
-        div_sigma=args.div_sigma,
-        div_max_samples=args.div_max_samples,
-        conditions=conditions,
-        arec_coef=args.arec_coef,
-        arec_q_steps=args.arec_q_steps,
-        arec_q_lr=args.arec_q_lr,
-        arec_fisher_ridge=args.arec_fisher_ridge,
-    )
+    if (root / "experiment_manifest.json").is_file() and not args.ignore_manifest:
+        rows = load_manifest_rows(root)
+    else:
+        algorithms = parse_csv(args.algorithms, ALGORITHMS)
+        conditions = parse_csv(args.conditions, CONDITIONS)
+        seeds = parse_seeds(args.seeds)
+        arec_coefs = (
+            (args.arec_coef,)
+            if args.arec_coefs is None
+            else parse_positive_floats(args.arec_coefs)
+        )
+        rows = load_rows(
+            root,
+            algorithms,
+            seeds,
+            div_coef=args.div_coef,
+            div_weight=args.div_weight,
+            div_sigma=args.div_sigma,
+            div_max_samples=args.div_max_samples,
+            conditions=conditions,
+            arec_coef=args.arec_coef,
+            arec_coefs=arec_coefs,
+            arec_q_steps=args.arec_q_steps,
+            arec_q_lr=args.arec_q_lr,
+            arec_fisher_ridge=args.arec_fisher_ridge,
+        )
     counts = {
         state: sum(row["status"] == state for row in rows)
         for state in ("completed", "running", "failed", "pending")
