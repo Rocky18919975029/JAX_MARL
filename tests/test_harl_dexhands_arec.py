@@ -224,6 +224,18 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(events.count(" START "), 1)
             self.assertIn("Stopping new launches", events)
 
+    def test_launcher_rejects_incomplete_wandb_before_dispatch(self):
+        from unittest.mock import patch
+
+        launcher = load(
+            ROOT / "experiments/harl_dexhands/run_matrix.py",
+            "test_dex_arec_wandb_preflight",
+        )
+        incomplete = types.ModuleType("wandb")
+        with patch.dict(sys.modules, {"wandb": incomplete}):
+            with self.assertRaisesRegex(RuntimeError, "no callable init"):
+                launcher.verify_wandb()
+
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")
 class ActorPathTests(unittest.TestCase):

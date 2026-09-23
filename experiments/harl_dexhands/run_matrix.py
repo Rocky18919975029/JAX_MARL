@@ -35,6 +35,23 @@ def training_environment(gpu: str) -> dict[str, str]:
     return environment
 
 
+def verify_wandb() -> None:
+    """Reject an incomplete or shadowed W&B import before launching workers."""
+    try:
+        import wandb
+    except ImportError as error:
+        raise RuntimeError(
+            "W&B online mode requires the wandb SDK in the active Python "
+            "environment; install it or use --wandb-mode disabled"
+        ) from error
+    if not callable(getattr(wandb, "init", None)):
+        raise RuntimeError(
+            "The imported wandb module has no callable init; "
+            f"loaded from {getattr(wandb, '__file__', None)!r}. "
+            "Check for a shadowing local module or an incomplete SDK installation."
+        )
+
+
 def freeze_manifest(root: Path, study_spec: dict, tasks: list) -> dict:
     """Record the exact grid and reject accidental changes on resume."""
     path = root / "experiment_manifest.json"
@@ -129,6 +146,8 @@ def main() -> None:
     gpus = tuple(piece.strip() for piece in args.gpus.split(",") if piece.strip())
     if not gpus:
         raise ValueError("Select at least one GPU")
+    if args.wandb_mode == "online" and not args.dry_run:
+        verify_wandb()
     root = args.run_root.expanduser().resolve()
     harl_root = args.harl_root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)

@@ -106,6 +106,19 @@ terminal; shell variables do not cross terminal sessions. The output root is
 on the data disk through `/home/data`. The λ grid is an initial candidate set,
 not a claim that any coefficient is tuned or beneficial.
 
+For online logging, check W&B in the active `harl_dex` Python before launching:
+
+```bash
+python -c 'import wandb; print(wandb.__file__); assert callable(wandb.init)'
+```
+
+The launcher performs the same import preflight before dispatching workers.
+If W&B is missing in this Python 3.8 environment, install a compatible pinned
+SDK (`python -m pip install 'wandb==0.21.1'`) and repeat the check. A run root
+whose workers failed before training can be relaunched with the identical grid;
+the manifest protects its settings and the launcher retries incomplete runs.
+Do not delete failed status files by hand.
+
 ## Server smoke test
 
 Run from the JAX_MARL root in the existing Isaac Gym environment:
