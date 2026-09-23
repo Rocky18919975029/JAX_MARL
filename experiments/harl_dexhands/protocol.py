@@ -9,7 +9,13 @@ from pathlib import Path
 
 
 ALGORITHMS = ("happo", "mappo", "madpo")
+CONDITIONS = ("none", "arec")
 PROTOCOL_VERSION = "harl-dexhands-shadowhandover-v1.0"
+AREC_PROTOCOL_VERSION = "harl-dexhands-shadowhandover-arec-v1.0"
+
+
+def number_label(value: float) -> str:
+    return f"{value:.10g}".replace("-", "m").replace(".", "p").replace("+", "")
 
 
 def parse_csv(value: str, allowed: tuple[str, ...]) -> tuple[str, ...]:
@@ -51,9 +57,16 @@ def load_matched_config(
     div_weight: float = 0.05,
     div_sigma: float = 1.0,
     div_max_samples: int = 1024,
+    condition: str = "none",
+    arec_coef: float = 0.0001,
+    arec_q_steps: int = 4,
+    arec_q_lr: float = 0.001,
+    arec_fisher_ridge: float = 0.001,
 ) -> tuple[dict, dict, dict]:
     if algorithm not in ALGORITHMS:
         raise ValueError(f"Unknown algorithm {algorithm!r}")
+    if condition not in CONDITIONS:
+        raise ValueError(f"Unknown condition {condition!r}")
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     main_args = copy.deepcopy(payload["main_args"])
     algo_args = copy.deepcopy(payload["algo_args"])
@@ -85,6 +98,24 @@ def load_matched_config(
                 "div_epsilon": 1e-8,
             }
         )
+    if condition == "arec":
+        if (
+            arec_coef <= 0
+            or arec_q_steps < 1
+            or arec_q_lr <= 0
+            or arec_fisher_ridge <= 0
+        ):
+            raise ValueError(
+                "ARec coefficient, q steps/LR, and Fisher ridge must be positive"
+            )
+        algo_args["algo"].update(
+            {
+                "arec_coef": float(arec_coef),
+                "arec_q_steps": int(arec_q_steps),
+                "arec_q_lr": float(arec_q_lr),
+                "arec_fisher_ridge": float(arec_fisher_ridge),
+            }
+        )
     return main_args, algo_args, env_args
 
 
@@ -96,15 +127,25 @@ class Task:
     div_weight: float = 0.05
     div_sigma: float = 1.0
     div_max_samples: int = 1024
+    condition: str = "none"
+    arec_coef: float = 0.0001
+    arec_q_steps: int = 4
+    arec_q_lr: float = 0.001
+    arec_fisher_ridge: float = 0.001
 
     @property
     def name(self) -> str:
         prefix = f"HARL-ShadowHandOver-nps-{self.algorithm}"
         if self.algorithm == "madpo":
-            label = lambda value: f"{value:.10g}".replace("-", "m").replace(".", "p")
             prefix += (
-                f"-div{label(self.div_coef)}-w{label(self.div_weight)}"
-                f"-sig{label(self.div_sigma)}-k{self.div_max_samples}"
+                f"-div{number_label(self.div_coef)}-w{number_label(self.div_weight)}"
+                f"-sig{number_label(self.div_sigma)}-k{self.div_max_samples}"
+            )
+        if self.condition == "arec":
+            prefix += (
+                f"-arec-lam{number_label(self.arec_coef)}"
+                f"-qs{self.arec_q_steps}-qlr{number_label(self.arec_q_lr)}"
+                f"-ridge{number_label(self.arec_fisher_ridge)}"
             )
         return f"{prefix}-seed{self.seed}"
 
@@ -117,6 +158,11 @@ def task_matrix(
     div_weight: float = 0.05,
     div_sigma: float = 1.0,
     div_max_samples: int = 1024,
+    conditions: tuple[str, ...] = ("none",),
+    arec_coef: float = 0.0001,
+    arec_q_steps: int = 4,
+    arec_q_lr: float = 0.001,
+    arec_fisher_ridge: float = 0.001,
 ) -> list[Task]:
     return [
         Task(
@@ -126,7 +172,13 @@ def task_matrix(
             div_weight,
             div_sigma,
             div_max_samples,
+            condition,
+            arec_coef,
+            arec_q_steps,
+            arec_q_lr,
+            arec_fisher_ridge,
         )
         for seed in seeds
         for algorithm in algorithms
+        for condition in conditions
     ]

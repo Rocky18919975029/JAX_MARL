@@ -268,3 +268,52 @@ class TrackedMAPPORunner(TrackingMixin, OnPolicyMARunner):
 
 class TrackedMADPORunner(TrackingMixin, MADPORunner):
     pass
+
+
+class ActorScoreRecoveryRunnerMixin:
+    """Prepare one frozen score target and q teacher per rollout, before PPO."""
+
+    def train(self):
+        if self.share_param or self.state_type != "EP":
+            raise ValueError("ShadowHandOver ARec requires NPS actors and EP state")
+        observations = self.critic_buffer.share_obs[:-1]
+        batch_size = observations.shape[0] * observations.shape[1]
+        with torch.no_grad():
+            critic_input = torch.as_tensor(
+                observations.reshape(batch_size, -1),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            critic_latent = self.critic.critic.base(critic_input).detach()
+        for actor, buffer in zip(self.actor, self.actor_buffer):
+            actor.prepare_recovery(buffer, critic_latent)
+        try:
+            # Preserve HARL's HAPPO/MAPPO ordering, MADPO references, and
+            # original critic value update. Only the actors have ARec loss.
+            return super().train()
+        finally:
+            for actor in self.actor:
+                actor.clear_recovery()
+
+    def save(self):
+        super().save()
+        for agent_id, actor in enumerate(self.actor):
+            torch.save(
+                {
+                    "q": actor.arec_q.state_dict(),
+                    "q_optimizer": actor.arec_q_optimizer.state_dict(),
+                },
+                Path(self.save_dir) / f"arec_q_agent{agent_id}.pt",
+            )
+
+
+class TrackedARecHAPPORunner(ActorScoreRecoveryRunnerMixin, TrackedHAPPORunner):
+    pass
+
+
+class TrackedARecMAPPORunner(ActorScoreRecoveryRunnerMixin, TrackedMAPPORunner):
+    pass
+
+
+class TrackedARecMADPORunner(ActorScoreRecoveryRunnerMixin, TrackedMADPORunner):
+    pass

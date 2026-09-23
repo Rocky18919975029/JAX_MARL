@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 from experiments.harl_dexhands.protocol import (  # noqa: E402
     ALGORITHMS,
+    CONDITIONS,
     parse_csv,
     parse_seeds,
     task_matrix,
@@ -33,6 +34,11 @@ def load_rows(
     div_weight: float = 0.05,
     div_sigma: float = 1.0,
     div_max_samples: int = 1024,
+    conditions: tuple[str, ...] = ("none",),
+    arec_coef: float = 0.0001,
+    arec_q_steps: int = 4,
+    arec_q_lr: float = 0.001,
+    arec_fisher_ridge: float = 0.001,
 ) -> list[dict]:
     rows = []
     for task in task_matrix(
@@ -42,6 +48,11 @@ def load_rows(
         div_weight=div_weight,
         div_sigma=div_sigma,
         div_max_samples=div_max_samples,
+        conditions=conditions,
+        arec_coef=arec_coef,
+        arec_q_steps=arec_q_steps,
+        arec_q_lr=arec_q_lr,
+        arec_fisher_ridge=arec_fisher_ridge,
     ):
         path = root / "status" / f"{task.name}.json"
         if not path.is_file():
@@ -68,13 +79,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--algorithms", default="happo,mappo,madpo")
+    parser.add_argument("--conditions", default="none")
     parser.add_argument("--seeds", default="1-4")
     parser.add_argument("--div-coef", type=float, default=1000.0)
     parser.add_argument("--div-weight", type=float, default=0.05)
     parser.add_argument("--div-sigma", type=float, default=1.0)
     parser.add_argument("--div-max-samples", type=int, default=1024)
+    parser.add_argument("--arec-coef", type=float, default=0.0001)
+    parser.add_argument("--arec-q-steps", type=int, default=4)
+    parser.add_argument("--arec-q-lr", type=float, default=0.001)
+    parser.add_argument("--arec-fisher-ridge", type=float, default=0.001)
     args = parser.parse_args()
     algorithms = parse_csv(args.algorithms, ALGORITHMS)
+    conditions = parse_csv(args.conditions, CONDITIONS)
     seeds = parse_seeds(args.seeds)
     root = args.run_root.expanduser().resolve()
     rows = load_rows(
@@ -85,6 +102,11 @@ def main() -> None:
         div_weight=args.div_weight,
         div_sigma=args.div_sigma,
         div_max_samples=args.div_max_samples,
+        conditions=conditions,
+        arec_coef=args.arec_coef,
+        arec_q_steps=args.arec_q_steps,
+        arec_q_lr=args.arec_q_lr,
+        arec_fisher_ridge=args.arec_fisher_ridge,
     )
     counts = {
         state: sum(row["status"] == state for row in rows)

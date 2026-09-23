@@ -40,6 +40,7 @@ def main() -> None:
         "--harl-root", type=Path, default=REPO_ROOT / "third_party" / "HARL"
     )
     parser.add_argument("--algorithms", default="happo,mappo,madpo")
+    parser.add_argument("--conditions", default="none")
     parser.add_argument("--seeds", default="1-4")
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--max-runs-per-gpu", type=int, default=1)
@@ -49,6 +50,10 @@ def main() -> None:
     parser.add_argument("--div-weight", type=float, default=0.05)
     parser.add_argument("--div-sigma", type=float, default=1.0)
     parser.add_argument("--div-max-samples", type=int, default=1024)
+    parser.add_argument("--arec-coef", type=float, default=0.0001)
+    parser.add_argument("--arec-q-steps", type=int, default=4)
+    parser.add_argument("--arec-q-lr", type=float, default=0.001)
+    parser.add_argument("--arec-fisher-ridge", type=float, default=0.001)
     parser.add_argument("--wandb-project", default="harl-dexhands-shadowhandover")
     parser.add_argument(
         "--wandb-mode", choices=("online", "disabled"), default="online"
@@ -59,6 +64,8 @@ def main() -> None:
     sys.path.insert(0, str(REPO_ROOT))
     from experiments.harl_dexhands.protocol import (
         ALGORITHMS,
+        AREC_PROTOCOL_VERSION,
+        CONDITIONS,
         PROTOCOL_VERSION,
         parse_csv,
         parse_seeds,
@@ -68,6 +75,7 @@ def main() -> None:
     if args.max_runs_per_gpu < 1:
         raise ValueError("max-runs-per-gpu must be positive")
     algorithms = parse_csv(args.algorithms, ALGORITHMS)
+    conditions = parse_csv(args.conditions, CONDITIONS)
     seeds = parse_seeds(args.seeds)
     gpus = tuple(piece.strip() for piece in args.gpus.split(",") if piece.strip())
     if not gpus:
@@ -83,6 +91,11 @@ def main() -> None:
         div_weight=args.div_weight,
         div_sigma=args.div_sigma,
         div_max_samples=args.div_max_samples,
+        conditions=conditions,
+        arec_coef=args.arec_coef,
+        arec_q_steps=args.arec_q_steps,
+        arec_q_lr=args.arec_q_lr,
+        arec_fisher_ridge=args.arec_fisher_ridge,
     )
 
     def is_completed(task) -> bool:
@@ -99,8 +112,10 @@ def main() -> None:
 
     pending = [task for task in tasks if not is_completed(task)]
     print(
-        f"Protocol={PROTOCOL_VERSION} total={len(tasks)} pending={len(pending)} "
-        f"algorithms={','.join(algorithms)} seeds={','.join(map(str, seeds))}",
+        f"Protocol={AREC_PROTOCOL_VERSION if 'arec' in conditions else PROTOCOL_VERSION} "
+        f"total={len(tasks)} pending={len(pending)} "
+        f"algorithms={','.join(algorithms)} conditions={','.join(conditions)} "
+        f"seeds={','.join(map(str, seeds))}",
         flush=True,
     )
     slots = [gpu for gpu in gpus for _ in range(args.max_runs_per_gpu)]
@@ -131,6 +146,8 @@ def main() -> None:
                 task.name,
                 "--algorithm",
                 task.algorithm,
+                "--condition",
+                task.condition,
                 "--seed",
                 str(task.seed),
                 "--div-coef",
@@ -141,6 +158,14 @@ def main() -> None:
                 str(args.div_sigma),
                 "--div-max-samples",
                 str(args.div_max_samples),
+                "--arec-coef",
+                str(args.arec_coef),
+                "--arec-q-steps",
+                str(args.arec_q_steps),
+                "--arec-q-lr",
+                str(args.arec_q_lr),
+                "--arec-fisher-ridge",
+                str(args.arec_fisher_ridge),
                 "--wandb-project",
                 args.wandb_project,
                 "--wandb-mode",

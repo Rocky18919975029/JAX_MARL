@@ -94,6 +94,11 @@ class MADPO(HAPPO):
         peer_policy: nn.Module | None,
         peer_data: dict[str, Any] | None,
     ):
+        recovery_teacher = None
+        if len(sample) == 10:
+            sample, recovery_teacher = sample[:-1], sample[-1]
+            if not hasattr(self, "_recovery_loss"):
+                raise ValueError("Recovery target supplied to a non-ARec MADPO actor")
         (
             obs_batch,
             rnn_states_batch,
@@ -215,6 +220,10 @@ class MADPO(HAPPO):
         objective = (
             policy_loss - self.entropy_coef * entropy - self.div_coef * divergence
         )
+        if recovery_teacher is not None:
+            objective = objective + self.arec_coef * self._recovery_loss(
+                obs_batch, actions_batch, active_masks_batch, recovery_teacher
+            )
         finite_values = {
             "policy loss": policy_loss,
             "entropy": entropy,
