@@ -1,10 +1,12 @@
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from scripts.analyze_smax_actor_score_recovery_sweep import metric_summary, summarize
+from scripts.monitor_smax_actor_score_recovery_sweep import main as monitor_main
 from scripts.plot_smax_actor_score_recovery_sweep import (
     make_figure,
     seed_bootstrap_curves,
@@ -61,6 +63,17 @@ def test_dense_10m_four_seed_grid_has_one_paired_baseline_per_seed():
     assert len({run.name for run in runs}) == 64
     assert sum(run.condition == "none" for run in runs) == 4
     assert all(run.steps == 10_000_000 for run in runs)
+
+
+def test_monitor_explains_missing_manifest_and_shows_launcher_error(
+    tmp_path, monkeypatch, capsys
+):
+    (tmp_path / "launcher.stdout").write_text("error: invalid launch option\n")
+    monkeypatch.setattr(sys, "argv", ["monitor", "--run-root", str(tmp_path)])
+    monitor_main()
+    output = capsys.readouterr().out
+    assert "NOT STARTED" in output
+    assert "error: invalid launch option" in output
 
 
 def test_baseline_disables_all_auxiliary_losses_and_matches_ppo_settings(tmp_path):

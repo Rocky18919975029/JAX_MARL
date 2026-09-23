@@ -26,7 +26,18 @@ def main() -> None:
     parser.add_argument("--run-root", type=Path, required=True)
     args = parser.parse_args()
     root = args.run_root.expanduser().resolve()
-    manifest = json.loads((root / "experiment_manifest.json").read_text())
+    manifest_path = root / "experiment_manifest.json"
+    if not manifest_path.is_file():
+        print(f"NOT STARTED: no experiment manifest at {manifest_path}")
+        stdout = root / "launcher.stdout"
+        if stdout.is_file():
+            lines = stdout.read_text(encoding="utf-8", errors="replace").splitlines()
+            print("\nLatest launcher output:")
+            print("\n".join(lines[-20:]) or "(empty)")
+        else:
+            print(f"No launcher output at {stdout}")
+        return
+    manifest = json.loads(manifest_path.read_text())
     rows = []
     for run in manifest["runs"]:
         name = run["run_name"]
