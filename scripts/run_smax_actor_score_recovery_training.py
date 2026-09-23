@@ -37,6 +37,7 @@ PROTOCOL = "smax-nps-actor-score-recovery-v1.0"
 DEFAULT_BUDGETS = {
     "10m_vs_11m": 10_000_000,
     "3s5z_vs_3s6z": 20_000_000,
+    "6s9z_vs_6s10z": 20_000_000,
     "smacv2_10_units": 10_000_000,
 }
 

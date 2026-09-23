@@ -10,6 +10,57 @@ oracle loss. The default scan varies the two most consequential controls,
 `lambda` and the number of q fitting steps; q learning rate and Fisher ridge
 are fixed by default but can be varied explicitly.
 
+## Four-seed heterogeneous-map sweeps
+
+The same NPS MAPPO protocol can run separately on `6s9z_vs_6s10z` and
+`smacv2_10_units`. Each map gets its own root and W&B project. The frozen
+2 × 3 grid is `q_steps={4,8}` ×
+`lambda_ARec={0.00003,0.0001,0.0003}` with q learning rate and Fisher ridge
+fixed at `0.001`. Each of seeds 1–4 has one matched `none` run and six ARec
+runs: **28 runs per map**, never pooling tasks. The 15-ally heterogeneous map
+uses 20M steps, matching the earlier heterogeneous SMAX scaling protocol;
+SMACv2 10 units uses 10M. All other MAPPO settings remain the sweep defaults.
+Use at most two concurrent runs per GPU. Run the two matrices sequentially so
+they do not together exceed that limit.
+
+First smoke-test both maps with one seed and one intervention cell in a
+separate root, then launch the formal matrices only after checking their logs:
+
+```bash
+cd ~/JaxMARL
+git pull --ff-only
+conda activate jaxmarl
+unset LD_LIBRARY_PATH
+export AREC_HET_SMOKE=/home/data/zeshenghong/JaxMARL/h1_smax_runs/arec_het_maps_smoke_v1
+python scripts/run_smax_actor_score_recovery_sweep.py --run-root "$AREC_HET_SMOKE" --maps 6s9z_vs_6s10z,smacv2_10_units --seeds 1 --coefs 0.00003 --q-steps-grid 4 --total-timesteps 16384 --gpus 0,1,2,3 --max-runs-per-gpu 1 --wandb-mode disabled
+python scripts/monitor_smax_actor_score_recovery_sweep.py --run-root "$AREC_HET_SMOKE"
+```
+
+After all four smoke runs complete with no failures, launch the first full
+matrix. The shell command is intentionally on one line to avoid lost
+continuation backslashes when pasting into a terminal.
+
+```bash
+export AREC_6S9Z_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/arec_6s9z_vs_6s10z_grid4seed_v1
+mkdir -p "$AREC_6S9Z_ROOT"
+nohup python scripts/run_smax_actor_score_recovery_sweep.py --run-root "$AREC_6S9Z_ROOT" --maps 6s9z_vs_6s10z --seeds 1-4 --conditions none,actor_score_recovery --coefs 0.00003,0.0001,0.0003 --q-steps-grid 4,8 --q-learning-rates 0.001 --fisher-ridges 0.001 --gpus 0,1,2,3 --max-runs-per-gpu 2 --project jaxmarl-smax-arec-6s9z-grid4seed > "$AREC_6S9Z_ROOT/launcher.stdout" 2>&1 &
+python scripts/monitor_smax_actor_score_recovery_sweep.py --run-root "$AREC_6S9Z_ROOT"
+```
+
+Once that matrix has `COMPLETED=28` and `FAILED=0`, run the SMACv2 matrix:
+
+```bash
+export AREC_SMACV2_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/arec_smacv2_10_units_grid4seed_v1
+mkdir -p "$AREC_SMACV2_ROOT"
+nohup python scripts/run_smax_actor_score_recovery_sweep.py --run-root "$AREC_SMACV2_ROOT" --maps smacv2_10_units --seeds 1-4 --conditions none,actor_score_recovery --coefs 0.00003,0.0001,0.0003 --q-steps-grid 4,8 --q-learning-rates 0.001 --fisher-ridges 0.001 --gpus 0,1,2,3 --max-runs-per-gpu 2 --project jaxmarl-smax-arec-smacv2-grid4seed > "$AREC_SMACV2_ROOT/launcher.stdout" 2>&1 &
+python scripts/monitor_smax_actor_score_recovery_sweep.py --run-root "$AREC_SMACV2_ROOT"
+```
+
+After completion, analyze and plot each root independently with
+`analyze_smax_actor_score_recovery_sweep.py` and
+`plot_smax_actor_score_recovery_sweep.py`. Four seeds used to choose the best
+hyperparameters are *tuning* seeds, not an independent confirmation cohort.
+
 Use a fresh root for each frozen grid. The launcher skips completed or active
 runs and records the exact matrix in `experiment_manifest.json`. Its monitor
 shows every run, including `none`.

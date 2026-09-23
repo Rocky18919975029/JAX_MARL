@@ -46,6 +46,8 @@ def test_launcher_keeps_alignment_and_critic_recovery_off(tmp_path):
     assert "lam0p001-seed2" in run.name
     assert DEFAULT_BUDGETS["10m_vs_11m"] == 10_000_000
     assert DEFAULT_BUDGETS["3s5z_vs_3s6z"] == 20_000_000
+    assert DEFAULT_BUDGETS["6s9z_vs_6s10z"] == 20_000_000
+    assert DEFAULT_BUDGETS["smacv2_10_units"] == 10_000_000
 
 
 def test_offline_measurement_can_identify_actor_intervention():

@@ -18,6 +18,31 @@ from scripts.run_smax_actor_score_recovery_sweep import (
     positive_float_items,
     run_matrix,
 )
+from scripts.run_smax_actor_score_recovery_training import DEFAULT_BUDGETS
+
+
+def test_heterogeneous_and_smacv2_four_seed_sweeps_have_paired_baselines():
+    maps = ("6s9z_vs_6s10z", "smacv2_10_units")
+    budgets = {name: DEFAULT_BUDGETS[name] for name in maps}
+    runs = run_matrix(
+        maps,
+        (1, 2, 3, 4),
+        budgets,
+        (3e-5, 1e-4, 3e-4),
+        (4, 8),
+        (1e-3,),
+        (1e-3,),
+    )
+    assert len(runs) == 56
+    assert len({run.name for run in runs}) == 56
+    for map_name in maps:
+        task_runs = [run for run in runs if run.map_name == map_name]
+        assert len(task_runs) == 28
+        for seed in (1, 2, 3, 4):
+            paired = [run for run in task_runs if run.seed == seed]
+            assert len(paired) == 7
+            assert sum(run.condition == "none" for run in paired) == 1
+            assert all(run.steps == budgets[map_name] for run in paired)
 
 
 def test_sweep_contains_one_isolated_run_per_task_seed_and_unique_grid():
