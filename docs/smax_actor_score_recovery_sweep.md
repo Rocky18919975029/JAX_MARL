@@ -356,3 +356,36 @@ the same report directory. `summary_all_tasks.csv` now has three separate
 task-specific baseline/ARec pairs. Selection and reporting use the same four
 training seeds, so these are exploratory estimates, not an independent
 confirmation.
+
+### Add the completed SMACv2 10-units sweep
+
+Pass `--root-smacv2` alongside the three existing roots. Four tasks render as
+2 × 2 panels, each with its own isolated baseline, selected ARec setting and
+four-seed bootstrap CI. The report keeps all tasks separate in the output
+table; it does not compute a cross-task mean. The existing 120 evaluations are
+validated and reused, so normally only SMACv2's 40 selected checkpoint
+policies require new held-out evaluation. The SMACv2 budget is 10M steps;
+the two heterogeneous SMAX tasks remain at 20M.
+
+```bash
+cd ~/JaxMARL
+git pull --ff-only
+conda activate jaxmarl
+unset LD_LIBRARY_PATH
+export AREC_DETAIL_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_10m_detail_4seed_v1
+export AREC_CONFIRM_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_confirm_4seed_v1
+export AREC_6S9Z_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/arec_6s9z_vs_6s10z_grid4seed_v1
+export AREC_SMACV2_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/arec_smacv2_10_units_grid4seed_v1
+export AREC_BEST_REPORT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_best_return_report_v1
+mkdir -p "$AREC_BEST_REPORT"
+nohup python scripts/report_smax_arec_best_returns.py --root-10m "$AREC_DETAIL_ROOT" --root-3s5z "$AREC_CONFIRM_ROOT/3s5z_vs_3s6z" --root-6s9z "$AREC_6S9Z_ROOT" --root-smacv2 "$AREC_SMACV2_ROOT" --output-root "$AREC_BEST_REPORT" --evaluate-missing --eval-episodes 256 --gpus 0,1,2,3 --max-runs-per-gpu 2 > "$AREC_BEST_REPORT/report-4task.stdout" 2>&1 &
+```
+
+After completion, `summary_all_tasks.csv` contains eight rows (four tasks ×
+two conditions). `return_auc_mean` is the seed-mean time-normalized area under
+the **training** return curve; `final_eval_return_last5_ckpt_mean` is the
+seed-mean **held-out** episode return averaged over the last five distinct
+saved checkpoints. Each also has a bootstrap 95% CI. The existing 6s9z
+baseline here is the original paired sweep baseline, not the subsequently
+tuned isolated PPO baseline; substituting the latter alone would make the ARec
+comparison unmatched.

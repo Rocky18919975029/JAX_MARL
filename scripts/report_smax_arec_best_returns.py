@@ -42,6 +42,7 @@ except ModuleNotFoundError:  # Direct execution from scripts/.
 
 TASKS = ("10m_vs_11m", "3s5z_vs_3s6z")
 THIRD_TASK = "6s9z_vs_6s10z"
+FOURTH_TASK = "smacv2_10_units"
 REPO = Path(__file__).resolve().parents[1]
 BASELINE_COLOR = "#343A40"
 RECOVERY_COLOR = "#0072B2"
@@ -511,8 +512,13 @@ def render_figure(curve_rows: list[dict], selections: dict, output: Path) -> Non
             "pdf.fonttype": 42,
         }
     ):
-        fig, axes = plt.subplots(1, len(tasks), figsize=(178 / 25.4, 94 / 25.4))
-        for ax, task in zip(axes, tasks):
+        if len(tasks) == 4:
+            fig, grid = plt.subplots(2, 2, figsize=(178 / 25.4, 130 / 25.4))
+            axes = tuple(grid.flat)
+        else:
+            fig, grid = plt.subplots(1, len(tasks), figsize=(178 / 25.4, 94 / 25.4))
+            axes = tuple(np.atleast_1d(grid).flat)
+        for index, (ax, task) in enumerate(zip(axes, tasks)):
             for condition, color, linestyle in (
                 ("none", BASELINE_COLOR, (0, (5, 2))),
                 ("actor_score_recovery", RECOVERY_COLOR, "-"),
@@ -531,18 +537,28 @@ def render_figure(curve_rows: list[dict], selections: dict, output: Path) -> Non
                 high = np.asarray([row["ci95_high"] for row in rows])
                 ax.fill_between(x, low, high, color=color, alpha=0.14, linewidth=0)
                 ax.plot(x, y, color=color, linestyle=linestyle, linewidth=1.35)
-            task_label = task.replace("_vs_", " vs ").replace("_", " ")
-            ax.set_title(
-                "SMAX\n" + task_label if len(tasks) == 3 else "SMAX — " + task_label
-            )
-            ax.set_xlabel("Environment steps (millions)")
+            if task == FOURTH_TASK:
+                ax.set_title("SMACv2\n10 units")
+            else:
+                task_label = task.replace("_vs_", " vs ").replace("_", " ")
+                ax.set_title(
+                    "SMAX\n" + task_label if len(tasks) >= 3 else "SMAX — " + task_label
+                )
+            if len(tasks) != 4:
+                ax.set_xlabel("Environment steps (millions)")
+            elif index >= 2:
+                ax.set_xlabel("Environment steps (millions)")
             ax.set_xlim(0, selections[task]["budget"] / 1e6)
             ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
             ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
             ax.grid(axis="y", color="#D9DEE5", linewidth=0.8)
             ax.spines[["top", "right"]].set_visible(False)
             ax.tick_params(direction="out", width=0.8, length=3)
-        axes[0].set_ylabel("Training episode return")
+        if len(tasks) == 4:
+            axes[0].set_ylabel("Training episode return")
+            axes[2].set_ylabel("Training episode return")
+        else:
+            axes[0].set_ylabel("Training episode return")
         fig.legend(
             handles=[
                 Line2D(
@@ -566,13 +582,23 @@ def render_figure(curve_rows: list[dict], selections: dict, output: Path) -> Non
             ncol=2,
             frameon=False,
         )
-        fig.subplots_adjust(
-            left=0.085,
-            right=0.985,
-            bottom=0.15,
-            top=0.79 if len(tasks) == 3 else 0.82,
-            wspace=0.29 if len(tasks) == 3 else 0.21,
-        )
+        if len(tasks) == 4:
+            fig.subplots_adjust(
+                left=0.11,
+                right=0.985,
+                bottom=0.11,
+                top=0.84,
+                wspace=0.32,
+                hspace=0.54,
+            )
+        else:
+            fig.subplots_adjust(
+                left=0.085,
+                right=0.985,
+                bottom=0.15,
+                top=0.79 if len(tasks) == 3 else 0.82,
+                wspace=0.29 if len(tasks) == 3 else 0.21,
+            )
         output.parent.mkdir(parents=True, exist_ok=True)
         for suffix in ("png", "pdf", "svg"):
             fig.savefig(output.with_suffix(f".{suffix}"), dpi=350)
@@ -583,6 +609,8 @@ def report(args) -> Path:
     roots = dict(zip(TASKS, (args.root_10m, args.root_3s5z)))
     if getattr(args, "root_6s9z", None) is not None:
         roots[THIRD_TASK] = args.root_6s9z
+    if getattr(args, "root_smacv2", None) is not None:
+        roots[FOURTH_TASK] = args.root_smacv2
     tasks = tuple(roots)
     selections = {
         task: select_runs(root.resolve(), task) for task, root in roots.items()
@@ -634,6 +662,7 @@ def report(args) -> Path:
             "claim": "Task-specific selected actor score recovery versus each task's isolated baseline",
             "five_second_takeaway": "Compare each blue return curve with the gray baseline in the same task panel",
             "publication_width_mm": 178,
+            "layout": "2x2 small multiples for four tasks; one row for two or three tasks",
             "audience": "multi-agent reinforcement learning researchers",
             "visual_anchor": "task-specific isolated MAPPO baseline",
             "semantic_encoding": {
@@ -681,7 +710,7 @@ def report(args) -> Path:
     figure = output / "smax-arec-selected-return-curves"
     render_figure(curves, selections, figure)
     caption = (
-        "SMAX training episode return for the isolated NPS MAPPO baseline and "
+        "SMAX and SMACv2 training episode return for the isolated NPS MAPPO baseline and "
         "the task-specific actor-side score-recovery setting selected by paired "
         "return AUC on four training seeds. Lines are seed means; bands are "
         "pointwise 95% exact seed-bootstrap intervals. Each task is "
@@ -701,6 +730,7 @@ def main() -> None:
     parser.add_argument("--root-10m", type=Path, required=True)
     parser.add_argument("--root-3s5z", type=Path, required=True)
     parser.add_argument("--root-6s9z", type=Path)
+    parser.add_argument("--root-smacv2", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--evaluate-missing", action="store_true")
     parser.add_argument("--eval-episodes", type=int, default=256)

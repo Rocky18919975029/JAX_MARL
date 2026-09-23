@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.report_smax_arec_best_returns import (
+    FOURTH_TASK,
     TASKS,
     THIRD_TASK,
     bootstrap_indices,
@@ -222,17 +223,23 @@ def test_selection_requires_all_four_seeds_and_final_checkpoint(tmp_path):
         last_five_checkpoints(tmp_path, run, 10_000_000)
 
 
-def test_three_task_report_adds_6s9z_without_pooling(tmp_path):
+@pytest.mark.parametrize("include_smacv2", [False, True])
+def test_multitask_report_keeps_task_rows_separate(tmp_path, include_smacv2):
     pytest.importorskip("matplotlib")
-    tasks = (*TASKS, THIRD_TASK)
-    budgets = {TASKS[0]: 10_000_000, TASKS[1]: 20_000_000, THIRD_TASK: 20_000_000}
+    tasks = (*TASKS, THIRD_TASK, *((FOURTH_TASK,) if include_smacv2 else ()))
+    budgets = {
+        TASKS[0]: 10_000_000,
+        TASKS[1]: 20_000_000,
+        THIRD_TASK: 20_000_000,
+        FOURTH_TASK: 10_000_000,
+    }
     roots = {task: tmp_path / f"sweep-{task}" for task in tasks}
     output = tmp_path / "report"
     for task in tasks:
         make_sweep(roots[task], task, budgets[task])
     selections = {task: select_runs(roots[task], task) for task in tasks}
     jobs, steps = make_eval_jobs(selections, output)
-    assert len(jobs) == 3 * 2 * 4 * 5
+    assert len(jobs) == len(tasks) * 2 * 4 * 5
     assert {key[0] for key in steps} == set(tasks)
     for job in jobs:
         write_json(
@@ -254,6 +261,7 @@ def test_three_task_report_adds_6s9z_without_pooling(tmp_path):
             root_10m=roots[TASKS[0]],
             root_3s5z=roots[TASKS[1]],
             root_6s9z=roots[THIRD_TASK],
+            root_smacv2=roots.get(FOURTH_TASK),
             output_root=output,
             evaluate_missing=False,
             eval_episodes=256,
@@ -275,8 +283,14 @@ def test_three_task_report_adds_6s9z_without_pooling(tmp_path):
         assert (output / task / "return_curve.csv").is_file()
     with (output / "summary_all_tasks.csv").open(newline="", encoding="utf-8") as file:
         summary = list(csv.DictReader(file))
-    assert len(summary) == 6
+    assert len(summary) == 2 * len(tasks)
     assert {row["task"] for row in summary} == set(tasks)
+    if include_smacv2:
+        smacv2_rows = [row for row in summary if row["task"] == FOURTH_TASK]
+        assert len(smacv2_rows) == 2
+        assert all(row["return_auc_mean"] for row in smacv2_rows)
+        assert all(row["final_eval_return_last5_ckpt_mean"] for row in smacv2_rows)
+        assert "SMACv2" in figure.with_suffix(".svg").read_text(encoding="utf-8")
     manifest = json.loads((output / "report_manifest.json").read_text())
     assert set(manifest["selection"]) == set(tasks)
     assert manifest["tasks_are_never_pooled"] is True
