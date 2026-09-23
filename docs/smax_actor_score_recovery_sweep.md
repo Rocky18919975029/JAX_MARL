@@ -87,6 +87,43 @@ For confirmation, run the same launcher in a new root for each map with
 Omit `--budget-fraction` so the full 10M/20M map budget is used. Separate
 roots are necessary if the two maps select different hyperparameters.
 
+The confirmation wrapper performs this selection and launch automatically.
+It recomputes `selection.json` from the completed pilot, checks that seeds
+1–4 were not used for tuning, freezes a `confirmation_plan.json`, and runs
+the two task-specific eight-run matrices **sequentially** so they do not
+compete for the same GPUs. Each task has its own isolated runs, checkpoints,
+metrics, and launcher log. It refuses a task whose best pilot setting does
+not beat its paired isolated win-rate AUC unless explicitly overridden.
+
+```bash
+export AREC_CONFIRM_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_confirm_4seed_v1
+mkdir -p "$AREC_CONFIRM_ROOT"
+
+python scripts/run_smax_actor_score_recovery_confirmation.py \
+  --sweep-root "$AREC_SWEEP_ROOT" \
+  --run-root "$AREC_CONFIRM_ROOT" \
+  --seeds 1-4 \
+  --gpus 0,1,2,3 \
+  --max-runs-per-gpu 1 \
+  --dry-run
+
+nohup python scripts/run_smax_actor_score_recovery_confirmation.py \
+  --sweep-root "$AREC_SWEEP_ROOT" \
+  --run-root "$AREC_CONFIRM_ROOT" \
+  --seeds 1-4 \
+  --gpus 0,1,2,3 \
+  --max-runs-per-gpu 1 \
+  --project jaxmarl-smax-actor-score-recovery \
+  > "$AREC_CONFIRM_ROOT/launcher.stdout" 2>&1 &
+```
+
+Monitor the active task with
+`python scripts/monitor_smax_actor_score_recovery_sweep.py --run-root "$AREC_CONFIRM_ROOT/10m_vs_11m"`;
+after it completes, use the same command with `3s5z_vs_3s6z`. Expect
+`COMPLETED=8 FAILED=0` for each task. The selection is based on **pilot
+training** win-rate AUC, not final performance or held-out evaluation; the
+four new seeds provide the confirmatory comparison.
+
 To backfill only the full-budget isolated runs for an already-running
 single-coefficient formal matrix, use a **different root** and
 `--conditions none --seeds 1-4`; this does not touch the active actor-side
