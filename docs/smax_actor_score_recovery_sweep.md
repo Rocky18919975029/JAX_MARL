@@ -207,3 +207,31 @@ driven by one seed is not a robust win. If these four seeds are used to choose
 another hyperparameter setting, they become **tuning seeds**. Any subsequent
 unbiased confirmation requires new, unused seeds (for example 5–8); do not
 reuse seeds 1–4 to claim an independent confirmation.
+
+## One-shot plot while a sweep is still running
+
+The completed-run plot above deliberately rejects unfinished runs. For an
+in-progress matrix, take a fresh snapshot whenever desired (no background
+plotting process is needed):
+
+```bash
+AREC_DETAIL_ROOT="/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_10m_detail_4seed_v1"
+python scripts/plot_smax_actor_score_recovery_live.py --run-root "$AREC_DETAIL_ROOT"
+```
+
+The command overwrites PNG/PDF/SVG, plotted-data CSV, coverage CSV, and
+metadata JSON under `$AREC_DETAIL_ROOT/analysis/live/10m_vs_11m/`. The PNG is
+`smax-arec-sweep-live-win-rate.png`. Run the command again later to refresh
+from the latest locally logged metrics. The figure has separate q-step panels,
+each with the isolated baseline and the five coefficient curves. If a sweep
+root contains multiple tasks, it writes a separate figure for each task.
+
+For each curve, the script uses running/completed seeds with at least two
+finite logged updates, intersecting their **exact** `env_step` grids. It
+resamples whole training seeds for a pointwise percentile 95% bootstrap band;
+one-seed curves have no band. Missing, pending, or failed runs are never
+silently counted as zero. The per-curve CSV records the actual seed IDs and
+`n_seeds`, because different in-progress curves can have different cohort
+sizes and horizons. These are exploratory live snapshots, not a matched
+four-seed comparison until all four seeds finish. There is no smoothing,
+interpolation, or cross-task averaging.
