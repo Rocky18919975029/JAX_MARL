@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ from scripts.report_smax_arec_best_returns import (
     PROTOCOL,
     discover_roots,
     make_eval_jobs,
+    report_training_curves,
     select_runs,
 )
 
@@ -25,7 +27,8 @@ def _record(root: Path, run: dict, reward: float) -> None:
     path = root / "metrics" / f"{name}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps({"env_step": step, "returns": reward})
-                              for step in (10, 20)) + "\n", encoding="utf-8")
+                              for step in (2, 6, 10, 14, 18, 20)) + "\n",
+                    encoding="utf-8")
 
 
 def _arec_root(root: Path, task: str, with_none: bool = True) -> None:
@@ -91,6 +94,15 @@ def test_external_tuned_baseline_replaces_old_none(tmp_path: Path) -> None:
                if job.condition == "none")
     assert all(arec in job.checkpoint.parents for job in jobs
                if job.condition == "actor_score_recovery")
+    figure = report_training_curves(
+        {task: selected}, tmp_path / "training-only",
+        SimpleNamespace(bootstrap_samples=100, bootstrap_seed=123),
+    )
+    assert figure.is_file()
+    assert (tmp_path / "training-only" / "training_summary_all_tasks.csv").is_file()
+    report = json.loads((tmp_path / "training-only" /
+                         "training_report_manifest.json").read_text())
+    assert "not held-out" in report["final_metric"]
 
 
 def test_arec_only_sweep_uses_other_root_none(tmp_path: Path) -> None:

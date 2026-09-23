@@ -720,6 +720,123 @@ def render_figure(curve_rows: list[dict], selections: dict, output: Path) -> Non
         plt.close(fig)
 
 
+def report_training_curves(selections: dict, output: Path, args) -> Path:
+    """Plot complete training histories without implying unavailable checkpoint evals."""
+    summary_rows, seed_rows, curve_rows = [], [], []
+    for task, selected in selections.items():
+        seeds, budget = selected["seeds"], selected["budget"]
+        indices = bootstrap_indices(len(seeds), args.bootstrap_samples,
+                                    args.bootstrap_seed)
+        per_condition = {}
+        for condition, group in (("none", selected["baseline"]),
+                                 ("actor_score_recovery", selected["best"])):
+            histories = [selected["histories"][group[seed]["run_name"]]
+                         for seed in seeds]
+            if any(len(rows) < 5 for rows in histories):
+                raise RuntimeError(f"Need five logged training returns: {task}/{condition}")
+            common_steps = sorted(set.intersection(*(
+                {row["env_step"] for row in rows} for rows in histories
+            )))
+            if len(common_steps) < 2:
+                raise RuntimeError(f"No common training-return steps: {task}/{condition}")
+            matrix = np.asarray([
+                [next(row["returns"] for row in rows if row["env_step"] == step)
+                 for step in common_steps] for rows in histories
+            ], dtype=np.float64)
+            if not np.isfinite(matrix).all():
+                raise RuntimeError(f"Non-finite returns: {task}/{condition}")
+            bootstrap = matrix[indices].mean(axis=1)
+            low, high = np.quantile(bootstrap, (0.025, 0.975), axis=0)
+            for index, step in enumerate(common_steps):
+                curve_rows.append({
+                    "task": task, "condition": condition, "env_step": step,
+                    "mean_training_return": float(matrix[:, index].mean()),
+                    "ci95_low": float(low[index]), "ci95_high": float(high[index]),
+                    "n_seeds": len(seeds),
+                })
+            auc = np.asarray([selected["aucs"][group[seed]["run_name"]]
+                              for seed in seeds])
+            final_logged = np.asarray([
+                statistics.mean(row["returns"] for row in rows[-5:])
+                for rows in histories
+            ])
+            per_condition[condition] = {"return_auc": auc,
+                                        "final_five_logged_training_returns": final_logged}
+            for index, seed in enumerate(seeds):
+                seed_rows.append({
+                    "task": task, "condition": condition, "seed": seed,
+                    "run_name": group[seed]["run_name"],
+                    "source_root": str(selected["baseline_root"] if condition == "none"
+                                       else selected["root"]),
+                    "budget_env_steps": budget,
+                    **table_parameters(group[seed]),
+                    "return_auc": float(auc[index]),
+                    "final_five_logged_training_returns": float(final_logged[index]),
+                })
+        for condition, group in (("none", selected["baseline"]),
+                                 ("actor_score_recovery", selected["best"])):
+            row = {"task": task, "condition": condition, "n_seeds": len(seeds),
+                   "budget_env_steps": budget,
+                   "source_root": str(selected["baseline_root"] if condition == "none"
+                                      else selected["root"]),
+                   **table_parameters(group[seeds[0]])}
+            for metric in ("return_auc", "final_five_logged_training_returns"):
+                values = per_condition[condition][metric]
+                mean, low, high = bootstrap_mean(values, indices)
+                delta = values - per_condition["none"][metric]
+                delta_mean, delta_low, delta_high = bootstrap_mean(delta, indices)
+                row.update({f"{metric}_mean": mean, f"{metric}_ci95_low": low,
+                            f"{metric}_ci95_high": high,
+                            f"delta_{metric}_vs_none_mean": delta_mean,
+                            f"delta_{metric}_vs_none_ci95_low": delta_low,
+                            f"delta_{metric}_vs_none_ci95_high": delta_high})
+            summary_rows.append(row)
+    output.mkdir(parents=True, exist_ok=True)
+    for task in selections:
+        task_root = output / task
+        write_csv(task_root / "training_summary.csv",
+                  [row for row in summary_rows if row["task"] == task])
+        write_csv(task_root / "training_seed_level.csv",
+                  [row for row in seed_rows if row["task"] == task])
+        write_csv(task_root / "return_curve.csv",
+                  [row for row in curve_rows if row["task"] == task])
+    write_csv(output / "training_summary_all_tasks.csv", summary_rows)
+    manifest = {
+        "schema_version": 1,
+        "mode": "training_curves_only",
+        "source_roots": {task: {
+            "none": str(selected["baseline_root"]),
+            "actor_score_recovery": str(selected["root"]),
+        } for task, selected in selections.items()},
+        "selected_hyperparameters": {task: {
+            "none": selected["baseline_params"],
+            "actor_score_recovery": selected["best_params"],
+        } for task, selected in selections.items()},
+        "curve_metric": "training episode return; no smoothing",
+        "auc_definition": "trapezoidal training return integral / task budget",
+        "final_metric": "mean of last five logged training-return observations; not held-out checkpoint evaluation",
+        "uncertainty": "pointwise exact 95% seed-bootstrap CI over four paired seeds",
+        "selection_warning": "Hyperparameters selected on the same four seeds used for this figure; exploratory.",
+    }
+    (output / "training_report_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    figure = output / "smax-arec-selected-return-curves"
+    render_figure(curve_rows, selections, figure)
+    (output / "figure_caption.txt").write_text(
+        "Training episode return for four tasks. Solid blue: selected actor-side "
+        "score recovery; dashed gray: task-specific isolated baseline. Lines are "
+        "means across four seeds and bands are pointwise exact seed-bootstrap "
+        "95% intervals. The accompanying table reports training return AUC and "
+        "mean of the last five logged training returns, not held-out checkpoint "
+        "evaluation. Hyperparameters were selected on these same seeds; the 6s9z "
+        "baseline was separately PPO-tuned.\n", encoding="utf-8"
+    )
+    print(figure.with_suffix(".png"), flush=True)
+    print(output / "training_summary_all_tasks.csv", flush=True)
+    return figure.with_suffix(".png")
+
+
 def discover_roots(matrix_root: Path) -> tuple[Path, Path, Path]:
     """Find the latest complete four-seed sweeps without silently using a partial root."""
     candidates: dict[str, list[tuple[float, Path]]] = defaultdict(list)
@@ -798,6 +915,8 @@ def report(args) -> Path:
         ) for task, root in roots.items()
     }
     output = args.output_root.expanduser().resolve()
+    if args.curves_only:
+        return report_training_curves(selections, output, args)
     jobs, checkpoint_steps = make_eval_jobs(selections, output)
     for task, selected in selections.items():
         print(
@@ -928,6 +1047,8 @@ def main() -> None:
     parser.add_argument("--matrix-root", type=Path,
                         help="Discover latest completed 6s9z baseline and 10-units ARec sweeps")
     parser.add_argument("--discover-only", action="store_true")
+    parser.add_argument("--curves-only", action="store_true",
+                        help="Use training metrics only; no checkpoint evaluations")
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--reuse-evaluation-root", type=Path,
                         help="Reuse only checkpoint-identity-verified old evaluations")

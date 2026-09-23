@@ -39,3 +39,11 @@ curve and its pointwise 95% bootstrap band use training returns and bootstrap
 entire seeds. A tuned 6s9z isolated PPO baseline may have a different learning
 rate or epoch count from the ARec runs; that panel is a tuned-method comparison,
 not an auxiliary-loss-only ablation.
+
+If a new sweep did not save five distinct checkpoints, the full held-out
+final-five report correctly refuses to run. For the requested four-panel
+training curves, use `--curves-only`: it needs no checkpoints and writes the
+figure plus `training_summary_all_tasks.csv`. That table's final metric is
+explicitly **the last five logged training returns**, not held-out checkpoint
+performance. The mode never fabricates or silently substitutes checkpoint
+evaluations.
