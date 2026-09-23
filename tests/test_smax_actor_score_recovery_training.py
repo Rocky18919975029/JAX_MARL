@@ -1,62 +1,51 @@
 """Actor-side score-recovery protocol and gradient-routing checks."""
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from scripts.run_smax_actor_score_recovery_training import (
-    DEFAULT_BUDGETS,
-    Run,
-    command,
-)
-from scripts.smax_score_recoverability import canonical_condition
+from scripts.smax_four_method import make_grid, train_command
 
 
-def test_launcher_keeps_alignment_and_critic_recovery_off(tmp_path):
+def test_arec_command_only_enables_actor_recovery(tmp_path):
     args = SimpleNamespace(
-        fisher_ridge=1e-3,
-        q_learning_rate=1e-3,
-        q_steps=8,
-        update_epochs=4,
-        learning_rate=0.002,
-        num_envs=128,
-        num_minibatches=4,
+        map_name="3s5z_vs_3s6z",
+        methods=("none", "arec"),
+        seed_start=1,
+        seed_count=2,
+        total_timesteps=20_000_000,
+        num_steps=128,
+        ppo_lrs=(0.002,),
+        ppo_epochs=(4,),
+        num_envs_grid=(128,),
+        num_minibatches_grid=(4,),
+        mse_coefs=(0.1,),
+        cka_coefs=(0.3,),
+        arec_coefs=(0.001,),
+        arec_q_steps=(8,),
+        arec_q_lrs=(1e-3,),
+        arec_fisher_ridges=(1e-3,),
         checkpoint_interval=1_000_000,
         wandb_mode="disabled",
         project="test",
     )
-    run = Run("3s5z_vs_3s6z", 2, 20_000_000, 0.001)
-    parts = command(Path("/repo"), tmp_path, args, run)
+    runs = make_grid(args)
+    assert len(runs) == 4
+    run = next(run for run in runs if run.method == "arec" and run.seed == 2)
+    parts = train_command(tmp_path, args, run)
     for override in (
         "ACTOR_PARAMETER_SHARING=false",
         "MATCHED_COMPARISON=true",
         "ALIGN_MODE=none",
         "ALIGNMENT_COEF=0",
-        "SCORE_RECOVERY=false",
-        "SCORE_RECOVERY_COEF=0",
         "ACTOR_SCORE_RECOVERY=true",
         "ACTOR_SCORE_RECOVERY_COEF=0.001",
         "ACTOR_SCORE_RECOVERY_Q_STEPS=8",
-        "EXPERIMENT_CONDITION=actor_score_recovery",
-        "TOTAL_TIMESTEPS=20000000",
+        "EXPERIMENT_CONDITION=arec",
     ):
         assert override in parts
-    assert "lam0p001-seed2" in run.name
-    assert DEFAULT_BUDGETS["10m_vs_11m"] == 10_000_000
-    assert DEFAULT_BUDGETS["3s5z_vs_3s6z"] == 20_000_000
-    assert DEFAULT_BUDGETS["6s9z_vs_6s10z"] == 20_000_000
-    assert DEFAULT_BUDGETS["smacv2_10_units"] == 10_000_000
-
-
-def test_offline_measurement_can_identify_actor_intervention():
-    assert (
-        canonical_condition(
-            {"condition": "actor_score_recovery", "align_distance": "ln_mse"}
-        )
-        == "actor_score_recovery"
-    )
+    assert run.timesteps == 19_988_480
 
 
 def test_fisher_matrix_and_rollout_target_are_stop_gradient():
