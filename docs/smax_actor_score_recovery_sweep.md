@@ -326,3 +326,33 @@ rows; it contains no cross-task average. `report_manifest.json` records
 selection, evaluation, AUC, and bootstrap definitions. Because the same four
 training seeds choose the 10m setting and appear in the report, this figure
 is an exploratory selected-sweep comparison, not independent confirmation.
+
+### Add the completed 6s9z sweep to the same report
+
+Pass `--root-6s9z` to expand the preceding figure from two panels to three.
+Keep the same report directory: any existing checkpoint evaluations are
+validated and reused. If the prior two-task report finished, only the 40
+selected `6s9z_vs_6s10z` checkpoint policies need fresh evaluation. Its best
+ARec cell is selected by that task's
+own four-seed paired **training return AUC gain** versus its own `none` runs.
+The combined CSV contains six task-condition rows; it does not average tasks.
+
+```bash
+cd ~/JaxMARL
+git pull --ff-only
+conda activate jaxmarl
+unset LD_LIBRARY_PATH
+export AREC_DETAIL_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_10m_detail_4seed_v1
+export AREC_CONFIRM_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_confirm_4seed_v1
+export AREC_6S9Z_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/arec_6s9z_vs_6s10z_grid4seed_v1
+export AREC_BEST_REPORT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_best_return_report_v1
+mkdir -p "$AREC_BEST_REPORT"
+nohup python scripts/report_smax_arec_best_returns.py --root-10m "$AREC_DETAIL_ROOT" --root-3s5z "$AREC_CONFIRM_ROOT/3s5z_vs_3s6z" --root-6s9z "$AREC_6S9Z_ROOT" --output-root "$AREC_BEST_REPORT" --evaluate-missing --eval-episodes 256 --gpus 0,1,2,3 --max-runs-per-gpu 2 > "$AREC_BEST_REPORT/report-3task.stdout" 2>&1 &
+```
+
+The figure remains `smax-arec-selected-return-curves.{png,pdf,svg}`. The new
+task has `6s9z_vs_6s10z/{summary.csv,seed_level.csv,return_curve.csv}` under
+the same report directory. `summary_all_tasks.csv` now has three separate
+task-specific baseline/ARec pairs. Selection and reporting use the same four
+training seeds, so these are exploratory estimates, not an independent
+confirmation.

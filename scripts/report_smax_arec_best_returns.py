@@ -4,7 +4,8 @@
 Selection uses mean seed-paired *training return AUC* within each task. The
 learning curves also use training returns; final performance instead evaluates
 the last five distinct saved checkpoints on held-out episodes. These two data
-sources are deliberately labelled separately in the output table.
+sources are deliberately labelled separately in the output table. All task
+selection and aggregation remain task-specific, even in a combined figure.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ except ModuleNotFoundError:  # Direct execution from scripts/.
 
 
 TASKS = ("10m_vs_11m", "3s5z_vs_3s6z")
+THIRD_TASK = "6s9z_vs_6s10z"
 REPO = Path(__file__).resolve().parents[1]
 BASELINE_COLOR = "#343A40"
 RECOVERY_COLOR = "#0072B2"
@@ -200,7 +202,7 @@ def last_five_checkpoints(root: Path, run: dict, budget: int) -> list[tuple[int,
 def make_eval_jobs(selections: dict, output_root: Path) -> tuple[list[EvalJob], dict]:
     jobs = []
     checkpoint_steps = {}
-    for task in TASKS:
+    for task in selections:
         selected = selections[task]
         for seed in selected["seeds"]:
             for condition, group in (
@@ -371,7 +373,7 @@ def build_rows(
         for job in jobs
     }
     summary_rows, seed_rows, curve_rows = [], [], []
-    for task in TASKS:
+    for task in selections:
         selected = selections[task]
         seeds, budget = selected["seeds"], selected["budget"]
         indices = bootstrap_indices(len(seeds), bootstrap_samples, bootstrap_seed)
@@ -494,6 +496,7 @@ def render_figure(curve_rows: list[dict], selections: dict, output: Path) -> Non
     from matplotlib.lines import Line2D
     from matplotlib.ticker import MaxNLocator
 
+    tasks = tuple(selections)
     with plt.rc_context(
         {
             "font.family": "sans-serif",
@@ -508,8 +511,8 @@ def render_figure(curve_rows: list[dict], selections: dict, output: Path) -> Non
             "pdf.fonttype": 42,
         }
     ):
-        fig, axes = plt.subplots(1, 2, figsize=(178 / 25.4, 94 / 25.4))
-        for ax, task in zip(axes, TASKS):
+        fig, axes = plt.subplots(1, len(tasks), figsize=(178 / 25.4, 94 / 25.4))
+        for ax, task in zip(axes, tasks):
             for condition, color, linestyle in (
                 ("none", BASELINE_COLOR, (0, (5, 2))),
                 ("actor_score_recovery", RECOVERY_COLOR, "-"),
@@ -528,7 +531,10 @@ def render_figure(curve_rows: list[dict], selections: dict, output: Path) -> Non
                 high = np.asarray([row["ci95_high"] for row in rows])
                 ax.fill_between(x, low, high, color=color, alpha=0.14, linewidth=0)
                 ax.plot(x, y, color=color, linestyle=linestyle, linewidth=1.35)
-            ax.set_title("SMAX — " + task.replace("_vs_", " vs ").replace("_", " "))
+            task_label = task.replace("_vs_", " vs ").replace("_", " ")
+            ax.set_title(
+                "SMAX\n" + task_label if len(tasks) == 3 else "SMAX — " + task_label
+            )
             ax.set_xlabel("Environment steps (millions)")
             ax.set_xlim(0, selections[task]["budget"] / 1e6)
             ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
@@ -560,7 +566,13 @@ def render_figure(curve_rows: list[dict], selections: dict, output: Path) -> Non
             ncol=2,
             frameon=False,
         )
-        fig.subplots_adjust(left=0.09, right=0.985, bottom=0.15, top=0.82, wspace=0.21)
+        fig.subplots_adjust(
+            left=0.085,
+            right=0.985,
+            bottom=0.15,
+            top=0.79 if len(tasks) == 3 else 0.82,
+            wspace=0.29 if len(tasks) == 3 else 0.21,
+        )
         output.parent.mkdir(parents=True, exist_ok=True)
         for suffix in ("png", "pdf", "svg"):
             fig.savefig(output.with_suffix(f".{suffix}"), dpi=350)
@@ -569,6 +581,9 @@ def render_figure(curve_rows: list[dict], selections: dict, output: Path) -> Non
 
 def report(args) -> Path:
     roots = dict(zip(TASKS, (args.root_10m, args.root_3s5z)))
+    if getattr(args, "root_6s9z", None) is not None:
+        roots[THIRD_TASK] = args.root_6s9z
+    tasks = tuple(roots)
     selections = {
         task: select_runs(root.resolve(), task) for task, root in roots.items()
     }
@@ -600,7 +615,7 @@ def report(args) -> Path:
         bootstrap_samples=args.bootstrap_samples,
         bootstrap_seed=args.bootstrap_seed,
     )
-    for task in TASKS:
+    for task in tasks:
         task_out = output / task
         write_csv(
             task_out / "summary.csv", [row for row in summary if row["task"] == task]
@@ -616,7 +631,7 @@ def report(args) -> Path:
     manifest = {
         "schema_version": 1,
         "figure_contract": {
-            "claim": "Selected actor score recovery versus its own isolated baseline on two SMAX tasks",
+            "claim": "Task-specific selected actor score recovery versus each task's isolated baseline",
             "five_second_takeaway": "Compare each blue return curve with the gray baseline in the same task panel",
             "publication_width_mm": 178,
             "audience": "multi-agent reinforcement learning researchers",
@@ -630,7 +645,7 @@ def report(args) -> Path:
             "editable_source": "scripts/report_smax_arec_best_returns.py",
             "exports": ["svg", "pdf", "png"],
         },
-        "source_roots": {task: str(roots[task].resolve()) for task in TASKS},
+        "source_roots": {task: str(roots[task].resolve()) for task in tasks},
         "tasks_are_never_pooled": True,
         "selection": {
             task: {
@@ -644,7 +659,7 @@ def report(args) -> Path:
                 "paired_return_auc_gain": selections[task]["paired_return_auc_gain"],
                 "seeds": selections[task]["seeds"],
             }
-            for task in TASKS
+            for task in tasks
         },
         "curve_source": "local training metrics JSONL; exact shared env_step grid; no smoothing",
         "auc_definition": "trapezoidal training return integral divided by task budget",
@@ -669,7 +684,7 @@ def report(args) -> Path:
         "SMAX training episode return for the isolated NPS MAPPO baseline and "
         "the task-specific actor-side score-recovery setting selected by paired "
         "return AUC on four training seeds. Lines are seed means; bands are "
-        "pointwise 95% exact seed-bootstrap intervals. The two tasks are "
+        "pointwise 95% exact seed-bootstrap intervals. Each task is "
         "analyzed separately. The table reports training return AUC and "
         "held-out return averaged over the last five distinct saved checkpoints "
         "per seed. Hyperparameters were selected on these same seeds, so the "
@@ -685,6 +700,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root-10m", type=Path, required=True)
     parser.add_argument("--root-3s5z", type=Path, required=True)
+    parser.add_argument("--root-6s9z", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--evaluate-missing", action="store_true")
     parser.add_argument("--eval-episodes", type=int, default=256)
