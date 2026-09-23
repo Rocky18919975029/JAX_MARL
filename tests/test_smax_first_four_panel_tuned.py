@@ -32,7 +32,7 @@ def test_yaml_pairs_generate_exact_best_cells(task: str, tmp_path: Path) -> None
     args = SimpleNamespace(
         task=task, run_root=tmp_path / "fresh", gpus=("0", "1"),
         max_runs_per_gpu=2, project="test", wandb_mode="disabled",
-        dry_run=True,
+        dry_run=True, seed_start=1, seed_count=4,
     )
     launch = launch_args(args, none, arec, paths, None)
     runs = make_grid(launch)
@@ -48,6 +48,21 @@ def test_yaml_pairs_generate_exact_best_cells(task: str, tmp_path: Path) -> None
     assert "ACTOR_SCORE_RECOVERY=false" in commands["none"]
     assert "ACTOR_SCORE_RECOVERY=true" in commands["arec"]
     assert f"ACTOR_SCORE_RECOVERY_Q_STEPS={q_steps}" in commands["arec"]
+
+
+@pytest.mark.parametrize("task", TASKS)
+def test_six_seed_extension_uses_same_frozen_cell(task: str, tmp_path: Path) -> None:
+    none, arec, paths = load_pair(task)
+    args = SimpleNamespace(
+        task=task, run_root=tmp_path / "extension_6seed", gpus=("0", "1"),
+        max_runs_per_gpu=2, project="test", wandb_mode="disabled",
+        dry_run=True, seed_start=5, seed_count=6,
+    )
+    runs = make_grid(launch_args(args, none, arec, paths, None))
+    assert len(runs) == 12
+    assert {run.seed for run in runs} == set(range(5, 11))
+    assert all({run.method for run in runs if run.seed == seed} == {"none", "arec"}
+               for seed in range(5, 11))
 
 
 def test_historical_report_and_checkpoint_verification(tmp_path: Path) -> None:

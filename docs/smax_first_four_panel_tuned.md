@@ -52,3 +52,56 @@ manifest so discrepancies are auditable. `EXPERIMENT_CONDITION` was renamed
 from historical `actor_score_recovery` to current `arec`; the verification
 explicitly accounts for this metadata-only rename. For a strict old-code
 replay, the historical commit and dependency environment must also be used.
+
+## Collect the selected four seeds and extend to ten
+
+The original four-panel report selected one `none` and one ARec cell per task
+from four *different* sweep roots. Those roots contain many unselected runs.
+Do **not** move those roots: the report, checkpoint provenance, and other
+analyses use their original paths. Instead,
+`scripts/organize_smax_first_four_panel.py` builds a symlink-only view of the
+eight selected historical runs per task. It never deletes, copies, or rewrites
+their artifacts. The new six-seed training outputs are written inside the
+same collection parent, under `<task>/extension_6seed`. Its `refresh` phase
+adds completed extension runs to the same per-method/seed view.
+
+On the server, from the clean repository checkout with the `jaxmarl` Conda
+environment active, run:
+
+```bash
+export MATRIX_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs
+export COLLECTION_ROOT="$MATRIX_ROOT/first_four_panel_selected_10seed_v1"
+python scripts/organize_smax_first_four_panel.py --matrix-root "$MATRIX_ROOT" --collection-root "$COLLECTION_ROOT" --phase prepare
+python scripts/organize_smax_first_four_panel.py --matrix-root "$MATRIX_ROOT" --collection-root "$COLLECTION_ROOT" --phase prepare --apply
+```
+
+Then extend *each* task using the same frozen YAML cell and six new paired
+seeds. The wrapper's `--seed-start 5 --seed-count 6` produces precisely 12
+runs per task, and its historical validation still checks the first four:
+
+```bash
+python scripts/run_smax_first_four_panel_tuned.py --task 10m_vs_11m --seed-start 5 --seed-count 6 --run-root "$COLLECTION_ROOT/10m_vs_11m/extension_6seed" --historical-matrix-root "$MATRIX_ROOT" --gpus 0,1,2,3 --max-runs-per-gpu 2 --dry-run
+```
+
+Remove `--dry-run` for the actual launch. Repeat for `3s5z_vs_3s6z`,
+`6s9z_vs_6s10z`, and `smacv2_10_units`, changing both `--task` and the
+task component of `--run-root`. Run task launchers sequentially if the cap
+must remain two runs per GPU across all tasks; launching four independent
+task launchers simultaneously would multiply that cap.
+
+After training, assemble and audit the ten-seed view:
+
+```bash
+python scripts/organize_smax_first_four_panel.py --matrix-root "$MATRIX_ROOT" --collection-root "$COLLECTION_ROOT" --phase refresh --require-complete --apply
+```
+
+The final layout is `COLLECTION_ROOT/<task>/runs/<none|arec>/seed_01` through
+`seed_10`. Each seed directory links its source manifest, status, metrics,
+checkpoints, and training log when available. `collection_index.json` records
+the exact original source paths and the six-seed extension provenance.
+
+The original four seeds came from historical training code. Seeds 5–10 use
+the current cleaned four-method code with matched *effective configurations*,
+not the exact historical commit. Keep `origin` and Git commit in analyses;
+the pooled ten-seed result is not a bitwise homogeneous reproduction unless
+the original four are also rerun with the current implementation.

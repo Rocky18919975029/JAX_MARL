@@ -205,7 +205,8 @@ def launch_args(args: argparse.Namespace, none: dict, arec: dict,
     a = arec["config"]
     return SimpleNamespace(
         map_name=args.task, methods=("none", "arec"),
-        seed_start=1, seed_count=4, total_timesteps=int(c["TOTAL_TIMESTEPS"]),
+        seed_start=args.seed_start, seed_count=args.seed_count,
+        total_timesteps=int(c["TOTAL_TIMESTEPS"]),
         num_steps=int(c["NUM_STEPS"]), ppo_lrs=(float(c["LR"]),),
         ppo_epochs=(int(c["UPDATE_EPOCHS"]),),
         num_envs_grid=(int(c["NUM_ENVS"]),),
@@ -230,6 +231,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", choices=TASKS, required=True)
     parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--seed-start", type=int, default=1,
+                        help="First training seed (5 when extending the original four)")
+    parser.add_argument("--seed-count", type=int, default=4,
+                        help="Number of consecutive training seeds (6 for seeds 5-10)")
     parser.add_argument("--config-dir", type=Path, default=CONFIG_DIR)
     parser.add_argument("--historical-matrix-root", type=Path,
                         help="Root containing first-four-panel report and original sweeps")
@@ -242,6 +247,8 @@ def main() -> None:
                         default="online")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.seed_start < 1 or args.seed_count < 1:
+        parser.error("--seed-start and --seed-count must be positive")
     none, arec, paths = load_pair(args.task, args.config_dir)
     if args.skip_historical_validation:
         provenance = None
@@ -253,9 +260,14 @@ def main() -> None:
                                        args.historical_matrix_root.expanduser().resolve())
     launch = launch_args(args, none, arec, paths, provenance)
     runs = control.make_grid(launch)
-    if len(runs) != 8 or {run.method for run in runs} != {"none", "arec"}:
-        raise RuntimeError("Expected exactly four paired seeds per method")
-    print(f"task={args.task} methods=none,arec seeds=1-4 "
+    if (len(runs) != 2 * args.seed_count
+            or {run.method for run in runs} != {"none", "arec"}
+            or {run.seed for run in runs}
+            != set(range(args.seed_start, args.seed_start + args.seed_count))):
+        raise RuntimeError("Expected one matched none/ARec pair for every requested seed")
+    last_seed = args.seed_start + args.seed_count - 1
+    print(f"task={args.task} methods=none,arec "
+          f"seeds={args.seed_start}-{last_seed} "
           f"nominal_budget={none['config']['TOTAL_TIMESTEPS']:,} "
           f"effective_budget={runs[0].timesteps:,} "
           f"lambda={arec['config']['ACTOR_SCORE_RECOVERY_COEF']} "
