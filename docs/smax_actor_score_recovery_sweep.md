@@ -286,3 +286,43 @@ silently counted as zero. The per-curve CSV records the actual seed IDs and
 sizes and horizons. These are exploratory live snapshots, not a matched
 four-seed comparison until all four seeds finish. There is no smoothing,
 interpolation, or cross-task averaging.
+
+## Best return curves plus last-five-checkpoint performance
+
+After the dense 10m four-seed sweep and the 3s5z four-seed confirmation have
+**both completed**, use the report script below. It chooses the best completed
+ARec cell *within each task* by mean seed-paired **training return AUC gain**
+against that task's own `none` runs. The 3s5z confirmation root contains the
+setting selected from its earlier pilot, so there is only one ARec candidate
+to compare there. This report does not mix tasks or borrow another task's
+baseline. Its 4-seed training-return curves use exact shared environment steps
+and pointwise 95% exact seed-bootstrap intervals (all 256 ordered resamples).
+
+For final performance, the script finds the last five *distinct saved*
+checkpoint steps for each run, preferring `final` over a duplicate `step_*`
+directory at the same step. With `--evaluate-missing`, it evaluates the 80
+selected checkpoint policies on 256 fresh stochastic episodes each, using
+paired evaluation seeds across conditions. The CSV reports both held-out
+last-five-checkpoint return and the explicitly labelled training-return
+interpolation at those steps; neither is silently replaced with the last five
+logged updates. Finished checkpoint evaluations are reused on reruns.
+
+```bash
+cd ~/JaxMARL
+git pull --ff-only
+conda activate jaxmarl
+unset LD_LIBRARY_PATH
+export AREC_DETAIL_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_10m_detail_4seed_v1
+export AREC_CONFIRM_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_confirm_4seed_v1
+export AREC_BEST_REPORT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_best_return_report_v1
+mkdir -p "$AREC_BEST_REPORT"
+nohup python scripts/report_smax_arec_best_returns.py --root-10m "$AREC_DETAIL_ROOT" --root-3s5z "$AREC_CONFIRM_ROOT/3s5z_vs_3s6z" --output-root "$AREC_BEST_REPORT" --evaluate-missing --eval-episodes 256 --gpus 0,1,2,3 --max-runs-per-gpu 2 > "$AREC_BEST_REPORT/report.stdout" 2>&1 &
+```
+
+The outputs are `smax-arec-selected-return-curves.{png,pdf,svg}` and separate
+`summary.csv`, `seed_level.csv`, and `return_curve.csv` files in each task's
+subdirectory. `summary_all_tasks.csv` merely concatenates the four task/method
+rows; it contains no cross-task average. `report_manifest.json` records
+selection, evaluation, AUC, and bootstrap definitions. Because the same four
+training seeds choose the 10m setting and appear in the report, this figure
+is an exploratory selected-sweep comparison, not independent confirmation.
