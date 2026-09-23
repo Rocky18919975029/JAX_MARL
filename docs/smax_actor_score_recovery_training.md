@@ -75,3 +75,7 @@ Do not reuse a run directory with a different protocol; the launcher freezes
 its manifest. Select a fixed coefficient using gradient-scale checks, then
 run all seeds with the same coefficient. Neither one-update loss nor the
 teacher's in-sample fit is evidence of return or held-out recoverability.
+
+For a paired isolated baseline and a task-separated coefficient/q-step
+screening grid, use `docs/smax_actor_score_recovery_sweep.md`. It uses a
+separate run root and does not alter an active single-coefficient matrix.
