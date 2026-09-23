@@ -145,7 +145,7 @@ def main() -> None:
     parser.add_argument("--maps", type=csv_items, default=MAPS)
     parser.add_argument("--seeds", type=seed_items, default=(1, 2, 3, 4))
     parser.add_argument("--gpus", type=csv_items, default=("0", "1", "2", "3"))
-    parser.add_argument("--max-runs-per-gpu", type=int, default=1)
+    parser.add_argument("--max-runs-per-gpu", type=int, default=2)
     parser.add_argument("--project", default="jaxmarl-smax-actor-score-recovery")
     parser.add_argument(
         "--wandb-mode", choices=("online", "offline", "disabled"), default="online"

@@ -74,7 +74,7 @@ def test_confirmation_is_per_task_full_budget_and_baseline_paired(tmp_path):
             cell,
             plan["pilot_ppo"],
             ("0", "1", "2", "3"),
-            1,
+            2,
             "project",
             "disabled",
         )
@@ -85,6 +85,7 @@ def test_confirmation_is_per_task_full_budget_and_baseline_paired(tmp_path):
         assert "--budget-fraction" not in cmd
         assert "--total-timesteps" not in cmd
         assert cmd[cmd.index("--learning-rate") + 1] == "0.002"
+        assert cmd[cmd.index("--max-runs-per-gpu") + 1] == "2"
         runs = run_matrix(
             (task,),
             (1, 2, 3, 4),

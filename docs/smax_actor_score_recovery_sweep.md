@@ -94,6 +94,9 @@ the two task-specific eight-run matrices **sequentially** so they do not
 compete for the same GPUs. Each task has its own isolated runs, checkpoints,
 metrics, and launcher log. It refuses a task whose best pilot setting does
 not beat its paired isolated win-rate AUC unless explicitly overridden.
+Within each task, the confirmation default is two concurrent runs per GPU
+(eight runs across four GPUs); this changes scheduling only, not the training
+protocol or selected hyperparameters.
 
 ```bash
 export AREC_CONFIRM_ROOT=/home/data/zeshenghong/JaxMARL/h1_smax_runs/actor_score_recovery_confirm_4seed_v1
@@ -104,7 +107,7 @@ python scripts/run_smax_actor_score_recovery_confirmation.py \
   --run-root "$AREC_CONFIRM_ROOT" \
   --seeds 1-4 \
   --gpus 0,1,2,3 \
-  --max-runs-per-gpu 1 \
+  --max-runs-per-gpu 2 \
   --dry-run
 
 nohup python scripts/run_smax_actor_score_recovery_confirmation.py \
@@ -112,7 +115,7 @@ nohup python scripts/run_smax_actor_score_recovery_confirmation.py \
   --run-root "$AREC_CONFIRM_ROOT" \
   --seeds 1-4 \
   --gpus 0,1,2,3 \
-  --max-runs-per-gpu 1 \
+  --max-runs-per-gpu 2 \
   --project jaxmarl-smax-actor-score-recovery \
   > "$AREC_CONFIRM_ROOT/launcher.stdout" 2>&1 &
 ```
