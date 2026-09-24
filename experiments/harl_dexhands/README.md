@@ -44,7 +44,8 @@ run-specific stdout log for every live legacy worker and terminates it
 environment from `/proc`, so worker termination does not depend on that field.
 A dry run never stops processes. If process identity cannot be
 verified, it refuses to launch rather than risking another experiment. The
-scheduler allows at most two new runs per GPU, completes each seed's primary
+scheduler spreads a seed's runs across all selected GPUs before assigning a
+second run to any GPU, allows at most two per GPU, completes each seed's primary
 jobs before advancing, and defers failed jobs to one retry at the end of that
 seed. Re-running the launcher keeps completed results and resumes only gaps.
 

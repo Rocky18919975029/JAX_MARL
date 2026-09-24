@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -117,6 +118,55 @@ def test_replacement_manifest_reuses_eight_and_sets_paper_madpo_budget(tmp_path)
         == 8
     )
     assert "madpo-div1000-w0p2-sig500-k4000" in result.stdout
+
+
+def test_seed_jobs_spread_over_all_gpus_before_second_slots():
+    gpus = ("0", "1", "2", "3")
+    occupied = Counter()
+    assignment = []
+    for _ in range(8):
+        gpu = launcher.least_loaded_gpu(gpus, occupied, 2)
+        assignment.append(gpu)
+        occupied[gpu] += 1
+    assert assignment == ["0", "1", "2", "3", "0", "1", "2", "3"]
+    assert launcher.least_loaded_gpu(gpus, occupied, 2) is None
+
+
+def test_seed_one_dry_run_places_four_paper_jobs_on_four_gpus(tmp_path):
+    old = make_legacy(tmp_path)
+    new = tmp_path / "new"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(launcher.__file__),
+            "--legacy-run-root",
+            str(old),
+            "--run-root",
+            str(new),
+            "--gpus",
+            "0,1,2,3",
+            "--max-runs-per-gpu",
+            "2",
+            "--wandb-mode",
+            "disabled",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    seed_one = [
+        line
+        for line in result.stdout.splitlines()
+        if " PLAN " in line and "-seed1" in line
+    ]
+    assert len(seed_one) == 4
+    assert {line.split("GPU ", 1)[1].split()[0] for line in seed_one} == {
+        "0",
+        "1",
+        "2",
+        "3",
+    }
 
 
 def test_failed_job_does_not_stop_seed_and_is_retried_after_peers(

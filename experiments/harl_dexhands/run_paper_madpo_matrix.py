@@ -300,6 +300,18 @@ def _lock(path: Path, description: str):
     return stream
 
 
+def least_loaded_gpu(
+    gpus: tuple[str, ...], occupied: collections.Counter, limit: int
+) -> str | None:
+    """Spread a seed's runs across devices before filling a second slot."""
+    available = [gpu for gpu in gpus if occupied[gpu] < limit]
+    return (
+        min(available, key=lambda gpu: (occupied[gpu], gpus.index(gpu)))
+        if available
+        else None
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--legacy-run-root", type=Path, required=True)
@@ -519,14 +531,16 @@ def main() -> None:
                         del active[future]
                 occupied = collections.Counter(item[1] for item in external.values())
                 occupied.update(gpu for _, gpu in active.values())
-                for gpu in gpus:
-                    while waiting and occupied[gpu] < args.max_runs_per_gpu:
-                        task = waiting.popleft()
-                        if completed(task):
-                            continue
-                        future = executor.submit(run_one, task, gpu, retry)
-                        active[future] = (task, gpu)
-                        occupied[gpu] += 1
+                while waiting:
+                    gpu = least_loaded_gpu(gpus, occupied, args.max_runs_per_gpu)
+                    if gpu is None:
+                        break
+                    task = waiting.popleft()
+                    if completed(task):
+                        continue
+                    future = executor.submit(run_one, task, gpu, retry)
+                    active[future] = (task, gpu)
+                    occupied[gpu] += 1
                 if (
                     waiting
                     or active
