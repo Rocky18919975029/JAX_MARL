@@ -17,12 +17,14 @@ from types import SimpleNamespace
 
 try:
     from scripts import smax_four_method as control
+    from scripts import reconcile_smax_first_four_panel_commits as commit_audit
     from scripts.run_smax_first_four_panel_tuned import (
         FIGURE_ID, TASKS, _selected_historical_runs, launch_args, load_pair,
         verify_historical,
     )
 except ModuleNotFoundError:  # Direct execution from scripts/.
     import smax_four_method as control
+    import reconcile_smax_first_four_panel_commits as commit_audit
     from run_smax_first_four_panel_tuned import (
         FIGURE_ID, TASKS, _selected_historical_runs, launch_args, load_pair,
         verify_historical,
@@ -126,10 +128,25 @@ def extension_plan(collection_root: Path) -> tuple[list[dict], dict[str, int]]:
         for row in manifest["runs"]:
             run = control.Run(**observed[row["name"]])
             status_path = root / "status" / f"{run.name}.json"
-            if not status_path.is_file() or _read(status_path).get("status") != "completed":
+            if not status_path.is_file():
                 continue
+            status = _read(status_path)
+            if status.get("status") != "completed":
+                continue
+            validated_commit = status.get("validated_git_commit", manifest["git_commit"])
+            if validated_commit != manifest["git_commit"]:
+                audit = status.get("commit_reconciliation", {})
+                backup = root / "reconciliation" / "original_failed_status" / status_path.name
+                if (audit.get("manifest_git_commit") != manifest["git_commit"]
+                        or audit.get("checkpoint_git_commit") != validated_commit
+                        or audit.get("original_status_backup") != str(backup)
+                        or not backup.is_file()
+                        or _read(backup).get("status") != "failed"
+                        or audit.get("nontraining_changes")
+                        != commit_audit.verify_commit_equivalence(manifest, validated_commit)):
+                    raise RuntimeError(f"Invalid commit reconciliation for {run.name}")
             issue = control.validate_artifacts(
-                root, manifest["project"], run, manifest["git_commit"]
+                root, manifest["project"], run, validated_commit
             )
             if issue is not None:
                 raise RuntimeError(f"Invalid completed extension {run.name}: {issue}")
@@ -147,7 +164,9 @@ def extension_plan(collection_root: Path) -> tuple[list[dict], dict[str, int]]:
                 "task": task, "method": run.method, "seed": run.seed,
                 "origin": "six_seed_extension", "run_name": run.name,
                 "source_root": str(root),
-                "training_git_commit": manifest["git_commit"],
+                "training_git_commit": validated_commit,
+                "manifest_git_commit": manifest["git_commit"],
+                "commit_reconciled": validated_commit != manifest["git_commit"],
                 "outputs": {key: str(path) for key, path in outputs.items()},
             })
         counts[task] = completed

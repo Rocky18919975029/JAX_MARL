@@ -242,6 +242,10 @@ def report(args: argparse.Namespace) -> Path:
         row["origin"] = entry["origin"]
         row["source_root"] = entry["source_root"]
         row["training_git_commit"] = entry["training_git_commit"]
+        row["manifest_git_commit"] = entry.get(
+            "manifest_git_commit", entry["training_git_commit"]
+        )
+        row["commit_reconciled"] = entry.get("commit_reconciled", False)
     previous.write_csv(output / "summary_all_tasks.csv", summary)
     previous.write_csv(output / "seed_level_all_tasks.csv", seeds)
     previous.write_csv(output / "return_curve_all_tasks.csv", curves)
@@ -267,6 +271,8 @@ def report(args: argparse.Namespace) -> Path:
             "task": row["task"], "method": row["method"], "seed": row["seed"],
             "run_name": row["run_name"], "origin": row["origin"],
             "training_git_commit": row["training_git_commit"],
+            "manifest_git_commit": row.get("manifest_git_commit", row["training_git_commit"]),
+            "commit_reconciled": row.get("commit_reconciled", False),
             "source_root": row["source_root"],
         } for _, row in sorted(entries.items())],
         "curve_metric": "unsmoothed training episode return",

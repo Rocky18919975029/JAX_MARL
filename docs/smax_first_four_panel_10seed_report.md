@@ -56,3 +56,35 @@ same frozen *effective* configurations. This is neither an independently
 selected ten-seed estimate nor a bitwise homogeneous-code replay. The report
 records each source root, origin, and training commit so that distinction is
 visible in the seed-level table and manifest.
+
+## Recover a checkout change during the six-seed extension
+
+If a Git pull occurred while the four extension launchers were running, later
+workers may train successfully (`exit=0`) yet be marked failed solely because
+their checkpoints record a newer commit than the immutable launcher manifest.
+Do not delete those checkpoints or simply change their status by hand. The
+reconciliation tool audits each such run: it checks that the newer commit is a
+descendant, that the diff contains only explicitly allowed non-SMAX files,
+that every frozen training source has the manifest's exact SHA-256 at both
+commits, and that the other checkpoint/metrics validations pass. It refuses
+any genuine training-code or artifact mismatch. Its default mode is read-only:
+
+```bash
+python scripts/reconcile_smax_first_four_panel_commits.py --collection-root "$COLLECTION_ROOT"
+```
+
+Review the audited run count and commits. Only if all candidates pass, apply
+the reconciliation, then refresh the collection and run the report:
+
+```bash
+python scripts/reconcile_smax_first_four_panel_commits.py --collection-root "$COLLECTION_ROOT" --apply
+python scripts/organize_smax_first_four_panel.py --matrix-root "$MATRIX_ROOT" --collection-root "$COLLECTION_ROOT" --phase refresh --require-complete --apply
+nohup python scripts/report_smax_first_four_panel_10seed.py --collection-root "$COLLECTION_ROOT" --output-root "$REPORT_ROOT" --reuse-evaluation-root "$MATRIX_ROOT/actor_score_recovery_best_return_report_v1" --evaluate-missing --eval-episodes 256 --eval-num-envs 128 --eval-policy stochastic --gpus 0,1,2,3 --max-runs-per-gpu 2 > "$REPORT_ROOT/report.stdout" 2>&1 &
+```
+
+The original failed status JSONs remain at
+`extension_6seed/reconciliation/original_failed_status/`. Reconciled statuses,
+the collection index, seed-level table, and report manifest distinguish the
+manifest commit from the actual checkpoint commit. Never pull the checkout
+while new training runs are in progress; the script is an audit of this
+specific completed-run incident, not a general permission to mix code.

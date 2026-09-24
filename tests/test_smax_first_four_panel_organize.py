@@ -9,6 +9,7 @@ import pytest
 
 from scripts import smax_four_method as control
 from scripts import organize_smax_first_four_panel as organizer
+from scripts import reconcile_smax_first_four_panel_commits as commit_audit
 from scripts.organize_smax_first_four_panel import apply_plan, extension_plan
 from scripts.run_smax_first_four_panel_tuned import FIGURE_ID, launch_args, load_pair
 
@@ -77,6 +78,22 @@ def test_extension_manifest_must_match_frozen_six_seed_grid(
     assert counts[task] == 1 and len(entries) == 1
     assert entries[0]["seed"] == 5 and entries[0]["method"] == "none"
     assert entries[0]["outputs"]["checkpoints"] == str(checkpoint)
+
+    backup = root / "reconciliation" / "original_failed_status" / f"{first.name}.json"
+    _write(backup, {"status": "failed"})
+    _write(root / "status" / f"{first.name}.json", {
+        "status": "completed", "validated_git_commit": "later-test",
+        "commit_reconciliation": {
+            "manifest_git_commit": "historical-test",
+            "checkpoint_git_commit": "later-test",
+            "nontraining_changes": ["docs/report.md"],
+            "original_status_backup": str(backup),
+        },
+    })
+    monkeypatch.setattr(commit_audit, "verify_commit_equivalence",
+                        lambda *_args: ["docs/report.md"])
+    entries, counts = extension_plan(tmp_path / "collection")
+    assert counts[task] == 1 and entries[0]["training_git_commit"] == "later-test"
 
     manifest["runs"][0]["lr"] = 0.123
     _write(root / "experiment_manifest.json", manifest)
