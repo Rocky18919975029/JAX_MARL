@@ -87,6 +87,23 @@ def load_manifest_rows(root: Path) -> list[dict]:
         run_budget = int(run.get("num_env_steps", budget))
         name = run["run_name"]
         path = root / "status" / f"{name}.json"
+        source = run.get("reuse_completed_from")
+        if source:
+            source_path = Path(source) / "status" / f"{name}.json"
+            try:
+                source_payload = json.loads(source_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                source_payload = {}
+            if source_payload.get("status") == "completed":
+                rows.append(
+                    {
+                        "name": name,
+                        "status": "completed",
+                        "steps": run_budget,
+                        "total": run_budget,
+                    }
+                )
+                continue
         if not path.is_file():
             rows.append(
                 {"name": name, "status": "pending", "steps": 0, "total": run_budget}

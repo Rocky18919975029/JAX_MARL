@@ -25,6 +25,49 @@ Inspect the resolved, frozen run protocol with
 `python experiments/harl_dexhands/monitor.py --run-root "$RUN_ROOT"`; the
 manifest records both the upstream HARL config hash and the paper-profile hash.
 
+### Replace the interrupted legacy 48-run grid
+
+`run_paper_madpo_matrix.py` creates a new, frozen 48-run study. It references
+completed HAPPO/MAPPO runs in the original grid without retraining or moving
+their files; it trains only missing HAPPO/MAPPO runs plus all 16 paper-profile
+MADPO runs in the new root. It preserves the old HAPPO/MAPPO settings (50M
+steps), while MADPO uses the paper profile (40M steps). The new manifest records
+the original manifest hash and each reused run's source. The monitor resolves
+those references, so the new root shows all 48 logical runs.
+
+On launch it acquires locks for both roots. If the old grid launcher still
+holds the legacy lock, the replacement stops only the exact `run_matrix.py`
+process whose `--run-root` matches the old directory, then waits for the lock.
+Before starting any training, it verifies the recorded PID, run name, log, and
+GPU for every live legacy worker and terminates it (including any old-profile
+MADPO worker). A dry run never stops processes. If process identity cannot be
+verified, it refuses to launch rather than risking another experiment. The
+scheduler allows at most two new runs per GPU, completes each seed's primary
+jobs before advancing, and defers failed jobs to one retry at the end of that
+seed. Re-running the launcher keeps completed results and resumes only gaps.
+
+```bash
+cd ~/JaxMARL
+git pull --ff-only
+conda activate harl_dex
+unset LD_LIBRARY_PATH
+export DEX_LEGACY_ROOT=/home/data/zeshenghong/JaxMARL/harl_dexhands_shadowhandover/arec_lambda_grid_4seed_v1
+export DEX_PAPER48_ROOT=/home/data/zeshenghong/JaxMARL/harl_dexhands_shadowhandover/arec_paper_madpo_48run_v1
+mkdir -p "$DEX_PAPER48_ROOT"
+nohup python experiments/harl_dexhands/run_paper_madpo_matrix.py \
+  --legacy-run-root "$DEX_LEGACY_ROOT" \
+  --run-root "$DEX_PAPER48_ROOT" \
+  --gpus 0,1,2,3 --max-runs-per-gpu 2 \
+  --wandb-project harl-dexhands-shadowhandover-arec-grid4seed \
+  > "$DEX_PAPER48_ROOT/launcher.stdout" 2>&1 &
+watch -n 5 "python experiments/harl_dexhands/monitor.py --run-root '$DEX_PAPER48_ROOT'"
+```
+
+Only run this once the GPUs are available for this grid; the launcher accounts
+for workers in the old and new roots but not unrelated GPU jobs. If W&B is not
+functional in `harl_dex`, add `--wandb-mode disabled` before the redirect; the
+launcher checks W&B before stopping any legacy process.
+
 ### Separate MADPO paper-profile comparison
 
 Use a **new** data-disk run root. Smoke-test both the MADPO baseline and its
