@@ -1,0 +1,17 @@
+defaults:
+  - logger: logger
+  - arch: anakin
+  - system: ppo/rec_mappo
+  - network: rnn
+  - env: rware
+  - _self_
+
+arec:
+  coef: 0.0001
+  q_steps: 4
+  q_lr: 0.001
+  fisher_ridge: 0.001
+
+hydra:
+  searchpath:
+    - file://mava/configs
