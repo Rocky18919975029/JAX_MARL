@@ -91,12 +91,18 @@ def task_overrides(config: dict, task: str, seed: int, smoke: bool) -> dict[str,
     return overrides
 
 
-def make_jobs(config: dict, tasks: tuple[str, ...], seeds: tuple[int, ...], smoke: bool) -> list[dict]:
+def make_jobs(
+    config: dict,
+    tasks: tuple[str, ...],
+    seeds: tuple[int, ...],
+    smoke: bool,
+    conditions: tuple[str, ...] = CONDITIONS,
+) -> list[dict]:
     jobs = []
     for seed in seeds:
         for task in tasks:
             shared = task_overrides(config, task, seed, smoke)
-            for condition in CONDITIONS:
+            for condition in conditions:
                 name = f"{task}--{condition}--seed{seed}"
                 jobs.append({
                     "name": name,
@@ -135,9 +141,15 @@ def validate_mava(mava_root: Path, config: dict) -> None:
         raise RuntimeError(f"Run uv sync --extra cuda12 in {mava_root} first")
 
 
-def manifest(config: dict, args: argparse.Namespace, tasks: tuple[str, ...], seeds: tuple[int, ...]) -> dict:
-    jobs = make_jobs(config, tasks, seeds, args.smoke)
-    return {
+def manifest(
+    config: dict,
+    args: argparse.Namespace,
+    tasks: tuple[str, ...],
+    seeds: tuple[int, ...],
+    conditions: tuple[str, ...],
+) -> dict:
+    jobs = make_jobs(config, tasks, seeds, args.smoke, conditions)
+    result = {
         "protocol": "mava-jumanji-rec-mappo-arec-paired-optimal-v1",
         "benchmark_config_sha256": digest(CONFIG_PATH),
         "baseline_script_sha256": digest(
@@ -158,6 +170,10 @@ def manifest(config: dict, args: argparse.Namespace, tasks: tuple[str, ...], see
         },
         "jobs": jobs,
     }
+    # Preserve the original paired manifest byte-for-byte when both methods run.
+    if conditions != CONDITIONS:
+        result["conditions"] = list(conditions)
+    return result
 
 
 def command(mava_root: Path, run_root: Path, job: dict, arec: dict) -> list[str]:
@@ -244,6 +260,7 @@ def display_status(run_root: Path) -> None:
 def run(args: argparse.Namespace) -> int:
     config = read_json(CONFIG_PATH)
     tasks = parse_names(args.tasks, set(config["tasks"]), "tasks")
+    conditions = parse_names(args.conditions, set(CONDITIONS), "conditions")
     seeds = parse_seeds(args.seeds)
     gpus = parse_names(args.gpus, set(args.gpus.split(",")), "GPUs")
     if any(not re.fullmatch(r"\d+", gpu) for gpu in gpus):
@@ -253,7 +270,7 @@ def run(args: argparse.Namespace) -> int:
     if args.arec_q_lr <= 0 or args.arec_fisher_ridge <= 0:
         raise ValueError("ARec q_lr and Fisher ridge must be positive")
     validate_mava(args.mava_root, config)
-    planned = manifest(config, args, tasks, seeds)
+    planned = manifest(config, args, tasks, seeds, conditions)
     if args.dry_run:
         for job in planned["jobs"]:
             print(job["name"], " ".join(command(args.mava_root, args.run_root, job, planned["arec"])))
@@ -335,6 +352,7 @@ def main() -> None:
     parser.add_argument("--mava-root", type=Path, default=Path("/home/data/zeshenghong/Mava"))
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--tasks", default="lbf_15x15-4p-5f,rware_large-8ag")
+    parser.add_argument("--conditions", default="none,arec")
     parser.add_argument("--seeds", default="1-4")
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--max-runs-per-gpu", type=int, default=1)

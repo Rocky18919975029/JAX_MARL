@@ -169,3 +169,46 @@ incomplete-seed tail without CI; it is provisional. The two panels have
 separate return scales and should only be compared **within** a task. The
 plotter tolerates an occasional partially rewritten Mava JSON file and skips
 that run for one refresh rather than mixing attempts or inventing values.
+
+## Same-four-seed ARec lambda sweep
+
+The first ARec-only scan uses the same two tasks and seeds 1–4, with
+`lambda = {3e-6, 1e-5, 3e-5, 1e-4, 3e-4}`. It fixes `q_steps=4`,
+`q_lr=1e-3`, and Fisher ridge `1e-3`. The completed formal paired experiment
+supplies all eight original MAPPO runs and all eight `lambda=1e-4` ARec runs.
+The sweep launcher verifies their hashes, zero exit codes, benchmark settings,
+and full-length evaluation logs; **only 32 new ARec runs are launched**.
+Original outputs are referenced, never copied or rewritten. A separate
+immutable manifest lists every reused file and its SHA256 hash.
+
+Use one worker per 4090 by default: the formal Mava workers have required
+around 18.5 GiB each on the current server.
+
+```bash
+cd ~/JaxMARL
+git pull --ff-only
+unset LD_LIBRARY_PATH
+MAVA_ROOT=/home/data/zeshenghong/Mava
+SOURCE_ROOT=/home/data/zeshenghong/JaxMARL/mava_high_agent_paired/formal_4seed_v1
+SWEEP_ROOT=/home/data/zeshenghong/JaxMARL/mava_high_agent_paired/arec_lambda_same4_v1
+mkdir -p "$SWEEP_ROOT"
+python experiments/mava_jumanji/run_arec_lambda_sweep.py run \
+  --mava-root "$MAVA_ROOT" --source-root "$SOURCE_ROOT" \
+  --run-root "$SWEEP_ROOT" --gpus 0,1,2,3 \
+  --max-runs-per-gpu 1 --dry-run > "$SWEEP_ROOT/dry-run.txt"
+nohup python -u experiments/mava_jumanji/run_arec_lambda_sweep.py run \
+  --mava-root "$MAVA_ROOT" --source-root "$SOURCE_ROOT" \
+  --run-root "$SWEEP_ROOT" --gpus 0,1,2,3 \
+  --max-runs-per-gpu 1 > "$SWEEP_ROOT/launcher.stdout" 2>&1 &
+watch -n 5 "python experiments/mava_jumanji/run_arec_lambda_sweep.py status --run-root '$SWEEP_ROOT'"
+```
+
+The four child roots are `lambda_3em06`, `lambda_1em05`, `lambda_3em05`,
+and `lambda_3em04`. The controller runs them sequentially, filling the four
+GPU slots within each coefficient; a failed worker does not block other
+workers or later coefficients. Restart the same command to skip completed
+runs, or add `--retry-failed` to retry only failed runs. Never point the sweep
+root inside the original paired run root. Select parameters using paired
+seed-level return AUC and report final-five-evaluation return as secondary;
+because selection uses the same four seeds, it is exploratory rather than an
+independent confirmation.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 from pathlib import Path
@@ -68,6 +69,28 @@ def test_four_seeds_are_paired_and_seed_first():
         assert none["shared_overrides"]["system.seed"] == none["seed"]
         assert none["shared_overrides"]["system.num_updates"] == 1220
     assert [job["seed"] for job in jobs] == sorted(job["seed"] for job in jobs)
+
+
+def test_arec_only_jobs_do_not_launch_any_baseline():
+    jobs = launcher.make_jobs(
+        CONFIG, tuple(CONFIG["tasks"]), (1, 2, 3, 4), False, ("arec",)
+    )
+    assert len(jobs) == 8
+    assert {job["condition"] for job in jobs} == {"arec"}
+    assert [job["seed"] for job in jobs] == sorted(job["seed"] for job in jobs)
+
+
+def test_default_manifest_shape_remains_backward_compatible(tmp_path):
+    args = argparse.Namespace(
+        smoke=False, mava_root=tmp_path, arec_coef=1e-4,
+        arec_q_steps=4, arec_q_lr=1e-3, arec_fisher_ridge=1e-3,
+    )
+    (tmp_path / "mava/systems/ppo/anakin").mkdir(parents=True)
+    (tmp_path / "mava/systems/ppo/anakin/rec_mappo.py").write_text("baseline")
+    original = launcher.manifest(CONFIG, args, tuple(CONFIG["tasks"]), (1,), launcher.CONDITIONS)
+    only_arec = launcher.manifest(CONFIG, args, tuple(CONFIG["tasks"]), (1,), ("arec",))
+    assert "conditions" not in original
+    assert only_arec["conditions"] == ["arec"]
 
 
 def test_command_only_adds_arec_knobs(tmp_path):
