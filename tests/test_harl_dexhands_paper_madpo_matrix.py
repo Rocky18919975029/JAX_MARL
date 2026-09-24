@@ -220,15 +220,37 @@ def test_only_missing_baselines_are_launched_and_resume_is_idempotent(
 def test_worker_stop_requires_verified_identity_and_uses_sigterm(tmp_path, monkeypatch):
     old = tmp_path / "legacy"
     old.mkdir()
-    status = {"status": "running", "pid": 123}
-    checks = iter(["0", "0", None])
+    status = {"status": "running", "pid": 123, "run_name": "happo-seed1"}
+    checks = iter([True, True, False])
     signals = []
-    monkeypatch.setattr(launcher, "running_gpu", lambda *_args, **_kwargs: next(checks))
+    monkeypatch.setattr(
+        launcher, "legacy_worker_is_live", lambda *_args, **_kwargs: next(checks)
+    )
     monkeypatch.setattr(
         launcher.os, "kill", lambda pid, sig: signals.append((pid, sig))
     )
-    assert launcher.stop_legacy_worker("happo-seed1", status, old, ("0",))
+    assert launcher.stop_legacy_worker("happo-seed1", status, old)
     assert signals == [(123, launcher.signal.SIGTERM)]
+
+
+def test_legacy_worker_identity_uses_log_even_if_gpu_environment_is_empty(tmp_path):
+    old = tmp_path / "legacy"
+    log = old / "logs" / "happo-seed1.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("")
+    proc_root = tmp_path / "proc"
+    proc = proc_root / "123"
+    (proc / "fd").mkdir(parents=True)
+    (proc / "stat").write_text("123 (happo-seed1) S 0 0 0\n")
+    (proc / "cmdline").write_bytes(b"happo-seed1\0")
+    (proc / "environ").write_bytes(b"")
+    (proc / "fd" / "1").symlink_to(log)
+    status = {"status": "running", "pid": 123, "run_name": "happo-seed1"}
+    assert launcher.legacy_worker_is_live("happo-seed1", status, old, proc_root)
+    (proc / "fd" / "1").unlink()
+    (proc / "fd" / "1").symlink_to(tmp_path / "unrelated.log")
+    with pytest.raises(RuntimeError, match="refusing to signal"):
+        launcher.legacy_worker_is_live("happo-seed1", status, old, proc_root)
 
 
 def test_launcher_process_matching_is_exact(tmp_path):

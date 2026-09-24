@@ -38,9 +38,11 @@ those references, so the new root shows all 48 logical runs.
 On launch it acquires locks for both roots. If the old grid launcher still
 holds the legacy lock, the replacement stops only the exact `run_matrix.py`
 process whose `--run-root` matches the old directory, then waits for the lock.
-Before starting any training, it verifies the recorded PID, run name, log, and
-GPU for every live legacy worker and terminates it (including any old-profile
-MADPO worker). A dry run never stops processes. If process identity cannot be
+Before starting any training, it verifies the recorded PID, run name, and
+run-specific stdout log for every live legacy worker and terminates it
+(including any old-profile MADPO worker). Isaac Gym may erase the visible GPU
+environment from `/proc`, so worker termination does not depend on that field.
+A dry run never stops processes. If process identity cannot be
 verified, it refuses to launch rather than risking another experiment. The
 scheduler allows at most two new runs per GPU, completes each seed's primary
 jobs before advancing, and defers failed jobs to one retry at the end of that

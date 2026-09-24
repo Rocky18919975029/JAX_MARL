@@ -99,35 +99,67 @@ def stop_legacy_launcher(legacy_root: Path, lock_path: Path, timeout: float = 20
     raise RuntimeError(f"Legacy launcher did not release {lock_path} after SIGTERM")
 
 
-def stop_legacy_worker(
-    name: str,
-    status: dict,
-    legacy_root: Path,
-    gpus: tuple[str, ...],
-    *,
-    timeout: float = 20.0,
+def legacy_worker_is_live(
+    name: str, status: dict, legacy_root: Path, proc_root: Path = Path("/proc")
 ) -> bool:
-    """Terminate only a live worker validated against its run name, log and GPU."""
-    log = legacy_root / "logs" / f"{name}.log"
-    gpu = running_gpu(name, status, gpus, expected_log=log)
-    if gpu is None:
+    """Verify a legacy worker without relying on mutable /proc environment data."""
+    if status.get("status") != "running":
+        return False
+    if status.get("run_name") != name:
+        raise RuntimeError(f"Legacy status has a different run name: {name}")
+    pid = status.get("pid")
+    if not isinstance(pid, int) or pid <= 0 or not process_is_running(pid, proc_root):
+        return False
+    proc = proc_root / str(pid)
+    expected_log = legacy_root / "logs" / f"{name}.log"
+    try:
+        log_matches = (proc / "fd" / "1").resolve(strict=True) == expected_log.resolve(
+            strict=True
+        )
+    except OSError:
+        log_matches = False
+    if log_matches:
+        return True
+    try:
+        argv = (proc / "cmdline").read_bytes().split(b"\0")
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot inspect live legacy worker {name} pid={pid}"
+        ) from error
+    if (
+        name.encode() in argv
+        and any(arg.endswith(b"experiments/harl_dexhands/train.py") for arg in argv)
+        and str(legacy_root).encode() in argv
+    ):
+        return True
+    raise RuntimeError(
+        f"Legacy status points to live pid={pid}, but its log and command do not "
+        f"identify {name}; refusing to signal that PID"
+    )
+
+
+def stop_legacy_worker(
+    name: str, status: dict, legacy_root: Path, *, timeout: float = 20.0
+) -> bool:
+    """Terminate only a live worker whose run-specific identity was verified."""
+    if not legacy_worker_is_live(name, status, legacy_root):
         return False
     pid = int(status["pid"])
-    if running_gpu(name, status, gpus, expected_log=log) != gpu:
-        raise RuntimeError(f"Worker identity changed before stopping {name}")
-    print(f"Stopping legacy worker GPU {gpu} pid={pid} {name}", flush=True)
+    if not legacy_worker_is_live(name, status, legacy_root):
+        return True
+    print(f"Stopping legacy worker pid={pid} {name}", flush=True)
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if running_gpu(name, status, gpus, expected_log=log) is None:
+        if not legacy_worker_is_live(name, status, legacy_root):
             return True
         time.sleep(0.25)
     # Never send SIGKILL to an unverified or recycled PID.
-    if running_gpu(name, status, gpus, expected_log=log) != gpu:
-        raise RuntimeError(f"Worker identity changed before SIGKILL: {name}")
+    if not legacy_worker_is_live(name, status, legacy_root):
+        return True
     os.kill(pid, signal.SIGKILL)
     for _ in range(40):
-        if running_gpu(name, status, gpus, expected_log=log) is None:
+        if not legacy_worker_is_live(name, status, legacy_root):
             return True
         time.sleep(0.25)
     raise RuntimeError(f"Worker still live after SIGKILL: {name} pid={pid}")
@@ -338,21 +370,15 @@ def main() -> None:
             status = read_status(legacy_root / "status" / f"{row['run_name']}.json")
             if status.get("status") != "running":
                 continue
-            gpu = running_gpu(
-                row["run_name"],
-                status,
-                gpus,
-                expected_log=legacy_root / "logs" / f"{row['run_name']}.log",
-            )
-            if gpu is None:
+            if not legacy_worker_is_live(row["run_name"], status, legacy_root):
                 continue
             if args.dry_run:
                 print(
-                    f"WOULD_STOP legacy GPU {gpu} pid={status['pid']} {row['run_name']}",
+                    f"WOULD_STOP legacy pid={status['pid']} {row['run_name']}",
                     flush=True,
                 )
                 continue
-            if stop_legacy_worker(row["run_name"], status, legacy_root, gpus):
+            if stop_legacy_worker(row["run_name"], status, legacy_root):
                 stopped_workers += 1
         for task in tasks:
             status = read_status(status_path(task))
