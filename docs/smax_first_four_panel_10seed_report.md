@@ -21,6 +21,12 @@ returns extend to the exact boundaries, matching the first four-panel report.
 Final performance is the per-seed mean held-out stochastic-policy return of
 the last five *distinct saved checkpoints*, followed by a ten-seed mean and
 bootstrap CI. Paired differences use the same seed draws for `none` and ARec.
+The historical final checkpoint uses the nominal budget (10M or 20M) in its
+metadata; the extension launcher uses the last complete rollout (9,994,240 or
+19,988,480). The report validates each cohort against its own actual saved
+step and requires the two methods to have matching five-checkpoint steps
+*within each seed*. It records the per-seed steps instead of pretending that
+all ten final checkpoint labels are identical.
 The evaluation default is 256 episodes per checkpoint, 128 environments, and
 the same deterministic evaluation-seed rule as the original report. Existing
 four-seed evaluations are reused only when checkpoint and protocol identities

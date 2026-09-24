@@ -52,7 +52,8 @@ class TenSeedReportTests(unittest.TestCase):
                         manifest = {"runs": [source_run]}
                     else:
                         source_run.update(name=name, method=method)
-                        manifest = {"map_name": task, "runs": [source_run]}
+                        manifest = {"map_name": task, "effective_timesteps": 20,
+                                    "runs": [source_run]}
                     manifest_path = source / "experiment_manifest.json"
                     status_path = source / "status.json"
                     metrics_path = source / "metrics.jsonl"
@@ -126,7 +127,43 @@ class TenSeedReportTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "grids are not sufficiently matched"):
                 report.prepare(self.collection, self.output)
 
+    def test_extension_final_uses_effective_whole_rollout_budget(self) -> None:
+        _, entries = report.load_collection(self.collection)
+        entry = entries["10m_vs_11m", "none", 5]
+        source_manifest = Path(entry["outputs"]["source_manifest.json"])
+        manifest = report.read_json(source_manifest)
+        manifest["effective_timesteps"] = 19
+        write_json(source_manifest, manifest)
+        checkpoint_parent = Path(entry["outputs"]["checkpoints"])
+        for checkpoint in checkpoint_parent.iterdir():
+            config = report.read_json(checkpoint / "config.json")
+            config["TOTAL_TIMESTEPS"] = 19
+            write_json(checkpoint / "config.json", config)
+        final = checkpoint_parent / "final" / "metadata.json"
+        metadata = report.read_json(final)
+        metadata["nominal_env_step"] = 19
+        write_json(final, metadata)
+        profile = self.profiles["10m_vs_11m"]["none"]
+        self.assertEqual(report.last_five(entry, profile)[-1][0], 19)
+
     def test_render_and_table_use_ten_seeds_and_heldout_last_five(self) -> None:
+        _, selected = report.load_collection(self.collection)
+        for entry in selected.values():
+            if entry["origin"] != "six_seed_extension":
+                continue
+            source_manifest = Path(entry["outputs"]["source_manifest.json"])
+            manifest = report.read_json(source_manifest)
+            manifest["effective_timesteps"] = 19
+            write_json(source_manifest, manifest)
+            checkpoint_parent = Path(entry["outputs"]["checkpoints"])
+            for checkpoint in checkpoint_parent.iterdir():
+                config = report.read_json(checkpoint / "config.json")
+                config["TOTAL_TIMESTEPS"] = 19
+                write_json(checkpoint / "config.json", config)
+            final = checkpoint_parent / "final" / "metadata.json"
+            metadata = report.read_json(final)
+            metadata["nominal_env_step"] = 19
+            write_json(final, metadata)
         with patch.object(report, "frozen_profiles", return_value=self.profiles):
             _, entries, jobs, _ = report.prepare(self.collection, self.output)
             for job in jobs:
@@ -160,6 +197,7 @@ class TenSeedReportTests(unittest.TestCase):
         self.assertEqual(len(rows), 8)
         arec = next(row for row in rows if row["task"] == "10m_vs_11m" and row["condition"] != "none")
         self.assertEqual(int(arec["n_seeds"]), 10)
+        self.assertIn("varies slightly", arec["final_checkpoint_steps"])
         self.assertAlmostEqual(float(arec["delta_final_eval_return_last5_ckpt_vs_none_mean"]), 0.5)
         self.assertAlmostEqual(float(arec["delta_return_auc_vs_none_mean"]), 0.2)
 

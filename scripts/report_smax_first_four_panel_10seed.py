@@ -87,6 +87,15 @@ def frozen_profiles() -> dict:
 def last_five(row: dict, profile: dict) -> list[tuple[int, Path]]:
     parent = Path(row["outputs"]["checkpoints"])
     task, method, seed = row["task"], row["method"], int(row["seed"])
+    source_manifest = read_json(Path(row["outputs"]["source_manifest.json"]))
+    nominal_budget = int(profile["TOTAL_TIMESTEPS"])
+    checkpoint_budget = (
+        nominal_budget if row["origin"] == "first_four_panel_v1"
+        else int(source_manifest["effective_timesteps"])
+    )
+    rollout_size = int(profile["NUM_ENVS"] * profile["NUM_STEPS"])
+    if not nominal_budget - rollout_size < checkpoint_budget <= nominal_budget:
+        raise RuntimeError(f"Checkpoint budget is not the matched whole-rollout budget: {parent}")
     expected_condition = (
         CONDITION[method] if row["origin"] == "first_four_panel_v1" else method
     )
@@ -101,7 +110,11 @@ def last_five(row: dict, profile: dict) -> list[tuple[int, Path]]:
         if int(config.get("SEED", -1)) != seed:
             raise RuntimeError(f"Checkpoint training seed differs: {checkpoint}")
         for key in CONFIG_KEYS:
-            expected = expected_condition if key == "EXPERIMENT_CONDITION" else profile[key]
+            expected = (
+                expected_condition if key == "EXPERIMENT_CONDITION"
+                else checkpoint_budget if key == "TOTAL_TIMESTEPS"
+                else profile[key]
+            )
             if not same_value(key, config.get(key), expected):
                 raise RuntimeError(
                     f"Checkpoint {key} differs from frozen method config: {checkpoint}; "
@@ -110,12 +123,12 @@ def last_five(row: dict, profile: dict) -> list[tuple[int, Path]]:
         if row.get("training_git_commit") not in (None, "unknown", config.get("GIT_COMMIT")):
             raise RuntimeError(f"Training commit differs from collection index: {checkpoint}")
         step = int(metadata["nominal_env_step"])
-        if step < 1 or step > int(profile["TOTAL_TIMESTEPS"]):
+        if step < 1 or step > checkpoint_budget:
             raise RuntimeError(f"Invalid nominal checkpoint step: {checkpoint}")
         if step not in by_step or checkpoint.name == "final":
             by_step[step] = checkpoint
-    budget = int(profile["TOTAL_TIMESTEPS"])
-    if budget not in by_step or by_step[budget].name != "final" or len(by_step) < 5:
+    if (checkpoint_budget not in by_step or by_step[checkpoint_budget].name != "final"
+            or len(by_step) < 5):
         raise RuntimeError(f"Need final and five distinct checkpoints: {parent}")
     return [(step, by_step[step]) for step in sorted(by_step)[-5:]]
 
@@ -163,9 +176,9 @@ def prepare(root: Path, output: Path) -> tuple[dict, dict, list[previous.EvalJob
                         100_000 + 100 * seed + checkpoint_index,
                     ))
             groups[method] = group
-        expected_steps = checkpoint_steps[task, "none", 1]
-        if any(steps != expected_steps for key, steps in checkpoint_steps.items() if key[0] == task):
-            raise RuntimeError(f"Last-five checkpoint steps are not matched in {task}")
+        for seed in SEEDS:
+            if checkpoint_steps[task, "none", seed] != checkpoint_steps[task, "actor_score_recovery", seed]:
+                raise RuntimeError(f"Paired last-five checkpoint steps differ in {task}/seed{seed}")
         shared_steps = set.intersection(*step_sets)
         if (len(shared_steps) < max(3, (max(map(len, step_sets)) + 1) // 2)
                 or max(shared_steps, default=0)
@@ -236,6 +249,11 @@ def report(args: argparse.Namespace) -> Path:
     for row in summary:
         row["selection_metric"] = "frozen from first four-panel selection; not reselected on 10 seeds"
         row["source_code_cohort"] = "historical seeds 1-4; current-code extension seeds 5-10"
+        step_sets = {
+            checkpoint_steps[row["task"], row["condition"], seed] for seed in SEEDS
+        }
+        if len(step_sets) > 1:
+            row["final_checkpoint_steps"] = "varies slightly by code cohort; see seed_level_all_tasks.csv"
     for row in seeds:
         method = "none" if row["condition"] == "none" else "arec"
         entry = entries[row["task"], method, int(row["seed"])]
@@ -286,6 +304,7 @@ def report(args: argparse.Namespace) -> Path:
         "bootstrap_seed": args.bootstrap_seed,
         "bootstrap_resamples": args.bootstrap_samples,
         "code_cohort_warning": "Historical seeds 1-4 and extension seeds 5-10 use different code commits; matched effective YAML configs, not a bitwise homogeneous replay",
+        "checkpoint_step_warning": "Historical final checkpoints use the nominal task budget; extension final checkpoints use the last complete rollout (within one rollout block of nominal). Each none/ARec seed pair is matched at the same five checkpoint steps.",
         "selection_warning": "Settings were chosen using the original four seeds, which are included in this ten-seed report; inference is partly selection-biased",
         "figure_contract": {
             "claim": "Compare frozen ARec and isolated NPS MAPPO across four tasks and ten paired seeds",
@@ -313,7 +332,9 @@ def report(args: argparse.Namespace) -> Path:
         "Hyperparameters were selected on historical seeds 1-4, "
         "which are included here; seeds 5-10 use a later code commit with the "
         "same effective frozen configurations. Comparisons are therefore partly "
-        "selection-biased and not a bitwise homogeneous-code replication.\n",
+        "selection-biased and not a bitwise homogeneous-code replication. "
+        "Extension final checkpoints are at the last complete rollout, slightly before "
+        "the nominal budget; each same-seed method pair uses matching checkpoint steps.\n",
         encoding="utf-8",
     )
     print(figure.with_suffix(".png"), flush=True)
