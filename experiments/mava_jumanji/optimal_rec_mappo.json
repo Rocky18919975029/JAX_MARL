@@ -1,0 +1,51 @@
+{
+  "source": "Sable benchmark optimal-hyperparams/onpolicy_params.csv, rec_mappo rows; https://sites.google.com/view/sable-marl",
+  "source_csv_sha256": "de6774cf4d08f5bd6db875156544c992fbb65f187b860dec8a94781f5bb2f606",
+  "mava_commit": "9f67e612654ecb7b7d45ff8052ce9ccfc6c68d93",
+  "common": {
+    "arch.num_envs": 64,
+    "system.update_batch_size": 2,
+    "system.rollout_length": 128,
+    "system.num_updates": 1220,
+    "arch.num_evaluation": 122,
+    "arch.num_eval_episodes": 32,
+    "arch.num_absolute_metric_eval_episodes": 320,
+    "arch.absolute_metric": true,
+    "system.gamma": 0.99,
+    "system.gae_lambda": 0.9,
+    "system.vf_coef": 0.5,
+    "system.add_agent_id": true
+  },
+  "tasks": {
+    "lbf_15x15-4p-5f": {
+      "env": "lbf",
+      "scenario": "15x15-4p-5f",
+      "num_agents": 4,
+      "optimal": {
+        "system.num_minibatches": 2,
+        "system.max_grad_norm": 10.0,
+        "system.ppo_epochs": 4,
+        "system.clip_eps": 0.1,
+        "system.recurrent_chunk_size": 64,
+        "system.ent_coef": 0.01,
+        "system.critic_lr": 0.001,
+        "system.actor_lr": 0.001
+      }
+    },
+    "rware_large-8ag": {
+      "env": "rware",
+      "scenario": "large-8ag",
+      "num_agents": 8,
+      "optimal": {
+        "system.num_minibatches": 8,
+        "system.max_grad_norm": 10.0,
+        "system.ppo_epochs": 8,
+        "system.clip_eps": 0.05,
+        "system.recurrent_chunk_size": 8,
+        "system.ent_coef": 0.0,
+        "system.critic_lr": 0.0005,
+        "system.actor_lr": 0.0001
+      }
+    }
+  }
+}

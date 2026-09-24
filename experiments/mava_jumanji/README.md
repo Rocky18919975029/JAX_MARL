@@ -81,3 +81,63 @@ three-update smoke test.
 We verified one compiled learner update locally on both LBF and RWARE using
 the pinned Mava checkout. The server CUDA smoke and longer runs remain to be
 run by the user.
+
+## Paired high-agent benchmark experiment
+
+`run_matched_optimal.py` selects the largest-agent standard tasks in the
+downloaded [Sable benchmark optimal on-policy parameter table](
+https://sites.google.com/view/sable-marl): LBF `15x15-4p-5f` (4 agents) and
+RWARE `large-8ag` (8 agents). The former has `fov: 15` on a 15x15 grid, so do
+not describe it as a strongly partially observed LBF task. Its task-level
+recurrent MAPPO settings and RWARE's are transcribed into
+`optimal_rec_mappo.json`. Both conditions use the same scenario, network,
+training and evaluation settings for each task and seed. The **only**
+condition-specific changes are the ARec entry point and its four auxiliary
+settings. The baseline is upstream Mava's original `rec_mappo.py`.
+
+The common formal protocol is 64 environments per learner batch, 2 learner
+batches, 128 rollout steps, 1220 updates (19,988,480 environment steps per
+run), 122 evaluations and 32 episodes per evaluation. The remaining published
+task-level settings are in `optimal_rec_mappo.json`; the launcher records the
+complete resolved overrides, source hashes and Mava commit in a manifest.
+The ARec coefficient `1e-4` and head settings below come from the earlier
+wiring smoke, **not** from task-specific tuning. A same-seed paired comparison
+controls the MAPPO configuration; it does not make ARec tuned or guarantee a
+gain. The ARec run will consume more wall-clock compute for the same number
+of environment transitions.
+
+From the JaxMARL checkout on the server, after installing the two ARec files
+as above, run one-seed low-cost smoke for both tasks first:
+
+```bash
+unset LD_LIBRARY_PATH
+MAVA_ROOT=/home/data/zeshenghong/Mava
+SMOKE_ROOT=/home/data/zeshenghong/JaxMARL/mava_high_agent_paired/smoke_v1
+python experiments/mava_jumanji/run_matched_optimal.py run \
+  --mava-root "$MAVA_ROOT" --run-root "$SMOKE_ROOT" \
+  --seeds 1 --gpus 1 --max-runs-per-gpu 1 --smoke
+python experiments/mava_jumanji/run_matched_optimal.py status --run-root "$SMOKE_ROOT"
+```
+
+The smoke reduces environments, batches, epochs and updates for a quick
+integration check. It is **not** a sample of the formal optimal-protocol
+learning curve. Once all four smoke jobs show `COMPLETED`, run the 16 formal
+jobs (2 tasks × 2 conditions × 4 paired seeds):
+
+```bash
+RUN_ROOT=/home/data/zeshenghong/JaxMARL/mava_high_agent_paired/formal_4seed_v1
+mkdir -p "$RUN_ROOT"
+nohup python -u experiments/mava_jumanji/run_matched_optimal.py run \
+  --mava-root "$MAVA_ROOT" --run-root "$RUN_ROOT" \
+  --seeds 1-4 --gpus 0,1,2,3 --max-runs-per-gpu 1 \
+  > "$RUN_ROOT/launcher.stdout" 2>&1 &
+echo "Launcher PID: $!"
+watch -n 5 "python experiments/mava_jumanji/run_matched_optimal.py status --run-root '$RUN_ROOT'"
+```
+
+Results stay under `$RUN_ROOT/runs/<task>--<condition>--seedN/`, each worker's
+stdout/stderr under `logs/`, and per-run state under `status/`. The launcher
+orders jobs by seed, skips completed runs on restart, and continues after a
+failed run. Inspect that run's log; then rerun the same command with
+`--retry-failed` to retry failures without duplicating successful runs. Each
+worker sees one GPU, even when multiple workers are allowed per GPU.
