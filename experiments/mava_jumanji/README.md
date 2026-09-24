@@ -141,3 +141,31 @@ orders jobs by seed, skips completed runs on restart, and continues after a
 failed run. Inspect that run's log; then rerun the same command with
 `--retry-failed` to retry failures without duplicating successful runs. Each
 worker sees one GPU, even when multiple workers are allowed per GPU.
+
+## Live, four-seed return curves without W&B
+
+Mava's enabled JSON logger writes evaluation `mean_episode_return` and
+`step_count` under each run's `json/**/metrics.json`. To regenerate the plots
+from whatever evaluations have finished so far, use the **Mava virtual
+environment's Python** (it includes Matplotlib):
+
+```bash
+cd ~/JaxMARL
+RUN_ROOT=/home/data/zeshenghong/JaxMARL/mava_high_agent_paired/formal_4seed_v1
+MAVA_ROOT=/home/data/zeshenghong/Mava
+watch -n 30 -x "$MAVA_ROOT/.venv/bin/python" \
+  experiments/mava_jumanji/plot_matched_optimal_returns.py \
+  --run-root "$RUN_ROOT"
+```
+
+Each refresh atomically replaces `$RUN_ROOT/plots/mava-paired-return-4seed.png`,
+`.svg` and `.pdf`, and also writes the exact plotted points to `.csv` plus provenance
+and current seed counts to `.json`. `watch` shows text status in the terminal;
+open the PNG separately to see the image. This is a **pointwise**, unsmoothed
+95% percentile bootstrap over the four training seeds, using a fixed random
+seed and 10,000 resamples. Shading appears only at evaluation steps where
+all four seeds for that condition have a value. A faint line shows any
+incomplete-seed tail without CI; it is provisional. The two panels have
+separate return scales and should only be compared **within** a task. The
+plotter tolerates an occasional partially rewritten Mava JSON file and skips
+that run for one refresh rather than mixing attempts or inventing values.

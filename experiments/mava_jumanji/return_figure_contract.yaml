@@ -1,0 +1,74 @@
+claim: "Show the evolving, seed-aggregated evaluation return of paired recurrent MAPPO and ARec."
+five_second_takeaway: "Compare ARec with its task-matched recurrent MAPPO baseline without hiding incomplete seeds."
+audience: "MARL researchers monitoring the paired LBF and RWARE experiments"
+venue:
+  name: "live diagnostic, double-column export"
+  layout: "double-column"
+  target_width_mm: 178
+academic_style:
+  policy: "scientific-figure-design/assets/academic-style.yaml"
+  exceptions: []
+paper_palette:
+  path: ""
+  palette_id: "mava-paired-return-live-v1"
+  status: "diagnostic"
+  role_assignments:
+    ours: "#2563EB"
+    strong_baseline: "#374151"
+  cross_figure_audit_passed: false
+figure_archetype: "aligned training curves"
+comparison_objects: ["none: original recurrent MAPPO", "ARec: recurrent MAPPO plus score recovery"]
+agent_evolution:
+  enabled: false
+evidence:
+  data_sources: ["run-root/runs/<task>--<condition>--seedN/json/**/metrics.json"]
+  metrics: ["evaluation mean_episode_return", "environment step_count"]
+  uncertainty: "pointwise 95% percentile bootstrap over four training seeds; 10,000 seeded resamples"
+semantic_inventory:
+  entities: ["LBF 15x15-4p-5f", "RWARE large-8ag", "none", "ARec"]
+  transformations: ["exact-step alignment", "mean over available seeds", "seed bootstrap only at 4/4"]
+  states: ["four-seed complete", "provisional under four seeds"]
+  boundaries: ["one panel per task; no cross-task return-scale comparison"]
+  evidence: ["mean curves", "confidence bands", "n at latest point"]
+  relations: ["same-task, same-seed method contrast"]
+visual_anchor:
+  type: "named baseline"
+  label: "Original recurrent MAPPO (none)"
+reading_order: "LBF panel, then RWARE panel; within each, baseline versus ARec"
+panels:
+  - id: "a"
+    purpose: "LBF within-task comparison"
+  - id: "b"
+    purpose: "RWARE within-task comparison"
+semantic_encodings:
+  color:
+    none: "#374151"
+    arec: "#2563EB"
+  shape: {}
+  line_style:
+    none: "dashed"
+    arec: "solid"
+    provisional: "faint, without uncertainty band"
+icon_system:
+  enabled: false
+drawio:
+  enabled: false
+accessibility:
+  grayscale_redundancy: "none dashed; ARec solid"
+  color_vision_strategy: "different line style and explicit legend"
+provenance:
+  data: "Mava marl-eval JSON logs from the pinned recurrent MAPPO/ARec launcher"
+  visual_elements: "Matplotlib lines and bands only; no third-party imagery"
+deliverables:
+  editable_source: "plot_matched_optimal_returns.py"
+  drawio_source: ""
+  icon_manifest: ""
+  vector_master: "mava-paired-return-4seed.svg"
+  pdf_master: "mava-paired-return-4seed.pdf"
+  png_preview: "mava-paired-return-4seed.png"
+validation:
+  final_size_checked: true
+  grayscale_checked: true
+  five_second_test: "Which method has higher return within each task, and where is the four-seed interval available?"
+  caption_test: "Define tasks, methods, evaluation return, four-seed pointwise bootstrap and provisional tail."
+caption_draft: "On-policy evaluation return for recurrent MAPPO and ARec on LBF and RWARE. Solid/dashed curves are four-seed means with pointwise 95% seed-bootstrap intervals; faint tails use fewer than four seeds and have no intervals."
