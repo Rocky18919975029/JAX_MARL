@@ -47,7 +47,8 @@ verified, it refuses to launch rather than risking another experiment. The
 scheduler spreads a seed's runs across all selected GPUs before assigning a
 second run to any GPU, allows at most two per GPU, completes each seed's primary
 jobs before advancing, and defers failed jobs to one retry at the end of that
-seed. Re-running the launcher keeps completed results and resumes only gaps.
+seed. Re-running the launcher keeps completed results, stops verified orphaned
+workers in the replacement root, and restarts only incomplete runs.
 
 ```bash
 cd ~/JaxMARL
@@ -66,8 +67,8 @@ nohup python experiments/harl_dexhands/run_paper_madpo_matrix.py \
 watch -n 5 "python experiments/harl_dexhands/monitor.py --run-root '$DEX_PAPER48_ROOT'"
 ```
 
-Only run this once the GPUs are available for this grid; the launcher accounts
-for workers in the old and new roots but not unrelated GPU jobs. If W&B is not
+Only run this once the GPUs are available for this grid; the launcher stops
+workers in the old and new roots but does not manage unrelated GPU jobs. If W&B is not
 functional in `harl_dex`, add `--wandb-mode disabled` before the redirect; the
 launcher checks W&B before stopping any legacy process.
 

@@ -37,7 +37,6 @@ from experiments.harl_dexhands.run_matrix import (  # noqa: E402
     mark_failed,
     process_is_running,
     read_status,
-    running_gpu,
     training_environment,
     verify_wandb,
 )
@@ -163,6 +162,25 @@ def stop_legacy_worker(
             return True
         time.sleep(0.25)
     raise RuntimeError(f"Worker still live after SIGKILL: {name} pid={pid}")
+
+
+def stop_orphaned_new_workers(root: Path, tasks: list, *, dry_run: bool = False) -> int:
+    """On restart, stop verified workers left by the previous launcher."""
+    stopped = 0
+    for task in tasks:
+        path = root / "status" / f"{task.name}.json"
+        status = read_status(path)
+        if status.get("status") != "running":
+            continue
+        if dry_run:
+            if legacy_worker_is_live(task.name, status, root):
+                print(f"WOULD_STOP new pid={status['pid']} {task.name}", flush=True)
+            continue
+        if stop_legacy_worker(task.name, status, root):
+            stopped += 1
+        if read_status(path).get("status") != "completed":
+            mark_failed(path, task.name, "Interrupted before replacement launch")
+    return stopped
 
 
 def read_legacy_study(legacy_root: Path, config_hash: str) -> tuple[dict, list]:
@@ -374,7 +392,6 @@ def main() -> None:
             completed_source(task, legacy_root, legacy_budget)
             or read_status(status_path(task)).get("status") == "completed"
         )
-        external: dict[str, tuple[int, str, int]] = {}
         stopped_workers = 0
         for row in json.loads((legacy_root / "experiment_manifest.json").read_text())[
             "runs"
@@ -392,26 +409,14 @@ def main() -> None:
                 continue
             if stop_legacy_worker(row["run_name"], status, legacy_root):
                 stopped_workers += 1
-        for task in tasks:
-            status = read_status(status_path(task))
-            if status.get("status") != "running":
-                continue
-            gpu = running_gpu(
-                task.name,
-                status,
-                gpus,
-                expected_log=root / "logs" / f"{task.name}.log",
-            )
-            if gpu is not None:
-                external[task.name] = (status["pid"], gpu, task.seed)
-            elif not args.dry_run:
-                mark_failed(status_path(task), task.name, "Stale running worker")
+        stopped_new = stop_orphaned_new_workers(root, tasks, dry_run=args.dry_run)
 
         initial_reused = sum(
             completed_source(t, legacy_root, legacy_budget) for t in tasks
         )
         print(
             f"TOTAL=48 REUSED={initial_reused} STOPPED_OLD={stopped_workers} "
+            f"STOPPED_NEW={stopped_new} "
             f"NEW_OR_INCOMPLETE={sum(not completed(t) for t in tasks)}",
             flush=True,
         )
@@ -424,16 +429,6 @@ def main() -> None:
                 print(line, flush=True)
                 with launcher_log.open("a", encoding="utf-8") as file:
                     file.write(line + "\n")
-
-        for name, (pid, gpu, _seed) in external.items():
-            event(f"GPU {gpu} KEEP  {name} pid={pid}")
-
-        def refresh_external() -> None:
-            for name, (pid, gpu, _seed) in list(external.items()):
-                if process_is_running(pid):
-                    continue
-                del external[name]
-                event(f"GPU {gpu} RELEASE {name} pid={pid}")
 
         def run_one(task, gpu: str, retry: bool) -> None:
             command = [
@@ -521,16 +516,12 @@ def main() -> None:
         ) -> None:
             waiting = collections.deque(jobs)
             active = {}
-            while (
-                waiting or active or any(item[2] == seed for item in external.values())
-            ):
-                refresh_external()
+            while waiting or active:
                 for future in list(active):
                     if future.done():
                         future.result()
                         del active[future]
-                occupied = collections.Counter(item[1] for item in external.values())
-                occupied.update(gpu for _, gpu in active.values())
+                occupied = collections.Counter(gpu for _, gpu in active.values())
                 while waiting:
                     gpu = least_loaded_gpu(gpus, occupied, args.max_runs_per_gpu)
                     if gpu is None:
@@ -541,11 +532,7 @@ def main() -> None:
                     future = executor.submit(run_one, task, gpu, retry)
                     active[future] = (task, gpu)
                     occupied[gpu] += 1
-                if (
-                    waiting
-                    or active
-                    or any(item[2] == seed for item in external.values())
-                ):
+                if waiting or active:
                     if active:
                         wait(active, timeout=2, return_when=FIRST_COMPLETED)
                     else:
@@ -560,7 +547,6 @@ def main() -> None:
                     task
                     for task in cohort
                     if not completed(task)
-                    and task.name not in external
                     and (
                         args.dry_run
                         or read_status(status_path(task)).get("status") != "failed"
@@ -570,11 +556,7 @@ def main() -> None:
                 run_wave(seed, primary, False, executor)
                 if args.dry_run:
                     continue
-                deferred = [
-                    task
-                    for task in cohort
-                    if not completed(task) and task.name not in external
-                ]
+                deferred = [task for task in cohort if not completed(task)]
                 event(f"SEED {seed} deferred={len(deferred)}")
                 run_wave(seed, deferred, True, executor)
                 event(

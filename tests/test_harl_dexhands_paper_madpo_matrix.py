@@ -303,6 +303,87 @@ def test_legacy_worker_identity_uses_log_even_if_gpu_environment_is_empty(tmp_pa
         launcher.legacy_worker_is_live("happo-seed1", status, old, proc_root)
 
 
+def test_restart_stops_new_root_worker_without_gpu_environment(tmp_path, monkeypatch):
+    root = tmp_path / "new"
+    (root / "status").mkdir(parents=True)
+    task = task_matrix(("madpo",), (1,))[0]
+    path = root / "status" / f"{task.name}.json"
+    path.write_text(
+        json.dumps({"status": "running", "pid": 123, "run_name": task.name})
+    )
+    stopped = []
+    monkeypatch.setattr(
+        launcher,
+        "stop_legacy_worker",
+        lambda name, status, run_root: stopped.append((name, run_root)) or True,
+    )
+    assert launcher.stop_orphaned_new_workers(root, [task]) == 1
+    assert stopped == [(task.name, root)]
+    assert json.loads(path.read_text())["status"] == "failed"
+
+
+def test_relaunch_with_orphaned_new_worker_completes_matrix(tmp_path, monkeypatch):
+    old = make_legacy(tmp_path, complete_all_baselines=True)
+    new = tmp_path / "new"
+    (new / "status").mkdir(parents=True)
+    paper = launcher.madpo_paper_settings()["algo"]
+    orphan = task_matrix(
+        ("madpo",),
+        (1,),
+        div_coef=paper["div_coef"],
+        div_weight=paper["div_weight"],
+        div_sigma=paper["div_sigma"],
+        div_max_samples=paper["div_max_samples"],
+    )[0]
+    (new / "status" / f"{orphan.name}.json").write_text(
+        json.dumps({"status": "running", "pid": 123, "run_name": orphan.name})
+    )
+    stopped = []
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        name = command[command.index("--run-name") + 1]
+        calls.append(name)
+        path = new / "status" / f"{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"status": "completed", "run_name": name}))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(
+        launcher,
+        "stop_legacy_worker",
+        lambda name, status, run_root: stopped.append(name) or True,
+    )
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(launcher.__file__),
+            "--legacy-run-root",
+            str(old),
+            "--run-root",
+            str(new),
+            "--gpus",
+            "0,1,2,3",
+            "--max-runs-per-gpu",
+            "2",
+            "--wandb-mode",
+            "disabled",
+        ],
+    )
+    launcher.main()
+    assert stopped == [orphan.name]
+    assert len(calls) == 16
+    assert (
+        sum(row["status"] == "completed" for row in monitor.load_manifest_rows(new))
+        == 48
+    )
+    assert (
+        new / "failed_attempts" / orphan.name / "attempt_01" / "status.json"
+    ).is_file()
+
+
 def test_launcher_process_matching_is_exact(tmp_path):
     old = tmp_path / "study"
     other = tmp_path / "other"
