@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import subprocess
@@ -49,14 +50,18 @@ def main() -> None:
     parser.add_argument(
         "--algorithm", choices=("happo", "mappo", "madpo"), required=True
     )
+    parser.add_argument(
+        "--madpo-profile", choices=("legacy", "paper2024"), default="legacy"
+    )
+    parser.add_argument("--madpo-paper-config-sha256")
     parser.add_argument("--condition", choices=("none", "arec"), default="none")
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--num-env-steps", type=int)
     parser.add_argument("--n-rollout-threads", type=int)
-    parser.add_argument("--div-coef", type=float, default=1000.0)
-    parser.add_argument("--div-weight", type=float, default=0.05)
-    parser.add_argument("--div-sigma", type=float, default=1.0)
-    parser.add_argument("--div-max-samples", type=int, default=1024)
+    parser.add_argument("--div-coef", type=float)
+    parser.add_argument("--div-weight", type=float)
+    parser.add_argument("--div-sigma", type=float)
+    parser.add_argument("--div-max-samples", type=int)
     parser.add_argument("--arec-coef", type=float, default=0.0001)
     parser.add_argument("--arec-q-steps", type=int, default=4)
     parser.add_argument("--arec-q-lr", type=float, default=0.001)
@@ -79,6 +84,34 @@ def main() -> None:
         raise FileNotFoundError(
             "Initialize third_party/HARL and its DexHands dependency"
         )
+    from experiments.harl_dexhands.protocol import (
+        MADPO_PAPER_CONFIG,
+        madpo_paper_settings,
+    )
+
+    if args.algorithm == "madpo" and args.madpo_profile == "paper2024":
+        actual_hash = hashlib.sha256(MADPO_PAPER_CONFIG.read_bytes()).hexdigest()
+        if (
+            args.madpo_paper_config_sha256 is not None
+            and actual_hash != args.madpo_paper_config_sha256
+        ):
+            raise RuntimeError(
+                "MADPO paper profile changed after the launcher froze the manifest"
+            )
+
+    div_defaults = (
+        madpo_paper_settings()["algo"]
+        if args.algorithm == "madpo" and args.madpo_profile == "paper2024"
+        else {
+            "div_coef": 1000.0,
+            "div_weight": 0.05,
+            "div_sigma": 1.0,
+            "div_max_samples": 1024,
+        }
+    )
+    for key in ("div_coef", "div_weight", "div_sigma", "div_max_samples"):
+        if getattr(args, key) is None:
+            setattr(args, key, div_defaults[key])
     if args.seed < 0 or args.div_max_samples < 2:
         raise ValueError("Invalid seed or divergence sample count")
     if args.run_name is None:
@@ -122,6 +155,7 @@ def main() -> None:
         div_weight=args.div_weight,
         div_sigma=args.div_sigma,
         div_max_samples=args.div_max_samples,
+        madpo_profile=args.madpo_profile,
         condition=args.condition,
         arec_coef=args.arec_coef,
         arec_q_steps=args.arec_q_steps,
@@ -142,6 +176,16 @@ def main() -> None:
         "seed": args.seed,
         "source_config": str(config_path),
         "source_config_algorithm": "happo",
+        **({"madpo_profile": args.madpo_profile} if args.algorithm == "madpo" else {}),
+        **(
+            {
+                "madpo_paper_config_sha256": hashlib.sha256(
+                    MADPO_PAPER_CONFIG.read_bytes()
+                ).hexdigest()
+            }
+            if args.algorithm == "madpo" and args.madpo_profile == "paper2024"
+            else {}
+        ),
         "madpo_reference_repository": "https://github.com/hwdou6677/MADPO",
         "madpo_reference_commit": MADPO_REFERENCE_COMMIT,
         "jaxmarl_git_commit": _commit(REPO_ROOT),

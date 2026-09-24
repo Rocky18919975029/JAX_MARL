@@ -135,6 +135,8 @@ class ProtocolTests(unittest.TestCase):
                 str(harl_root),
                 "--algorithms",
                 "happo,mappo,madpo",
+                "--madpo-profile",
+                "legacy",
                 "--conditions",
                 "none,arec",
                 "--seeds",
@@ -152,6 +154,10 @@ class ProtocolTests(unittest.TestCase):
             manifest = json.loads((root / "experiment_manifest.json").read_text())
             self.assertEqual(len(manifest["runs"]), 48)
             self.assertEqual(manifest["study_spec"]["arec_coefs"], [3e-5, 1e-4, 3e-4])
+            automatic_resume = [
+                "auto" if value == "legacy" else value for value in command
+            ]
+            subprocess.run(automatic_resume, check=True, capture_output=True, text=True)
             self.assertEqual(output.stdout.count("--arec-coef 3e-05"), 12)
             self.assertEqual(output.stdout.count("--arec-coef 0.0001"), 24)
             self.assertEqual(output.stdout.count("--arec-coef 0.0003"), 12)
@@ -218,17 +224,31 @@ class ProtocolTests(unittest.TestCase):
                 return types.SimpleNamespace(returncode=int(failed_once))
 
             arguments = [
-                "run_matrix.py", "--run-root", str(root),
-                "--harl-root", str(harl_root),
-                "--algorithms", "happo,mappo,madpo",
-                "--conditions", "none,arec",
-                "--seeds", "1-2",
-                "--arec-coefs", "0.00003,0.0001,0.0003",
-                "--gpus", "0", "--max-runs-per-gpu", "1",
-                "--wandb-mode", "disabled",
+                "run_matrix.py",
+                "--run-root",
+                str(root),
+                "--harl-root",
+                str(harl_root),
+                "--algorithms",
+                "happo,mappo,madpo",
+                "--madpo-profile",
+                "legacy",
+                "--conditions",
+                "none,arec",
+                "--seeds",
+                "1-2",
+                "--arec-coefs",
+                "0.00003,0.0001,0.0003",
+                "--gpus",
+                "0",
+                "--max-runs-per-gpu",
+                "1",
+                "--wandb-mode",
+                "disabled",
             ]
-            with patch.object(sys, "argv", arguments), patch.object(
-                launcher.subprocess, "run", side_effect=fake_worker
+            with (
+                patch.object(sys, "argv", arguments),
+                patch.object(launcher.subprocess, "run", side_effect=fake_worker),
             ):
                 launcher.main()
 
@@ -242,8 +262,12 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(all(seed == 1 for seed, _, _ in invocation_order[:13]))
             failed_run = "HARL-ShadowHandOver-nps-happo-seed1"
             archive = root / "failed_attempts" / failed_run / "attempt_01"
-            self.assertEqual(json.loads((archive / "status.json").read_text())["status"], "failed")
-            self.assertEqual((archive / "metrics.jsonl").read_text(), '{"attempt": 1}\n')
+            self.assertEqual(
+                json.loads((archive / "status.json").read_text())["status"], "failed"
+            )
+            self.assertEqual(
+                (archive / "metrics.jsonl").read_text(), '{"attempt": 1}\n'
+            )
             self.assertEqual(
                 (root / "metrics" / f"{failed_run}.jsonl").read_text(),
                 '{"attempt": 2}\n',
@@ -267,7 +291,9 @@ class ProtocolTests(unittest.TestCase):
             (proc / "environ").write_bytes(b"CUDA_VISIBLE_DEVICES=3\0")
             status = {"status": "running", "pid": 1234}
             self.assertEqual(
-                launcher.running_gpu(run_name, status, ("0", "1", "2", "3"), Path(directory)),
+                launcher.running_gpu(
+                    run_name, status, ("0", "1", "2", "3"), Path(directory)
+                ),
                 "3",
             )
             with self.assertRaisesRegex(RuntimeError, "different title"):
@@ -286,14 +312,20 @@ class ProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "runs"
             harl_root = Path(directory) / "harl"
-            config = harl_root / "tuned_configs/dexhands/ShadowHandOver/happo/config.json"
+            config = (
+                harl_root / "tuned_configs/dexhands/ShadowHandOver/happo/config.json"
+            )
             config.parent.mkdir(parents=True)
-            config.write_text(json.dumps({"algo_args": {"train": {"num_env_steps": 2400}}}))
+            config.write_text(
+                json.dumps({"algo_args": {"train": {"num_env_steps": 2400}}})
+            )
             external_name = "HARL-ShadowHandOver-nps-happo-seed2"
             external_status = root / "status" / f"{external_name}.json"
             external_status.parent.mkdir(parents=True)
             external_status.write_text(
-                json.dumps({"run_name": external_name, "status": "running", "pid": 1234})
+                json.dumps(
+                    {"run_name": external_name, "status": "running", "pid": 1234}
+                )
             )
             done = threading.Event()
             starts = []
@@ -312,19 +344,36 @@ class ProtocolTests(unittest.TestCase):
                 return types.SimpleNamespace(returncode=0)
 
             arguments = [
-                "run_matrix.py", "--run-root", str(root),
-                "--harl-root", str(harl_root),
-                "--algorithms", "happo", "--conditions", "none",
-                "--seeds", "1-2", "--gpus", "0", "--max-runs-per-gpu", "1",
-                "--wandb-mode", "disabled",
+                "run_matrix.py",
+                "--run-root",
+                str(root),
+                "--harl-root",
+                str(harl_root),
+                "--algorithms",
+                "happo",
+                "--conditions",
+                "none",
+                "--madpo-profile",
+                "legacy",
+                "--seeds",
+                "1-2",
+                "--gpus",
+                "0",
+                "--max-runs-per-gpu",
+                "1",
+                "--wandb-mode",
+                "disabled",
             ]
             timer = threading.Timer(0.05, finish_external)
-            with patch.object(sys, "argv", arguments), patch.object(
-                launcher, "running_gpu", return_value="0"
-            ), patch.object(
-                launcher, "process_is_running", side_effect=lambda _pid: not done.is_set()
-            ), patch.object(
-                launcher.subprocess, "run", side_effect=fake_worker
+            with (
+                patch.object(sys, "argv", arguments),
+                patch.object(launcher, "running_gpu", return_value="0"),
+                patch.object(
+                    launcher,
+                    "process_is_running",
+                    side_effect=lambda _pid: not done.is_set(),
+                ),
+                patch.object(launcher.subprocess, "run", side_effect=fake_worker),
             ):
                 timer.start()
                 try:

@@ -84,11 +84,12 @@ def load_manifest_rows(root: Path) -> list[dict]:
     budget = int(manifest["study_spec"]["num_env_steps"])
     rows = []
     for run in manifest["runs"]:
+        run_budget = int(run.get("num_env_steps", budget))
         name = run["run_name"]
         path = root / "status" / f"{name}.json"
         if not path.is_file():
             rows.append(
-                {"name": name, "status": "pending", "steps": 0, "total": budget}
+                {"name": name, "status": "pending", "steps": 0, "total": run_budget}
             )
             continue
         try:
@@ -96,7 +97,7 @@ def load_manifest_rows(root: Path) -> list[dict]:
         except (OSError, ValueError):
             payload = {}
         state = str(payload.get("status", "unknown"))
-        total = int(payload.get("total_env_steps", budget))
+        total = int(payload.get("total_env_steps", run_budget))
         steps = total if state == "completed" else int(payload.get("env_steps", 0))
         rows.append({"name": name, "status": state, "steps": steps, "total": total})
     return rows

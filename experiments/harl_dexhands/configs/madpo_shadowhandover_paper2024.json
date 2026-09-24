@@ -1,0 +1,28 @@
+{
+  "profile": "paper2024",
+  "paper": "https://proceedings.neurips.cc/paper_files/paper/2024/file/8bb7d93ee3ce2c75da68ebeb51508111-Paper-Conference.pdf",
+  "repository": "https://github.com/hwdou6677/MADPO",
+  "repository_commit": "0596056312f52a3183676c471ffdd4638b59d63c",
+  "provenance_note": "Table 3 supplies Bi-DexHands training settings and Table 4 supplies ShadowHandOver lambda and kernel sigma. The MADPO repository only publishes generic madpo.yaml: div_coef=1000 is retained from it. The 4000-sample CCSD cap is our bounded-memory interpretation of the paper's batch-size=4000, not an upstream config key.",
+  "train": {
+    "num_env_steps": 40000000,
+    "n_rollout_threads": 128,
+    "episode_length": 75
+  },
+  "model": {
+    "activation_func": "relu",
+    "hidden_sizes": [256, 256, 256],
+    "gain": 0.01,
+    "lr": 0.0005,
+    "critic_lr": 0.0005
+  },
+  "algo": {
+    "gamma": 0.99,
+    "ppo_epoch": 5,
+    "clip_param": 0.2,
+    "div_weight": 0.2,
+    "div_sigma": 500.0,
+    "div_coef": 1000.0,
+    "div_max_samples": 4000
+  }
+}

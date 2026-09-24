@@ -13,6 +13,18 @@ ALGORITHMS = ("happo", "mappo", "madpo")
 CONDITIONS = ("none", "arec")
 PROTOCOL_VERSION = "harl-dexhands-shadowhandover-v1.0"
 AREC_PROTOCOL_VERSION = "harl-dexhands-shadowhandover-arec-v1.0"
+MADPO_PAPER_PROFILE = "paper2024"
+MADPO_PAPER_CONFIG = (
+    Path(__file__).resolve().parent / "configs" / "madpo_shadowhandover_paper2024.json"
+)
+
+
+def madpo_paper_settings() -> dict:
+    """Paper task settings overlaid on the pinned HARL environment config."""
+    payload = json.loads(MADPO_PAPER_CONFIG.read_text(encoding="utf-8"))
+    if payload["profile"] != MADPO_PAPER_PROFILE:
+        raise ValueError("Unexpected MADPO paper profile")
+    return payload
 
 
 def number_label(value: float) -> str:
@@ -70,10 +82,11 @@ def load_matched_config(
     *,
     num_env_steps: int | None = None,
     n_rollout_threads: int | None = None,
-    div_coef: float = 1000.0,
-    div_weight: float = 0.05,
-    div_sigma: float = 1.0,
-    div_max_samples: int = 1024,
+    div_coef: float | None = None,
+    div_weight: float | None = None,
+    div_sigma: float | None = None,
+    div_max_samples: int | None = None,
+    madpo_profile: str = "legacy",
     condition: str = "none",
     arec_coef: float = 0.0001,
     arec_q_steps: int = 4,
@@ -92,6 +105,12 @@ def load_matched_config(
         raise ValueError("Source config must be HARL HAPPO on DexHands")
     if env_args.get("task") != "ShadowHandOver":
         raise ValueError("Source config must be ShadowHandOver")
+    if madpo_profile not in ("legacy", MADPO_PAPER_PROFILE):
+        raise ValueError(f"Unknown MADPO profile {madpo_profile!r}")
+    if algorithm == "madpo" and madpo_profile == MADPO_PAPER_PROFILE:
+        paper = madpo_paper_settings()
+        for section in ("train", "model", "algo"):
+            algo_args[section].update(paper[section])
 
     main_args["algo"] = algorithm
     main_args["env"] = "dexhands"
@@ -106,12 +125,25 @@ def load_matched_config(
     if n_rollout_threads is not None:
         algo_args["train"]["n_rollout_threads"] = int(n_rollout_threads)
     if algorithm == "madpo":
+        defaults = algo_args["algo"]
         algo_args["algo"].update(
             {
-                "div_coef": float(div_coef),
-                "div_weight": float(div_weight),
-                "div_sigma": float(div_sigma),
-                "div_max_samples": int(div_max_samples),
+                "div_coef": float(
+                    defaults.get("div_coef", 1000.0) if div_coef is None else div_coef
+                ),
+                "div_weight": float(
+                    defaults.get("div_weight", 0.05)
+                    if div_weight is None
+                    else div_weight
+                ),
+                "div_sigma": float(
+                    defaults.get("div_sigma", 1.0) if div_sigma is None else div_sigma
+                ),
+                "div_max_samples": int(
+                    defaults.get("div_max_samples", 1024)
+                    if div_max_samples is None
+                    else div_max_samples
+                ),
                 "div_epsilon": 1e-8,
             }
         )

@@ -24,6 +24,17 @@ TRAIN_SCRIPT = REPO_ROOT / "experiments" / "harl_dexhands" / "train.py"
 OFFICIAL_CONFIG = Path("tuned_configs/dexhands/ShadowHandOver/happo/config.json")
 
 
+def resolve_madpo_profile(root: Path, requested: str) -> str:
+    """New studies use paper settings; frozen older studies keep their protocol."""
+    if requested != "auto":
+        return requested
+    manifest = root / "experiment_manifest.json"
+    if manifest.is_file():
+        spec = json.loads(manifest.read_text(encoding="utf-8"))["study_spec"]
+        return spec.get("madpo_profile", "legacy")
+    return "paper2024"
+
+
 def training_environment(gpu: str) -> dict[str, str]:
     """Build an Isaac Gym child environment from the active Python runtime."""
 
@@ -56,7 +67,12 @@ def verify_wandb() -> None:
         )
 
 
-def freeze_manifest(root: Path, study_spec: dict, tasks: list) -> dict:
+def freeze_manifest(
+    root: Path,
+    study_spec: dict,
+    tasks: list,
+    budget_by_algorithm: dict[str, int] | None = None,
+) -> dict:
     """Record the exact grid and reject accidental changes on resume."""
     path = root / "experiment_manifest.json"
     payload = {
@@ -69,6 +85,11 @@ def freeze_manifest(root: Path, study_spec: dict, tasks: list) -> dict:
                 "condition": task.condition,
                 "seed": task.seed,
                 "arec_coef": task.arec_coef if task.condition == "arec" else 0.0,
+                **(
+                    {"num_env_steps": budget_by_algorithm[task.algorithm]}
+                    if budget_by_algorithm is not None
+                    else {}
+                ),
             }
             for task in tasks
         ],
@@ -106,7 +127,9 @@ def process_is_running(pid: int, proc_root: Path = Path("/proc")) -> bool:
 
 
 def running_gpu(
-    run_name: str, status: dict, gpus: tuple[str, ...],
+    run_name: str,
+    status: dict,
+    gpus: tuple[str, ...],
     proc_root: Path = Path("/proc"),
     expected_log: Path | None = None,
 ) -> str | None:
@@ -121,13 +144,17 @@ def running_gpu(
         command = proc.joinpath("cmdline").read_bytes()
         environment = proc.joinpath("environ").read_bytes().split(b"\0")
     except OSError as error:
-        raise RuntimeError(f"Cannot inspect live worker {run_name} pid={pid}") from error
+        raise RuntimeError(
+            f"Cannot inspect live worker {run_name} pid={pid}"
+        ) from error
     # HARL may replace argv with a process title; stdout still points to this
     # run's launcher log, which provides a second exact identity check.
     log_matches = False
     if expected_log is not None:
         try:
-            log_matches = proc.joinpath("fd", "1").resolve(strict=True) == expected_log.resolve()
+            log_matches = (
+                proc.joinpath("fd", "1").resolve(strict=True) == expected_log.resolve()
+            )
         except OSError:
             pass
     if run_name.encode() not in command and not log_matches:
@@ -135,8 +162,11 @@ def running_gpu(
             f"Status says {run_name} is running at pid={pid}, but the live process "
             "has a different title and stdout log; refusing to risk a duplicate launch"
         )
-    devices = [item.split(b"=", 1)[1].decode() for item in environment
-               if item.startswith(b"CUDA_VISIBLE_DEVICES=")]
+    devices = [
+        item.split(b"=", 1)[1].decode()
+        for item in environment
+        if item.startswith(b"CUDA_VISIBLE_DEVICES=")
+    ]
     if len(devices) != 1 or devices[0] not in gpus:
         raise RuntimeError(
             f"Live worker {run_name} pid={pid} uses GPU {devices!r}; "
@@ -189,10 +219,13 @@ def main() -> None:
     parser.add_argument("--max-runs-per-gpu", type=int, default=1)
     parser.add_argument("--num-env-steps", type=int)
     parser.add_argument("--n-rollout-threads", type=int)
-    parser.add_argument("--div-coef", type=float, default=1000.0)
-    parser.add_argument("--div-weight", type=float, default=0.05)
-    parser.add_argument("--div-sigma", type=float, default=1.0)
-    parser.add_argument("--div-max-samples", type=int, default=1024)
+    parser.add_argument(
+        "--madpo-profile", choices=("auto", "legacy", "paper2024"), default="auto"
+    )
+    parser.add_argument("--div-coef", type=float)
+    parser.add_argument("--div-weight", type=float)
+    parser.add_argument("--div-sigma", type=float)
+    parser.add_argument("--div-max-samples", type=int)
     coefficient_group = parser.add_mutually_exclusive_group()
     coefficient_group.add_argument("--arec-coef", type=float, default=0.0001)
     coefficient_group.add_argument("--arec-coefs")
@@ -211,7 +244,9 @@ def main() -> None:
         ALGORITHMS,
         AREC_PROTOCOL_VERSION,
         CONDITIONS,
+        MADPO_PAPER_CONFIG,
         PROTOCOL_VERSION,
+        madpo_paper_settings,
         parse_csv,
         parse_positive_floats,
         parse_seeds,
@@ -243,6 +278,28 @@ def main() -> None:
         verify_wandb()
     root = args.run_root.expanduser().resolve()
     harl_root = args.harl_root.expanduser().resolve()
+    madpo_profile = resolve_madpo_profile(root, args.madpo_profile)
+    paper_settings = madpo_paper_settings() if madpo_profile == "paper2024" else None
+    div_defaults = (
+        paper_settings["algo"]
+        if paper_settings is not None
+        else {
+            "div_coef": 1000.0,
+            "div_weight": 0.05,
+            "div_sigma": 1.0,
+            "div_max_samples": 1024,
+        }
+    )
+    for key in ("div_coef", "div_weight", "div_sigma", "div_max_samples"):
+        if getattr(args, key) is None:
+            setattr(args, key, div_defaults[key])
+    if (
+        args.div_coef < 0
+        or not 0 <= args.div_weight <= 1
+        or args.div_sigma <= 0
+        or args.div_max_samples < 2
+    ):
+        raise ValueError("Invalid MADPO divergence settings")
     root.mkdir(parents=True, exist_ok=True)
     (root / "logs").mkdir(parents=True, exist_ok=True)
     tasks = task_matrix(
@@ -275,27 +332,66 @@ def main() -> None:
     protocol_version = (
         AREC_PROTOCOL_VERSION if "arec" in conditions else PROTOCOL_VERSION
     )
+    paper_budget = (
+        int(paper_settings["train"]["num_env_steps"])
+        if paper_settings
+        else official_budget
+    )
+    budget_by_algorithm = (
+        {
+            algorithm: args.num_env_steps
+            or (paper_budget if algorithm == "madpo" else official_budget)
+            for algorithm in algorithms
+        }
+        if madpo_profile == "paper2024"
+        else None
+    )
+    study_spec = {
+        "protocol_version": protocol_version,
+        "algorithms": list(algorithms),
+        "conditions": list(conditions),
+        "seeds": list(seeds),
+        "arec_coefs": list(arec_coefs),
+        "arec_q_steps": args.arec_q_steps,
+        "arec_q_lr": args.arec_q_lr,
+        "arec_fisher_ridge": args.arec_fisher_ridge,
+        "div_coef": args.div_coef,
+        "div_weight": args.div_weight,
+        "div_sigma": args.div_sigma,
+        "div_max_samples": args.div_max_samples,
+        "num_env_steps": args.num_env_steps or official_budget,
+        "n_rollout_threads": args.n_rollout_threads,
+        "harl_root": str(harl_root),
+        "official_config_sha256": config_hash,
+    }
+    if madpo_profile == "paper2024":
+        study_spec.update(
+            {
+                "madpo_profile": madpo_profile,
+                "madpo_paper_config_sha256": hashlib.sha256(
+                    MADPO_PAPER_CONFIG.read_bytes()
+                ).hexdigest(),
+                "num_env_steps_by_algorithm": budget_by_algorithm,
+                "n_rollout_threads_by_algorithm": {
+                    algorithm: args.n_rollout_threads
+                    or (
+                        int(paper_settings["train"]["n_rollout_threads"])
+                        if algorithm == "madpo"
+                        else int(
+                            json.loads(config_path.read_text())["algo_args"][
+                                "train"
+                            ].get("n_rollout_threads", 0)
+                        )
+                    )
+                    for algorithm in algorithms
+                },
+            }
+        )
     freeze_manifest(
         root,
-        {
-            "protocol_version": protocol_version,
-            "algorithms": list(algorithms),
-            "conditions": list(conditions),
-            "seeds": list(seeds),
-            "arec_coefs": list(arec_coefs),
-            "arec_q_steps": args.arec_q_steps,
-            "arec_q_lr": args.arec_q_lr,
-            "arec_fisher_ridge": args.arec_fisher_ridge,
-            "div_coef": args.div_coef,
-            "div_weight": args.div_weight,
-            "div_sigma": args.div_sigma,
-            "div_max_samples": args.div_max_samples,
-            "num_env_steps": args.num_env_steps or official_budget,
-            "n_rollout_threads": args.n_rollout_threads,
-            "harl_root": str(harl_root),
-            "official_config_sha256": config_hash,
-        },
+        study_spec,
         tasks,
+        budget_by_algorithm,
     )
 
     lock_path = root / ".launcher.lock"
@@ -310,6 +406,7 @@ def main() -> None:
 
     def status_path(task) -> Path:
         return root / "status" / f"{task.name}.json"
+
     external: dict[str, tuple[int, str, int]] = {}
     if not args.dry_run:
         for task in tasks:
@@ -317,19 +414,23 @@ def main() -> None:
             if status.get("status") != "running":
                 continue
             gpu = running_gpu(
-                task.name, status, gpus,
+                task.name,
+                status,
+                gpus,
                 expected_log=root / "logs" / f"{task.name}.log",
             )
             if gpu is None:
                 mark_failed(
-                    status_path(task), task.name,
+                    status_path(task),
+                    task.name,
                     f"Stale running status: pid={status.get('pid')} is no longer alive",
                 )
             else:
                 external[task.name] = (status["pid"], gpu, task.seed)
 
     pending = [
-        task for task in tasks
+        task
+        for task in tasks
         if read_status(status_path(task)).get("status") != "completed"
     ]
     print(
@@ -360,30 +461,57 @@ def main() -> None:
             del external[name]
             path = root / "status" / f"{name}.json"
             if read_status(path).get("status") == "running":
-                mark_failed(path, name, f"Existing worker pid={pid} exited without final status")
+                mark_failed(
+                    path, name, f"Existing worker pid={pid} exited without final status"
+                )
             event(f"GPU {gpu} RELEASE {name} pid={pid}")
 
     def run_one(task, gpu: str, retry: bool) -> int:
         command = [
             sys.executable,
             str(TRAIN_SCRIPT),
-            "--harl-root", str(harl_root),
-            "--run-root", str(root),
-            "--run-name", task.name,
-            "--algorithm", task.algorithm,
-            "--condition", task.condition,
-            "--seed", str(task.seed),
-            "--div-coef", str(args.div_coef),
-            "--div-weight", str(args.div_weight),
-            "--div-sigma", str(args.div_sigma),
-            "--div-max-samples", str(args.div_max_samples),
-            "--arec-coef", str(task.arec_coef),
-            "--arec-q-steps", str(args.arec_q_steps),
-            "--arec-q-lr", str(args.arec_q_lr),
-            "--arec-fisher-ridge", str(args.arec_fisher_ridge),
-            "--wandb-project", args.wandb_project,
-            "--wandb-mode", args.wandb_mode,
+            "--harl-root",
+            str(harl_root),
+            "--run-root",
+            str(root),
+            "--run-name",
+            task.name,
+            "--algorithm",
+            task.algorithm,
+            "--condition",
+            task.condition,
+            "--seed",
+            str(task.seed),
+            "--div-coef",
+            str(args.div_coef),
+            "--div-weight",
+            str(args.div_weight),
+            "--div-sigma",
+            str(args.div_sigma),
+            "--div-max-samples",
+            str(args.div_max_samples),
+            "--arec-coef",
+            str(task.arec_coef),
+            "--arec-q-steps",
+            str(args.arec_q_steps),
+            "--arec-q-lr",
+            str(args.arec_q_lr),
+            "--arec-fisher-ridge",
+            str(args.arec_fisher_ridge),
+            "--wandb-project",
+            args.wandb_project,
+            "--wandb-mode",
+            args.wandb_mode,
         ]
+        if task.algorithm == "madpo":
+            command.extend(["--madpo-profile", madpo_profile])
+            if madpo_profile == "paper2024":
+                command.extend(
+                    [
+                        "--madpo-paper-config-sha256",
+                        study_spec["madpo_paper_config_sha256"],
+                    ]
+                )
         if args.num_env_steps is not None:
             command.extend(["--num-env-steps", str(args.num_env_steps)])
         if args.n_rollout_threads is not None:
@@ -408,7 +536,8 @@ def main() -> None:
             code = result.returncode
             if read_status(status_path(task)).get("status") != "completed":
                 mark_failed(
-                    status_path(task), task.name,
+                    status_path(task),
+                    task.name,
                     f"Worker exited with code {code} without completed status",
                 )
         except Exception as error:
@@ -418,7 +547,9 @@ def main() -> None:
         event(f"GPU {gpu} END   {task.name} status={code}")
         return code
 
-    def run_wave(seed: int, jobs: list, retry: bool, executor: ThreadPoolExecutor) -> None:
+    def run_wave(
+        seed: int, jobs: list, retry: bool, executor: ThreadPoolExecutor
+    ) -> None:
         waiting = collections.deque(jobs)
         active = {}
         while waiting or active or any(item[2] == seed for item in external.values()):
@@ -448,7 +579,8 @@ def main() -> None:
         for seed in seeds:
             cohort = [task for task in tasks if task.seed == seed]
             primary = [
-                task for task in cohort
+                task
+                for task in cohort
                 if read_status(status_path(task)).get("status") != "completed"
                 and (
                     args.dry_run
@@ -458,21 +590,27 @@ def main() -> None:
                     )
                 )
             ]
-            event(f"SEED {seed} primary={len(primary)} existing={sum(item[2] == seed for item in external.values())}")
+            event(
+                f"SEED {seed} primary={len(primary)} existing={sum(item[2] == seed for item in external.values())}"
+            )
             run_wave(seed, primary, False, executor)
             if args.dry_run:
                 continue
             failed = [
-                task for task in cohort
+                task
+                for task in cohort
                 if read_status(status_path(task)).get("status") == "failed"
             ]
             event(f"SEED {seed} retry={len(failed)}")
             run_wave(seed, failed, True, executor)
             incomplete = [
-                task.name for task in cohort
+                task.name
+                for task in cohort
                 if read_status(status_path(task)).get("status") != "completed"
             ]
-            event(f"SEED {seed} finished completed={len(cohort)-len(incomplete)}/{len(cohort)}")
+            event(
+                f"SEED {seed} finished completed={len(cohort)-len(incomplete)}/{len(cohort)}"
+            )
 
     if args.dry_run:
         event("dry-run finished")
@@ -481,7 +619,9 @@ def main() -> None:
     states = collections.Counter(
         read_status(status_path(task)).get("status", "pending") for task in tasks
     )
-    pending_count = len(tasks) - states["completed"] - states["failed"] - states["running"]
+    pending_count = (
+        len(tasks) - states["completed"] - states["failed"] - states["running"]
+    )
     event(
         f"matrix finished; completed={states['completed']} "
         f"failed={states['failed']} running={states['running']} "

@@ -91,6 +91,94 @@ def test_config_changes_only_algorithm_specific_madpo_fields(tmp_path):
     assert configs["madpo"][1]["algo"]["div_max_samples"] == 1024
 
 
+def test_paper_profile_changes_madpo_only(tmp_path):
+    protocol = load(PROTOCOL, "test_dex_paper_config")
+    source = (
+        ROOT
+        / "third_party"
+        / "HARL"
+        / "tuned_configs"
+        / "dexhands"
+        / "ShadowHandOver"
+        / "happo"
+        / "config.json"
+    )
+    for algorithm in ("happo", "mappo"):
+        old = protocol.load_matched_config(source, algorithm, 7, tmp_path)
+        new = protocol.load_matched_config(
+            source, algorithm, 7, tmp_path, madpo_profile="paper2024"
+        )
+        assert old == new
+    _, algo, env = protocol.load_matched_config(
+        source, "madpo", 7, tmp_path, madpo_profile="paper2024"
+    )
+    assert env["task"] == "ShadowHandOver"
+    assert algo["train"]["num_env_steps"] == 40_000_000
+    assert algo["train"]["n_rollout_threads"] == 128
+    assert algo["train"]["episode_length"] == 75
+    assert algo["model"]["hidden_sizes"] == [256, 256, 256]
+    assert algo["algo"]["gamma"] == 0.99
+    assert algo["algo"]["div_weight"] == 0.2
+    assert algo["algo"]["div_sigma"] == 500.0
+    assert algo["algo"]["div_coef"] == 1000.0
+    assert algo["algo"]["div_max_samples"] == 4000
+
+
+def test_new_study_uses_paper_profile_and_legacy_study_is_resumable(tmp_path):
+    launcher = load(RUN_MATRIX, "test_dex_profile_resolution")
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    assert launcher.resolve_madpo_profile(new_root, "auto") == "paper2024"
+    old_root.mkdir()
+    (old_root / "experiment_manifest.json").write_text(
+        json.dumps({"study_spec": {"protocol_version": "old"}})
+    )
+    assert launcher.resolve_madpo_profile(old_root, "auto") == "legacy"
+    command = [
+        sys.executable,
+        str(RUN_MATRIX),
+        "--run-root",
+        str(new_root),
+        "--algorithms",
+        "mappo,madpo",
+        "--conditions",
+        "none,arec",
+        "--seeds",
+        "1",
+        "--gpus",
+        "0",
+        "--wandb-mode",
+        "disabled",
+        "--dry-run",
+    ]
+    result = __import__("subprocess").run(
+        command, check=True, capture_output=True, text=True
+    )
+    manifest = json.loads((new_root / "experiment_manifest.json").read_text())
+    spec = manifest["study_spec"]
+    assert spec["madpo_profile"] == "paper2024"
+    assert spec["num_env_steps_by_algorithm"] == {
+        "mappo": 50_000_000,
+        "madpo": 40_000_000,
+    }
+    assert spec["n_rollout_threads_by_algorithm"] == {"mappo": 256, "madpo": 128}
+    assert len(spec["madpo_paper_config_sha256"]) == 64
+    assert "madpo-div1000-w0p2-sig500-k4000" in result.stdout
+    assert "mappo-arec" in result.stdout
+    assert "--madpo-profile paper2024" in result.stdout
+    monitor = load(
+        ROOT / "experiments/harl_dexhands/monitor.py", "test_dex_paper_monitor"
+    )
+    rows = monitor.load_manifest_rows(new_root)
+    assert {row["total"] for row in rows if "-madpo-" in row["name"]} == {40_000_000}
+    assert {row["total"] for row in rows if "-mappo-" in row["name"]} == {50_000_000}
+    changed = __import__("subprocess").run(
+        command + ["--madpo-profile", "legacy"], capture_output=True, text=True
+    )
+    assert changed.returncode != 0
+    assert "manifest differs" in changed.stderr
+
+
 def test_import_order_and_reference_policy_safety_are_explicit():
     train_source = TRAIN.read_text(encoding="utf-8")
     assert train_source.index("import isaacgym") < train_source.index(

@@ -1,9 +1,58 @@
 # ShadowHandOver: matched HAPPO, MAPPO, MADPO, and actor-side score recovery
 
-This extension keeps `third_party/HARL` unchanged. All three algorithms use the
-official HARL `ShadowHandOver/happo/config.json` protocol with NPS actors; only
-the actor update rule changes. Consequently, MAPPO and MADPO are matched-
-protocol variants, not separately tuned official configurations.
+This extension keeps `third_party/HARL` unchanged. HAPPO and MAPPO retain the
+existing official HARL `ShadowHandOver/happo/config.json` protocol with NPS
+actors. In a **new run root**, MADPO defaults to the separately documented
+`paper2024` profile in
+`configs/madpo_shadowhandover_paper2024.json`; the old 48-run root retains its
+frozen `legacy` profile and can be resumed without changing any of its runs.
+The runner infers `legacy` for pre-existing manifests and rejects a changed
+profile in the same run root. No MAPPO training setting is altered.
+
+MADPO's paper Appendix Tables 3–4 report ShadowHandOver `lambda=0.2` and
+Gaussian-kernel `sigma=500`, plus ReLU, gamma 0.99, 128 rollout threads,
+75-step episodes, 256×3 MLP, five PPO epochs, clip 0.2, and 5e-4 actor/critic
+learning rates. These override the HAPPO training/model fields **for MADPO
+only**. The generic MADPO repository config supplies the 40M-step budget and
+the separate divergence multiplier `div_coef=1000`; it does not publish a
+task-specific JSON. We use a bounded 4000-sample CCSD estimator corresponding
+to the paper's reported batch size. This is a documented integration choice,
+not a claim of bit-exact reproduction: the paper writes a `1/sigma` divergence
+coefficient, whereas the repository exposes both a kernel `sigma` and a
+separate `div_coef`. The checked-in profile records that distinction.
+
+Inspect the resolved, frozen run protocol with
+`python experiments/harl_dexhands/monitor.py --run-root "$RUN_ROOT"`; the
+manifest records both the upstream HARL config hash and the paper-profile hash.
+
+### Separate MADPO paper-profile comparison
+
+Use a **new** data-disk run root. Smoke-test both the MADPO baseline and its
+ARec variant at one full rollout with the actual 128-thread and 4000-sample
+settings before scheduling full training. Do not run this while the existing
+Isaac Gym grid occupies the same GPUs.
+
+```bash
+cd ~/JaxMARL
+git pull --ff-only
+conda activate harl_dex
+unset LD_LIBRARY_PATH
+export DEX_MADPO_PAPER_SMOKE=/home/data/zeshenghong/JaxMARL/harl_dexhands_shadowhandover/madpo_paper2024_smoke_v1
+python experiments/harl_dexhands/run_matrix.py --run-root "$DEX_MADPO_PAPER_SMOKE" --algorithms madpo --conditions none,arec --seeds 1 --madpo-profile paper2024 --arec-coef 0.0001 --num-env-steps 9600 --gpus 0,1 --max-runs-per-gpu 1 --wandb-mode disabled
+python experiments/harl_dexhands/monitor.py --run-root "$DEX_MADPO_PAPER_SMOKE"
+```
+
+For the full four-seed comparison, use another root and omit the budget/thread
+overrides: MADPO uses 40M steps and 128 rollout threads, while a mixed matrix
+would keep the old HAPPO/MAPPO settings. The ARec and `none` MADPO runs use
+the identical MADPO profile within each seed.
+
+```bash
+export DEX_MADPO_PAPER_ROOT=/home/data/zeshenghong/JaxMARL/harl_dexhands_shadowhandover/madpo_paper2024_arec_4seed_v1
+mkdir -p "$DEX_MADPO_PAPER_ROOT"
+nohup python experiments/harl_dexhands/run_matrix.py --run-root "$DEX_MADPO_PAPER_ROOT" --algorithms madpo --conditions none,arec --seeds 1-4 --madpo-profile paper2024 --arec-coefs 0.00003,0.0001,0.0003 --gpus 0,1,2,3 --max-runs-per-gpu 2 --wandb-project harl-dexhands-shadowhandover-madpo-paper2024 > "$DEX_MADPO_PAPER_ROOT/launcher.stdout" 2>&1 &
+watch -n 5 "python experiments/harl_dexhands/monitor.py --run-root '$DEX_MADPO_PAPER_ROOT'"
+```
 
 ## MADPO implementation notes
 
@@ -16,8 +65,7 @@ divergence but fixes four integration hazards in the reference repository:
 - only CCSD is subsampled before its quadratic Gram matrices are constructed.
 
 PPO still sees the complete rollout minibatch. `div_max_samples` therefore
-controls the divergence estimator only and does not change the shared PPO
-optimization protocol.
+controls the divergence estimator only and does not change PPO optimization.
 
 ## Actor-side score recovery (ARec)
 
@@ -60,7 +108,7 @@ git pull --ff-only
 conda activate harl_dex
 unset LD_LIBRARY_PATH
 export DEX_AREC_SMOKE_ROOT=/home/data/zeshenghong/JaxMARL/harl_dexhands_shadowhandover/arec_smoke_v1
-python experiments/harl_dexhands/run_matrix.py --run-root "$DEX_AREC_SMOKE_ROOT" --algorithms happo,mappo,madpo --conditions none,arec --seeds 1 --gpus 0,1,2 --max-runs-per-gpu 1 --n-rollout-threads 16 --num-env-steps 2400 --div-max-samples 256 --arec-coef 0.0001 --arec-q-steps 4 --arec-q-lr 0.001 --arec-fisher-ridge 0.001 --wandb-mode disabled
+python experiments/harl_dexhands/run_matrix.py --run-root "$DEX_AREC_SMOKE_ROOT" --algorithms happo,mappo,madpo --madpo-profile legacy --conditions none,arec --seeds 1 --gpus 0,1,2 --max-runs-per-gpu 1 --n-rollout-threads 16 --num-env-steps 2400 --div-max-samples 256 --arec-coef 0.0001 --arec-q-steps 4 --arec-q-lr 0.001 --arec-fisher-ridge 0.001 --wandb-mode disabled
 ```
 
 Monitor the exact six names with the same ARec and MADPO arguments:
@@ -76,6 +124,8 @@ must be smoke-tested on the server.
 
 ### First four-seed λ grid: 48 runs
 
+The following earlier 48-run recipe is the **legacy matched-protocol study**;
+its existing run root must not be reused for the paper-profile MADPO study.
 After the six-run smoke test, compare each of the three original algorithms
 against ARec at `λ ∈ {3e-5, 1e-4, 3e-4}`. Thus each seed has three `none`
 baselines and nine ARec runs. All other ARec settings are fixed. Omitting the
@@ -94,7 +144,7 @@ completed runs. Earlier failed logs and metrics are archived under
 ```bash
 export DEX_AREC_GRID_ROOT=/home/data/zeshenghong/JaxMARL/harl_dexhands_shadowhandover/arec_lambda_grid_4seed_v1
 mkdir -p "$DEX_AREC_GRID_ROOT"
-nohup python experiments/harl_dexhands/run_matrix.py --run-root "$DEX_AREC_GRID_ROOT" --algorithms happo,mappo,madpo --conditions none,arec --seeds 1-4 --arec-coefs 0.00003,0.0001,0.0003 --arec-q-steps 4 --arec-q-lr 0.001 --arec-fisher-ridge 0.001 --gpus 0,1,2,3 --max-runs-per-gpu 2 --wandb-project harl-dexhands-shadowhandover-arec-grid4seed > "$DEX_AREC_GRID_ROOT/launcher.stdout" 2>&1 &
+nohup python experiments/harl_dexhands/run_matrix.py --run-root "$DEX_AREC_GRID_ROOT" --algorithms happo,mappo,madpo --madpo-profile legacy --conditions none,arec --seeds 1-4 --arec-coefs 0.00003,0.0001,0.0003 --arec-q-steps 4 --arec-q-lr 0.001 --arec-fisher-ridge 0.001 --gpus 0,1,2,3 --max-runs-per-gpu 2 --wandb-project harl-dexhands-shadowhandover-arec-grid4seed > "$DEX_AREC_GRID_ROOT/launcher.stdout" 2>&1 &
 echo "Launcher PID: $!"
 ```
 
