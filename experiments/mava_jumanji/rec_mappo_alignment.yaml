@@ -1,0 +1,16 @@
+defaults:
+  - logger: logger
+  - arch: anakin
+  - system: ppo/rec_mappo
+  - network: rnn
+  - env: rware
+  - _self_
+
+align:
+  distance: ln_mse # ln_mse | linear_cka
+  coef: 0.01
+  epsilon: 1.0e-8
+
+hydra:
+  searchpath:
+    - file://mava/configs
