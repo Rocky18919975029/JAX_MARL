@@ -267,43 +267,7 @@ def test_only_missing_baselines_are_launched_and_resume_is_idempotent(
     assert len(calls) == 40
 
 
-def test_worker_stop_requires_verified_identity_and_uses_sigterm(tmp_path, monkeypatch):
-    old = tmp_path / "legacy"
-    old.mkdir()
-    status = {"status": "running", "pid": 123, "run_name": "happo-seed1"}
-    checks = iter([True, True, False])
-    signals = []
-    monkeypatch.setattr(
-        launcher, "legacy_worker_is_live", lambda *_args, **_kwargs: next(checks)
-    )
-    monkeypatch.setattr(
-        launcher.os, "kill", lambda pid, sig: signals.append((pid, sig))
-    )
-    assert launcher.stop_legacy_worker("happo-seed1", status, old)
-    assert signals == [(123, launcher.signal.SIGTERM)]
-
-
-def test_legacy_worker_identity_uses_log_even_if_gpu_environment_is_empty(tmp_path):
-    old = tmp_path / "legacy"
-    log = old / "logs" / "happo-seed1.log"
-    log.parent.mkdir(parents=True)
-    log.write_text("")
-    proc_root = tmp_path / "proc"
-    proc = proc_root / "123"
-    (proc / "fd").mkdir(parents=True)
-    (proc / "stat").write_text("123 (happo-seed1) S 0 0 0\n")
-    (proc / "cmdline").write_bytes(b"happo-seed1\0")
-    (proc / "environ").write_bytes(b"")
-    (proc / "fd" / "1").symlink_to(log)
-    status = {"status": "running", "pid": 123, "run_name": "happo-seed1"}
-    assert launcher.legacy_worker_is_live("happo-seed1", status, old, proc_root)
-    (proc / "fd" / "1").unlink()
-    (proc / "fd" / "1").symlink_to(tmp_path / "unrelated.log")
-    with pytest.raises(RuntimeError, match="refusing to signal"):
-        launcher.legacy_worker_is_live("happo-seed1", status, old, proc_root)
-
-
-def test_restart_stops_new_root_worker_without_gpu_environment(tmp_path, monkeypatch):
+def test_restart_marks_dead_running_status_for_later_retry(tmp_path, monkeypatch):
     root = tmp_path / "new"
     (root / "status").mkdir(parents=True)
     task = task_matrix(("madpo",), (1,))[0]
@@ -311,15 +275,23 @@ def test_restart_stops_new_root_worker_without_gpu_environment(tmp_path, monkeyp
     path.write_text(
         json.dumps({"status": "running", "pid": 123, "run_name": task.name})
     )
-    stopped = []
-    monkeypatch.setattr(
-        launcher,
-        "stop_legacy_worker",
-        lambda name, status, run_root: stopped.append((name, run_root)) or True,
-    )
-    assert launcher.stop_orphaned_new_workers(root, [task]) == 1
-    assert stopped == [(task.name, root)]
+    monkeypatch.setattr(launcher, "process_is_running", lambda pid: False)
+    assert launcher.mark_interrupted_workers(root, [task]) == 1
     assert json.loads(path.read_text())["status"] == "failed"
+
+
+def test_restart_refuses_live_running_worker_without_signaling(tmp_path, monkeypatch):
+    root = tmp_path / "new"
+    (root / "status").mkdir(parents=True)
+    task = task_matrix(("madpo",), (1,))[0]
+    path = root / "status" / f"{task.name}.json"
+    path.write_text(
+        json.dumps({"status": "running", "pid": 123, "run_name": task.name})
+    )
+    monkeypatch.setattr(launcher, "process_is_running", lambda pid: True)
+    with pytest.raises(RuntimeError, match="live PID 123"):
+        launcher.mark_interrupted_workers(root, [task])
+    assert json.loads(path.read_text())["status"] == "running"
 
 
 def test_relaunch_with_orphaned_new_worker_completes_matrix(tmp_path, monkeypatch):
@@ -338,7 +310,6 @@ def test_relaunch_with_orphaned_new_worker_completes_matrix(tmp_path, monkeypatc
     (new / "status" / f"{orphan.name}.json").write_text(
         json.dumps({"status": "running", "pid": 123, "run_name": orphan.name})
     )
-    stopped = []
     calls = []
 
     def fake_run(command, **_kwargs):
@@ -349,11 +320,7 @@ def test_relaunch_with_orphaned_new_worker_completes_matrix(tmp_path, monkeypatc
         path.write_text(json.dumps({"status": "completed", "run_name": name}))
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(
-        launcher,
-        "stop_legacy_worker",
-        lambda name, status, run_root: stopped.append(name) or True,
-    )
+    monkeypatch.setattr(launcher, "process_is_running", lambda pid: False)
     monkeypatch.setattr(launcher.subprocess, "run", fake_run)
     monkeypatch.setattr(
         sys,
@@ -373,7 +340,6 @@ def test_relaunch_with_orphaned_new_worker_completes_matrix(tmp_path, monkeypatc
         ],
     )
     launcher.main()
-    assert stopped == [orphan.name]
     assert len(calls) == 16
     assert (
         sum(row["status"] == "completed" for row in monitor.load_manifest_rows(new))
@@ -382,22 +348,3 @@ def test_relaunch_with_orphaned_new_worker_completes_matrix(tmp_path, monkeypatc
     assert (
         new / "failed_attempts" / orphan.name / "attempt_01" / "status.json"
     ).is_file()
-
-
-def test_launcher_process_matching_is_exact(tmp_path):
-    old = tmp_path / "study"
-    other = tmp_path / "other"
-    proc = tmp_path / "proc"
-    (proc / "100").mkdir(parents=True)
-    (proc / "101").mkdir()
-    (proc / "100" / "cmdline").write_bytes(
-        b"python\0experiments/harl_dexhands/run_matrix.py\0--run-root\0"
-        + str(old).encode()
-        + b"\0"
-    )
-    (proc / "101" / "cmdline").write_bytes(
-        b"python\0experiments/harl_dexhands/run_matrix.py\0--run-root\0"
-        + str(other).encode()
-        + b"\0"
-    )
-    assert launcher.legacy_launcher_pids(old, proc_root=proc) == [100]

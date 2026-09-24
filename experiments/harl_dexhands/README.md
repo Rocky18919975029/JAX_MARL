@@ -35,20 +35,17 @@ steps), while MADPO uses the paper profile (40M steps). The new manifest records
 the original manifest hash and each reused run's source. The monitor resolves
 those references, so the new root shows all 48 logical runs.
 
-On launch it acquires locks for both roots. If the old grid launcher still
-holds the legacy lock, the replacement stops only the exact `run_matrix.py`
-process whose `--run-root` matches the old directory, then waits for the lock.
-Before starting any training, it verifies the recorded PID, run name, and
-run-specific stdout log for every live legacy worker and terminates it
-(including any old-profile MADPO worker). Isaac Gym may erase the visible GPU
-environment from `/proc`, so worker termination does not depend on that field.
-A dry run never stops processes. If process identity cannot be
-verified, it refuses to launch rather than risking another experiment. The
+On launch it acquires locks for both roots. Stop the old launcher and any
+in-flight workers before starting the replacement: this launcher never sends
+signals to them. A completed status is skipped. A failed status is skipped in
+the seed's primary wave and retried once after its other runs. A `running`
+status whose PID has exited is marked interrupted and handled as failed; a
+still-live PID causes an explicit error rather than a duplicate launch. The
 scheduler spreads a seed's runs across all selected GPUs before assigning a
 second run to any GPU, allows at most two per GPU, completes each seed's primary
 jobs before advancing, and defers failed jobs to one retry at the end of that
-seed. Re-running the launcher keeps completed results, stops verified orphaned
-workers in the replacement root, and restarts only incomplete runs.
+seed. Re-running the launcher keeps completed results and starts only incomplete
+runs.
 
 ```bash
 cd ~/JaxMARL
@@ -67,8 +64,8 @@ nohup python experiments/harl_dexhands/run_paper_madpo_matrix.py \
 watch -n 5 "python experiments/harl_dexhands/monitor.py --run-root '$DEX_PAPER48_ROOT'"
 ```
 
-Only run this once the GPUs are available for this grid; the launcher stops
-workers in the old and new roots but does not manage unrelated GPU jobs. If W&B is not
+Only run this once the GPUs are available for this grid; the launcher does not
+stop or manage GPU workers. If W&B is not
 functional in `harl_dex`, add `--wandb-mode disabled` before the redirect; the
 launcher checks W&B before stopping any legacy process.
 

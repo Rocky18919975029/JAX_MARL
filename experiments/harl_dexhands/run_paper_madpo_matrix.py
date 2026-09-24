@@ -13,8 +13,6 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
-import os
-import signal
 import subprocess
 import sys
 import threading
@@ -42,145 +40,24 @@ from experiments.harl_dexhands.run_matrix import (  # noqa: E402
 )
 
 
-def legacy_launcher_pids(
-    legacy_root: Path, proc_root: Path = Path("/proc")
-) -> list[int]:
-    """Find only a legacy matrix launcher with the exact frozen run root."""
-    matches = []
-    for proc in proc_root.iterdir():
-        if not proc.name.isdecimal():
-            continue
-        try:
-            argv = [
-                part.decode()
-                for part in (proc / "cmdline").read_bytes().split(b"\0")
-                if part
-            ]
-        except (OSError, UnicodeDecodeError):
-            continue
-        if not any(
-            arg.endswith("experiments/harl_dexhands/run_matrix.py") for arg in argv
-        ):
-            continue
-        for index, arg in enumerate(argv[:-1]):
-            if (
-                arg == "--run-root"
-                and Path(argv[index + 1]).expanduser().resolve() == legacy_root
-            ):
-                matches.append(int(proc.name))
-                break
-    return matches
-
-
-def stop_legacy_launcher(legacy_root: Path, lock_path: Path, timeout: float = 20.0):
-    """Stop the old scheduler only; workers are inspected separately below."""
-    candidates = legacy_launcher_pids(legacy_root)
-    if len(candidates) != 1:
-        raise RuntimeError(
-            f"Legacy launcher lock is held, but found {len(candidates)} exact launcher "
-            f"processes ({candidates}); stop it manually before retrying"
-        )
-    pid = candidates[0]
-    # A second exact process check narrows the PID-reuse window before signaling.
-    if pid not in legacy_launcher_pids(legacy_root):
-        raise RuntimeError("Legacy launcher changed during preflight; retry")
-    print(f"Stopping legacy scheduler pid={pid} for {legacy_root}", flush=True)
-    os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        stream = lock_path.open("a+")
-        try:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return stream
-        except BlockingIOError:
-            stream.close()
-            time.sleep(0.25)
-    raise RuntimeError(f"Legacy launcher did not release {lock_path} after SIGTERM")
-
-
-def legacy_worker_is_live(
-    name: str, status: dict, legacy_root: Path, proc_root: Path = Path("/proc")
-) -> bool:
-    """Verify a legacy worker without relying on mutable /proc environment data."""
-    if status.get("status") != "running":
-        return False
-    if status.get("run_name") != name:
-        raise RuntimeError(f"Legacy status has a different run name: {name}")
-    pid = status.get("pid")
-    if not isinstance(pid, int) or pid <= 0 or not process_is_running(pid, proc_root):
-        return False
-    proc = proc_root / str(pid)
-    expected_log = legacy_root / "logs" / f"{name}.log"
-    try:
-        log_matches = (proc / "fd" / "1").resolve(strict=True) == expected_log.resolve(
-            strict=True
-        )
-    except OSError:
-        log_matches = False
-    if log_matches:
-        return True
-    try:
-        argv = (proc / "cmdline").read_bytes().split(b"\0")
-    except OSError as error:
-        raise RuntimeError(
-            f"Cannot inspect live legacy worker {name} pid={pid}"
-        ) from error
-    if (
-        name.encode() in argv
-        and any(arg.endswith(b"experiments/harl_dexhands/train.py") for arg in argv)
-        and str(legacy_root).encode() in argv
-    ):
-        return True
-    raise RuntimeError(
-        f"Legacy status points to live pid={pid}, but its log and command do not "
-        f"identify {name}; refusing to signal that PID"
-    )
-
-
-def stop_legacy_worker(
-    name: str, status: dict, legacy_root: Path, *, timeout: float = 20.0
-) -> bool:
-    """Terminate only a live worker whose run-specific identity was verified."""
-    if not legacy_worker_is_live(name, status, legacy_root):
-        return False
-    pid = int(status["pid"])
-    if not legacy_worker_is_live(name, status, legacy_root):
-        return True
-    print(f"Stopping legacy worker pid={pid} {name}", flush=True)
-    os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not legacy_worker_is_live(name, status, legacy_root):
-            return True
-        time.sleep(0.25)
-    # Never send SIGKILL to an unverified or recycled PID.
-    if not legacy_worker_is_live(name, status, legacy_root):
-        return True
-    os.kill(pid, signal.SIGKILL)
-    for _ in range(40):
-        if not legacy_worker_is_live(name, status, legacy_root):
-            return True
-        time.sleep(0.25)
-    raise RuntimeError(f"Worker still live after SIGKILL: {name} pid={pid}")
-
-
-def stop_orphaned_new_workers(root: Path, tasks: list, *, dry_run: bool = False) -> int:
-    """On restart, stop verified workers left by the previous launcher."""
-    stopped = 0
+def mark_interrupted_workers(root: Path, tasks: list, *, dry_run: bool = False) -> int:
+    """Classify stale running statuses; never signal a training process."""
+    interrupted = 0
     for task in tasks:
         path = root / "status" / f"{task.name}.json"
         status = read_status(path)
         if status.get("status") != "running":
             continue
-        if dry_run:
-            if legacy_worker_is_live(task.name, status, root):
-                print(f"WOULD_STOP new pid={status['pid']} {task.name}", flush=True)
-            continue
-        if stop_legacy_worker(task.name, status, root):
-            stopped += 1
-        if read_status(path).get("status") != "completed":
-            mark_failed(path, task.name, "Interrupted before replacement launch")
-    return stopped
+        pid = status.get("pid")
+        if isinstance(pid, int) and pid > 0 and process_is_running(pid):
+            raise RuntimeError(
+                f"Run {task.name} still has a live PID {pid}; stop it before "
+                "restarting this launcher"
+            )
+        interrupted += 1
+        if not dry_run:
+            mark_failed(path, task.name, "Previous worker exited before completion")
+    return interrupted
 
 
 def read_legacy_study(legacy_root: Path, config_hash: str) -> tuple[dict, list]:
@@ -371,17 +248,7 @@ def main() -> None:
     (root / "logs").mkdir(parents=True, exist_ok=True)
     launcher_lock = _lock(root / ".launcher.lock", "Replacement")
     try:
-        try:
-            legacy_lock = _lock(legacy_root / ".launcher.lock", "Legacy")
-        except RuntimeError:
-            if args.dry_run:
-                raise RuntimeError(
-                    "Dry-run will not stop the active legacy launcher; run without --dry-run "
-                    "to perform the requested replacement"
-                )
-            legacy_lock = stop_legacy_launcher(
-                legacy_root, legacy_root / ".launcher.lock"
-            )
+        legacy_lock = _lock(legacy_root / ".launcher.lock", "Legacy")
     except BaseException:
         launcher_lock.close()
         raise
@@ -392,31 +259,13 @@ def main() -> None:
             completed_source(task, legacy_root, legacy_budget)
             or read_status(status_path(task)).get("status") == "completed"
         )
-        stopped_workers = 0
-        for row in json.loads((legacy_root / "experiment_manifest.json").read_text())[
-            "runs"
-        ]:
-            status = read_status(legacy_root / "status" / f"{row['run_name']}.json")
-            if status.get("status") != "running":
-                continue
-            if not legacy_worker_is_live(row["run_name"], status, legacy_root):
-                continue
-            if args.dry_run:
-                print(
-                    f"WOULD_STOP legacy pid={status['pid']} {row['run_name']}",
-                    flush=True,
-                )
-                continue
-            if stop_legacy_worker(row["run_name"], status, legacy_root):
-                stopped_workers += 1
-        stopped_new = stop_orphaned_new_workers(root, tasks, dry_run=args.dry_run)
+        interrupted_new = mark_interrupted_workers(root, tasks, dry_run=args.dry_run)
 
         initial_reused = sum(
             completed_source(t, legacy_root, legacy_budget) for t in tasks
         )
         print(
-            f"TOTAL=48 REUSED={initial_reused} STOPPED_OLD={stopped_workers} "
-            f"STOPPED_NEW={stopped_new} "
+            f"TOTAL=48 REUSED={initial_reused} INTERRUPTED_NEW={interrupted_new} "
             f"NEW_OR_INCOMPLETE={sum(not completed(t) for t in tasks)}",
             flush=True,
         )
