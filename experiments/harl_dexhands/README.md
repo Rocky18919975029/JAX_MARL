@@ -83,9 +83,13 @@ budget/thread overrides restores the official HAPPO protocol (50M environment
 steps, 256 rollout threads); MAPPO and MADPO still inherit that matched
 protocol, not their own tuned configs. This grid is expensive. Cap concurrency
 at **two runs per GPU** (eight across four GPUs); do not reuse the four-runs-per-
-GPU SMAX setting for Isaac Gym. The launcher stops dispatching
-new tasks after the first failure, and an identical restart resumes completed
-runs from the frozen manifest.
+GPU SMAX setting for Isaac Gym. The launcher works one seed cohort at a time:
+it runs that seed's pending experiments, retries each failed experiment once
+after the other experiments in that seed, then advances to the next seed.
+A failed worker never stops dispatching the remaining matrix. On restart it
+keeps already-running workers alive, reserves their GPU slots, and skips all
+completed runs. Earlier failed logs and metrics are archived under
+`failed_attempts/` so retries start with clean metrics.
 
 ```bash
 export DEX_AREC_GRID_ROOT=/home/data/zeshenghong/JaxMARL/harl_dexhands_shadowhandover/arec_lambda_grid_4seed_v1

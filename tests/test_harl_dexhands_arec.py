@@ -182,9 +182,13 @@ class ProtocolTests(unittest.TestCase):
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("limited to two concurrent runs per GPU", rejected.stderr)
 
-    def test_launcher_stops_dispatch_after_first_failure(self):
+    def test_launcher_completes_each_seed_and_retries_failures_without_stopping(self):
         import tempfile
 
+        launcher = load(
+            ROOT / "experiments/harl_dexhands/run_matrix.py",
+            "test_dex_arec_failure_continuation",
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "runs"
             harl_root = Path(directory) / "harl"
@@ -195,34 +199,140 @@ class ProtocolTests(unittest.TestCase):
             config.write_text(
                 json.dumps({"algo_args": {"train": {"num_env_steps": 2400}}})
             )
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(ROOT / "experiments/harl_dexhands/run_matrix.py"),
-                    "--run-root",
-                    str(root),
-                    "--harl-root",
-                    str(harl_root),
-                    "--algorithms",
-                    "happo,mappo,madpo",
-                    "--conditions",
-                    "none,arec",
-                    "--seeds",
-                    "1",
-                    "--arec-coefs",
-                    "0.00003,0.0001,0.0003",
-                    "--gpus",
-                    "0",
-                    "--wandb-mode",
-                    "disabled",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            self.assertNotEqual(result.returncode, 0)
+            attempts = {}
+            invocation_order = []
+
+            def fake_worker(command, **_kwargs):
+                name = command[command.index("--run-name") + 1]
+                seed = int(command[command.index("--seed") + 1])
+                attempts[name] = attempts.get(name, 0) + 1
+                invocation_order.append((seed, name, attempts[name]))
+                failed_once = name.endswith("happo-seed1") and attempts[name] == 1
+                state = "failed" if failed_once else "completed"
+                status = root / "status" / f"{name}.json"
+                status.parent.mkdir(parents=True, exist_ok=True)
+                status.write_text(json.dumps({"run_name": name, "status": state}))
+                metric = root / "metrics" / f"{name}.jsonl"
+                metric.parent.mkdir(parents=True, exist_ok=True)
+                metric.write_text('{"attempt": %d}\n' % attempts[name])
+                return types.SimpleNamespace(returncode=int(failed_once))
+
+            arguments = [
+                "run_matrix.py", "--run-root", str(root),
+                "--harl-root", str(harl_root),
+                "--algorithms", "happo,mappo,madpo",
+                "--conditions", "none,arec",
+                "--seeds", "1-2",
+                "--arec-coefs", "0.00003,0.0001,0.0003",
+                "--gpus", "0", "--max-runs-per-gpu", "1",
+                "--wandb-mode", "disabled",
+            ]
+            with patch.object(sys, "argv", arguments), patch.object(
+                launcher.subprocess, "run", side_effect=fake_worker
+            ):
+                launcher.main()
+
             events = (root / "launcher.log").read_text()
-            self.assertEqual(events.count(" START "), 1)
-            self.assertIn("Stopping new launches", events)
+            self.assertEqual(len(attempts), 24)
+            self.assertEqual(sum(attempts.values()), 25)
+            self.assertNotIn("Stopping new launches", events)
+            self.assertIn("SEED 1 retry=1", events)
+            self.assertIn("SEED 1 finished completed=12/12", events)
+            self.assertIn("SEED 2 finished completed=12/12", events)
+            self.assertTrue(all(seed == 1 for seed, _, _ in invocation_order[:13]))
+            failed_run = "HARL-ShadowHandOver-nps-happo-seed1"
+            archive = root / "failed_attempts" / failed_run / "attempt_01"
+            self.assertEqual(json.loads((archive / "status.json").read_text())["status"], "failed")
+            self.assertEqual((archive / "metrics.jsonl").read_text(), '{"attempt": 1}\n')
+            self.assertEqual(
+                (root / "metrics" / f"{failed_run}.jsonl").read_text(),
+                '{"attempt": 2}\n',
+            )
+
+    def test_live_worker_gpu_is_reserved_and_identity_checked(self):
+        import tempfile
+
+        launcher = load(
+            ROOT / "experiments/harl_dexhands/run_matrix.py",
+            "test_dex_arec_live_worker",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory) / "1234"
+            proc.mkdir()
+            run_name = "HARL-ShadowHandOver-nps-happo-seed2"
+            (proc / "stat").write_text("1234 (python) R 1 1 1\n")
+            (proc / "cmdline").write_bytes(
+                f"python\0train.py\0--run-name\0{run_name}\0".encode()
+            )
+            (proc / "environ").write_bytes(b"CUDA_VISIBLE_DEVICES=3\0")
+            status = {"status": "running", "pid": 1234}
+            self.assertEqual(
+                launcher.running_gpu(run_name, status, ("0", "1", "2", "3"), Path(directory)),
+                "3",
+            )
+            with self.assertRaisesRegex(RuntimeError, "different title"):
+                launcher.running_gpu("another-run", status, ("3",), Path(directory))
+            with self.assertRaisesRegex(RuntimeError, "select its GPU"):
+                launcher.running_gpu(run_name, status, ("0",), Path(directory))
+
+    def test_resume_keeps_live_worker_and_counts_its_gpu_slot(self):
+        import tempfile
+        import threading
+
+        launcher = load(
+            ROOT / "experiments/harl_dexhands/run_matrix.py",
+            "test_dex_arec_external_slot",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runs"
+            harl_root = Path(directory) / "harl"
+            config = harl_root / "tuned_configs/dexhands/ShadowHandOver/happo/config.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"algo_args": {"train": {"num_env_steps": 2400}}}))
+            external_name = "HARL-ShadowHandOver-nps-happo-seed2"
+            external_status = root / "status" / f"{external_name}.json"
+            external_status.parent.mkdir(parents=True)
+            external_status.write_text(
+                json.dumps({"run_name": external_name, "status": "running", "pid": 1234})
+            )
+            done = threading.Event()
+            starts = []
+
+            def finish_external():
+                external_status.write_text(
+                    json.dumps({"run_name": external_name, "status": "completed"})
+                )
+                done.set()
+
+            def fake_worker(command, **_kwargs):
+                name = command[command.index("--run-name") + 1]
+                starts.append((name, done.is_set()))
+                path = root / "status" / f"{name}.json"
+                path.write_text(json.dumps({"run_name": name, "status": "completed"}))
+                return types.SimpleNamespace(returncode=0)
+
+            arguments = [
+                "run_matrix.py", "--run-root", str(root),
+                "--harl-root", str(harl_root),
+                "--algorithms", "happo", "--conditions", "none",
+                "--seeds", "1-2", "--gpus", "0", "--max-runs-per-gpu", "1",
+                "--wandb-mode", "disabled",
+            ]
+            timer = threading.Timer(0.05, finish_external)
+            with patch.object(sys, "argv", arguments), patch.object(
+                launcher, "running_gpu", return_value="0"
+            ), patch.object(
+                launcher, "process_is_running", side_effect=lambda _pid: not done.is_set()
+            ), patch.object(
+                launcher.subprocess, "run", side_effect=fake_worker
+            ):
+                timer.start()
+                try:
+                    launcher.main()
+                finally:
+                    timer.join()
+            self.assertEqual(starts, [("HARL-ShadowHandOver-nps-happo-seed1", True)])
+            self.assertIn(f"KEEP  {external_name}", (root / "launcher.log").read_text())
 
     def test_launcher_rejects_incomplete_wandb_before_dispatch(self):
         from unittest.mock import patch
