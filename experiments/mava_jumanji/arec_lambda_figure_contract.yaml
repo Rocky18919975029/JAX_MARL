@@ -1,0 +1,77 @@
+claim: "Compare five ARec coefficients with matched original recurrent MAPPO on LBF and RWARE."
+five_second_takeaway: "The within-task return curves show whether any fixed ARec coefficient improves on its paired MAPPO baseline."
+audience: "MARL researchers auditing the same-four-seed coefficient sweep"
+venue:
+  name: "diagnostic double-column export"
+  layout: "double-column"
+  target_width_mm: 178
+academic_style:
+  policy: "scientific-figure-design/assets/academic-style.yaml"
+  exceptions: []
+paper_palette:
+  path: ""
+  palette_id: "mava-arec-lambda-sweep-v1"
+  status: "diagnostic"
+  role_assignments:
+    strong_baseline: "#374151"
+    ours: "#2563EB"
+  cross_figure_audit_passed: false
+figure_archetype: "aligned training curves"
+comparison_objects:
+  - "Original recurrent MAPPO"
+  - "ARec: λ=3e-6, 1e-5, 3e-5, 1e-4, 3e-4"
+agent_evolution:
+  enabled: false
+evidence:
+  data_sources:
+    - "sweep manifest: 16 reused runs and 32 new runs"
+    - "each run's pinned Mava marl-eval metrics.json"
+  metrics:
+    - "evaluation mean_episode_return"
+    - "evaluated-policy environment steps"
+  uncertainty: "pointwise 95% percentile bootstrap over the four complete seed curves; 10,000 fixed-seed resamples"
+semantic_inventory:
+  entities: ["LBF 15x15-4p-5f", "RWARE large-8ag", "original MAPPO", "five ARec coefficients"]
+  transformations: ["correct one-evaluation step lag", "exact-step alignment", "mean over four seeds", "whole-seed bootstrap"]
+  boundaries: ["one panel per task", "return values compared only within task", "same-seed selection is exploratory"]
+visual_anchor:
+  type: "named baseline"
+  label: "Original recurrent MAPPO"
+reading_order: "Legend, then LBF panel, then RWARE panel"
+panels:
+  - id: "a"
+    purpose: "LBF coefficient comparison against original MAPPO"
+  - id: "b"
+    purpose: "RWARE coefficient comparison against original MAPPO"
+semantic_encodings:
+  color:
+    baseline: "#374151"
+    arec: "five fixed shades of blue"
+  shape:
+    arec: "five distinct markers at regular intervals"
+  line_style:
+    baseline: "dashed"
+    arec: "solid"
+icon_system:
+  enabled: false
+drawio:
+  enabled: false
+accessibility:
+  grayscale_redundancy: "dashed baseline and distinct ARec marker shapes"
+  color_vision_strategy: "line style and markers supplement fixed blue shades"
+provenance:
+  data: "immutable lambda-sweep manifest, per-run metric hashes, and full evaluation JSON logs"
+  visual_elements: "Matplotlib lines, markers and bands only"
+deliverables:
+  editable_source: "report_arec_lambda_sweep.py"
+  drawio_source: ""
+  icon_manifest: ""
+  vector_master: "mava-arec-lambda-sweep-4seed.svg"
+  pdf_master: "mava-arec-lambda-sweep-4seed.pdf"
+  png_preview: "mava-arec-lambda-sweep-4seed.png"
+validation:
+  final_size_checked: true
+  grayscale_checked: true
+  five_second_test: "Which ARec coefficient, if any, is above the original MAPPO curve within each task?"
+  caption_test: "Define tasks, methods, coefficients, four-seed pointwise bootstrap and corrected policy steps."
+caption_draft: "Evaluation return for original recurrent MAPPO and five ARec coefficients. Curves are four-seed means; bands are pointwise 95% seed-bootstrap intervals. Steps refer to the evaluated policy."

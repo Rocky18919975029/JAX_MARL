@@ -212,3 +212,30 @@ root inside the original paired run root. Select parameters using paired
 seed-level return AUC and report final-five-evaluation return as secondary;
 because selection uses the same four seeds, it is exploratory rather than an
 independent confirmation.
+
+## Completed lambda-sweep figure and table
+
+After all 32 new runs show `COMPLETED`, produce the two-task, six-curve
+figure and audit tables with the Mava virtual environment's Python:
+
+```bash
+cd ~/JaxMARL
+git pull --ff-only
+SWEEP_ROOT=/home/data/zeshenghong/JaxMARL/mava_high_agent_paired/arec_lambda_same4_v1
+/home/data/zeshenghong/Mava/.venv/bin/python \
+  experiments/mava_jumanji/report_arec_lambda_sweep.py \
+  --run-root "$SWEEP_ROOT"
+```
+
+Outputs are in `$SWEEP_ROOT/report/`: `mava-arec-lambda-sweep-4seed.png`,
+its editable SVG and PDF exports, `summary.csv` (mean, bootstrap 95% CI,
+paired AUC/final-five differences), `seed_level.csv`,
+`pointwise_curves.csv`, and `provenance.json`. The report requires all
+48 curves at every expected evaluation step and refuses incomplete or
+changed source logs. It uses the same 4 training seeds for every condition,
+resamples entire seed trajectories 10,000 times, and does not smooth the
+curves. The x axis is corrected by one evaluation interval because the pinned
+Mava learners evaluate the previous learner state but label the metrics after
+the just-finished update. This correction is identical for baseline and ARec.
+The table's flagged best coefficient is chosen by mean paired return AUC on the
+same four seeds, so it is an exploratory selection, not independent evidence.
