@@ -28,8 +28,8 @@ Observation = namedtuple("Observation", "agents_view action_mask global_state")
 
 class DummyRecurrentActor:
     def init(self, key, carry, observation_done):
-        del carry
         observation, _ = observation_done
+        assert carry.shape[-2] == observation.agents_view.shape[-2] == 1
         return {"params": {"weight": jax.random.normal(
             key, (observation.agents_view.shape[-1], observation.action_mask.shape[-1])
         )}}
@@ -41,6 +41,7 @@ class DummyRecurrentActor:
             logits = jnp.where(mask, latent @ weight, jnp.finfo(jnp.float32).min)
             return tfd.Categorical(logits=logits).log_prob(action)
         carry, (observation, _) = args
+        assert carry.shape[-2] == observation.agents_view.shape[-2] == 1
         latent = observation.agents_view
         logits = jnp.where(
             observation.action_mask, latent @ weight, jnp.finfo(jnp.float32).min

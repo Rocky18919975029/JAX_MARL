@@ -40,8 +40,16 @@ class IndependentActor:
         keys = jax.random.split(key, self.num_agents)
 
         def init_one(agent_key, agent_carry, view, mask, done):
-            agent_obs = observation._replace(agents_view=view, action_mask=mask)
-            return self.single_actor.init(agent_key, agent_carry, (agent_obs, done))
+            # Mava's ScannedRNN indexes resets as [environment, agent].
+            # Keep a singleton agent axis inside each independent actor.
+            agent_obs = observation._replace(
+                agents_view=jnp.expand_dims(view, -2),
+                action_mask=jnp.expand_dims(mask, -2),
+            )
+            return self.single_actor.init(
+                agent_key, jnp.expand_dims(agent_carry, -2),
+                (agent_obs, jnp.expand_dims(done, -1)),
+            )
 
         return jax.vmap(init_one)(keys, carries, views, masks, dones)
 
@@ -68,11 +76,19 @@ class IndependentActor:
         )
 
         def apply_one(agent_params, agent_carry, view, mask, done):
-            agent_obs = observation._replace(agents_view=view, action_mask=mask)
-            next_carry, policy, latent = self.single_actor.apply(
-                agent_params, agent_carry, (agent_obs, done), return_latent=True
+            agent_obs = observation._replace(
+                agents_view=jnp.expand_dims(view, -2),
+                action_mask=jnp.expand_dims(mask, -2),
             )
-            return next_carry, policy.distribution.logits_parameter(), latent
+            next_carry, policy, latent = self.single_actor.apply(
+                agent_params, jnp.expand_dims(agent_carry, -2),
+                (agent_obs, jnp.expand_dims(done, -1)), return_latent=True,
+            )
+            return (
+                jnp.squeeze(next_carry, axis=-2),
+                jnp.squeeze(policy.distribution.logits_parameter(), axis=-2),
+                jnp.squeeze(latent, axis=-2),
+            )
 
         next_carries, masked_logits, latents = jax.vmap(apply_one)(
             params, carries, views, masks, dones
